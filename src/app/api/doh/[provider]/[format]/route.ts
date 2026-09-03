@@ -3,12 +3,16 @@ import { handleDoH } from '@/lib/doh';
 
 export const runtime = 'edge';
 
-// Format-specific provider endpoint: /api/doh/<provider>/<format>
-// e.g. /api/doh/google/resolve (JSON) or /api/doh/google/dns-query (wire).
+type RouteContext = {
+  params: Promise<{
+    provider: string;
+    format: string;
+  }>;
+};
 
 export async function GET(
   request: NextRequest,
-  { params }: { params: Promise<{ provider: string; format: string }> }
+  { params }: RouteContext
 ) {
   const { provider, format } = await params;
   return handleDoH(request, provider, format);
@@ -16,17 +20,20 @@ export async function GET(
 
 export async function POST(
   request: NextRequest,
-  { params }: { params: Promise<{ provider: string; format: string }> }
+  { params }: RouteContext
 ) {
-  // RFC 8484 wire-format POST (Content-Type: application/dns-message).
   const { provider, format } = await params;
   return handleDoH(request, provider, format);
 }
 
 export async function HEAD(
   request: NextRequest,
-  { params }: { params: Promise<{ provider: string; format: string }> }
+  { params }: RouteContext
 ) {
   const { provider, format } = await params;
   return handleDoH(request, provider, format);
+}
+
+export async function OPTIONS(request: NextRequest) {
+  return handleDoH(request, '');
 }
