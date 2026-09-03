@@ -1,54 +1,169 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getProvider, resolveProviderEndpoint } from '@/lib/providers';
 
-// --- Constants & Config ---
+const REQUEST_TIMEOUT_MS = 2_500;
+const MAX_QUERY_STRING_LENGTH = 1_024;
+const MAX_BODY_SIZE = 4_096;
+const PROXY_VERSION = 'v1.2.0';
 
-const REQUEST_TIMEOUT_MS = 2500; // Upstream timeout (1500ms - 2500ms)
-const MAX_QUERY_STRING_LENGTH = 1024;
-const MAX_BODY_SIZE = 4096; // RFC 8484 DNS query messages are tiny; cap the POST body
-// Allow underscores so SRV/TXT lookups (e.g. _dmarc, _sip._tcp) are accepted.
 const ALLOWED_DOMAIN_REGEX = /^[a-zA-Z0-9._-]+$/;
+const DNS_MESSAGE_REGEX = /^[A-Za-z0-9_-]+={0,2}$/;
 
-// --- Helpers ---
+interface LogEntry {
+  timestamp: string;
+  provider: string;
+  durationMs: number;
+  status: number;
+  method: string;
+  error?: string;
+}
 
-function getClientIP(req: NextRequest): string {
-  // Abstracted IP retrieval - prefer standard headers but don't rely on it for auth
-  return (
-    req.headers.get('x-forwarded-for')?.split(',')[0] ||
-    req.headers.get('cf-connecting-ip') ||
-    'unknown'
+function getBaseHeaders(): Headers {
+  const headers = new Headers();
+
+  headers.set('Cache-Control', 'no-store, max-age=0');
+  headers.set('Pragma', 'no-cache');
+  headers.set('Expires', '0');
+  headers.set('Vary', 'Accept, Accept-Encoding, Origin');
+
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, HEAD, OPTIONS');
+  headers.set(
+    'Access-Control-Allow-Headers',
+    'Accept, Content-Type, Content-Length'
   );
+
+  headers.set('X-DoH-Proxy-Version', PROXY_VERSION);
+
+  return headers;
+}
+
+function createResponse(
+  body: BodyInit | null,
+  status: number,
+  contentType = 'text/plain; charset=utf-8'
+): NextResponse {
+  const headers = getBaseHeaders();
+
+  if (contentType) {
+    headers.set('Content-Type', contentType);
+  }
+
+  return new NextResponse(body, {
+    status,
+    headers,
+  });
+}
+
+function logRequest(entry: LogEntry): void {
+  if (process.env.DEBUG_LOG === 'true' || entry.status >= 400) {
+    console.log(JSON.stringify(entry));
+  }
+}
+
+function isValidDomainName(value: string): boolean {
+  if (value === '.') {
+    return true;
+  }
+
+  if (
+    value.length === 0 ||
+    value.length > 253 ||
+    !ALLOWED_DOMAIN_REGEX.test(value)
+  ) {
+    return false;
+  }
+
+  const labels = value.endsWith('.') ? value.slice(0, -1).split('.') : value.split('.');
+
+  return labels.every((label) => {
+    if (label.length === 0 || label.length > 63) {
+      return false;
+    }
+
+    if (label.startsWith('-') || label.endsWith('-')) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function validateRequest(
+  url: URL,
+  method: string
+): NextResponse | null {
+  if (url.search.length > MAX_QUERY_STRING_LENGTH) {
+    return createResponse('Query string too long', 414);
+  }
+
+  if (method === 'OPTIONS' || method === 'HEAD') {
+    return null;
+  }
+
+  if (method === 'POST') {
+    return null;
+  }
+
+  if (method !== 'GET') {
+    return createResponse('Method not allowed', 405);
+  }
+
+  const dnsParam = url.searchParams.get('dns');
+
+  if (dnsParam !== null) {
+    if (
+      dnsParam.length === 0 ||
+      dnsParam.length > MAX_QUERY_STRING_LENGTH ||
+      !DNS_MESSAGE_REGEX.test(dnsParam)
+    ) {
+      return createResponse('Invalid DNS message parameter', 400);
+    }
+
+    return null;
+  }
+
+  const nameParam = url.searchParams.get('name');
+
+  if (!nameParam) {
+    return createResponse('Invalid domain: empty', 400);
+  }
+
+  if (!isValidDomainName(nameParam)) {
+    return createResponse('Invalid domain name', 400);
+  }
+
+  return null;
 }
 
 /**
- * SSRF guard for the 'manual' provider.
+ * Validates caller-supplied upstream URLs used by the manual provider.
  *
- * A caller-supplied upstream URL must never be allowed to reach private,
- * loopback or link-local address space (the link-local range also covers
- * cloud metadata endpoints like 169.254.169.254).
- *
- * Both http: and https: are permitted; all other schemes are rejected.
- *
- * Note: full protection requires resolving the hostname, which is not
- * available on the edge runtime. This blocks the common literal-IP and
- * local-hostname cases; DNS-rebinding style attacks are not covered.
+ * DNS resolution is not available from the Edge Runtime, so hostname-based
+ * DNS rebinding cannot be completely prevented here. Literal private,
+ * loopback, link-local, multicast, and reserved addresses are rejected.
  */
-function isSafeUpstreamUrl(raw: string): boolean {
+function isSafeUpstreamUrl(rawUrl: string): boolean {
   let url: URL;
+
   try {
-    url = new URL(raw);
+    url = new URL(rawUrl);
   } catch {
     return false;
   }
 
-  // Allow plain HTTP and HTTPS upstreams; reject anything else
-  // (file:, ftp:, gopher:, ...).
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    return false;
+  }
 
-  // Strip IPv6 brackets and normalize.
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (url.username || url.password || url.hash) {
+    return false;
+  }
 
-  // Block obvious local / internal hostnames.
+  let host = url.hostname.toLowerCase();
+
+  host = host.replace(/^\[|\]$/g, '').replace(/\.$/, '');
+
   if (
     host === 'localhost' ||
     host.endsWith('.localhost') ||
@@ -58,275 +173,291 @@ function isSafeUpstreamUrl(raw: string): boolean {
     return false;
   }
 
-  // IPv4 literal checks.
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  const ipv4 = host.match(
+    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+  );
+
   if (ipv4) {
-    const a = Number(ipv4[1]);
-    const b = Number(ipv4[2]);
-    if (a === 0 || a === 10 || a === 127) return false; // this-host / private / loopback
-    if (a === 169 && b === 254) return false; // link-local (incl. cloud metadata)
-    if (a === 172 && b >= 16 && b <= 31) return false; // private
-    if (a === 192 && b === 168) return false; // private
-    if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT (RFC 6598)
-    if (a >= 224) return false; // multicast / reserved
+    const octets = ipv4.slice(1).map(Number);
+
+    if (octets.some((octet) => octet < 0 || octet > 255)) {
+      return false;
+    }
+
+    const [a, b] = octets;
+
+    if (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      a >= 224
+    ) {
+      return false;
+    }
+
     return true;
   }
 
-  // IPv6 literal checks.
   if (host.includes(':')) {
-    if (host === '::1' || host === '::') return false; // loopback / unspecified
-    if (host.startsWith('fe80')) return false; // link-local
-    if (host.startsWith('fc') || host.startsWith('fd')) return false; // unique local
-    if (host.startsWith('::ffff:')) return false; // IPv4-mapped
+    if (
+      host === '::' ||
+      host === '::1' ||
+      host.startsWith('fe8') ||
+      host.startsWith('fe9') ||
+      host.startsWith('fea') ||
+      host.startsWith('feb') ||
+      host.startsWith('fc') ||
+      host.startsWith('fd') ||
+      host.startsWith('::ffff:')
+    ) {
+      return false;
+    }
+
     return true;
   }
 
-  // Regular DNS hostname - allowed.
-  return true;
+  return host.length > 0;
 }
 
-interface LogEntry {
-  timestamp: string;
-  clientIp: string;
-  provider: string;
-  durationMs: number;
-  status: number;
-  upstreamUrl?: string;
-  error?: string;
-  method: string;
+function getUpstreamUrl(
+  providerId: string,
+  providerEndpoint: string | undefined,
+  url: URL
+): string | NextResponse {
+  const provider = getProvider(providerId);
+
+  if (!provider) {
+    return createResponse(`Provider '${providerId}' not found`, 404);
+  }
+
+  if (providerId === 'custom') {
+    const customUrl = process.env.CUSTOM_DOH_URL;
+
+    if (!customUrl) {
+      return createResponse(
+        'Configuration Error: CUSTOM_DOH_URL missing',
+        500
+      );
+    }
+
+    let parsedCustomUrl: URL;
+
+    try {
+      parsedCustomUrl = new URL(customUrl);
+    } catch {
+      return createResponse('Configuration Error: invalid CUSTOM_DOH_URL', 500);
+    }
+
+    if (
+      parsedCustomUrl.protocol !== 'https:' &&
+      parsedCustomUrl.protocol !== 'http:'
+    ) {
+      return createResponse(
+        'Configuration Error: CUSTOM_DOH_URL must use HTTP or HTTPS',
+        500
+      );
+    }
+
+    return parsedCustomUrl.toString();
+  }
+
+  if (providerId === 'manual') {
+    const manualUrl = url.searchParams.get('upstream');
+
+    if (!manualUrl) {
+      return createResponse('Missing "upstream" parameter', 400);
+    }
+
+    if (!isSafeUpstreamUrl(manualUrl)) {
+      return createResponse('Invalid or disallowed upstream URL', 400);
+    }
+
+    return manualUrl;
+  }
+
+  const resolvedEndpoint = resolveProviderEndpoint(
+    provider,
+    providerEndpoint
+  );
+
+  if (!resolvedEndpoint) {
+    return createResponse(
+      `Endpoint '${providerEndpoint}' not found for provider '${providerId}'`,
+      404
+    );
+  }
+
+  return resolvedEndpoint;
 }
 
-function logRequest(entry: LogEntry) {
-  if (process.env.DEBUG_LOG === 'true' || entry.status >= 400) {
-    console.log(JSON.stringify(entry));
+function getAcceptHeader(request: NextRequest, url: URL): string {
+  const clientAccept = request.headers.get('accept');
+
+  if (clientAccept) {
+    return clientAccept;
   }
+
+  if (request.method === 'POST' || url.searchParams.has('dns')) {
+    return 'application/dns-message';
+  }
+
+  return 'application/dns-json';
 }
 
-function validateRequest(url: URL, method: string): NextResponse | null {
-  // Validate Query String Length
-  if (url.search.length > MAX_QUERY_STRING_LENGTH) {
-    return new NextResponse('Query string too long', { status: 414 });
-  }
-
-  // RFC 8484 POST (binary wire format) carries the query in the body -
-  // there are no query params to validate.
-  if (method === 'POST') return null;
-
-  // RFC 8484 GET (base64 dns message) - 'name' is NOT required.
-  if (url.searchParams.has('dns')) return null;
-
-  // JSON API request - enforce a valid 'name' param.
-  const nameParam = url.searchParams.get('name');
-  if (!nameParam || nameParam.length === 0) {
-    return new NextResponse('Invalid domain: empty', { status: 400 });
-  }
-  if (nameParam.length > 253) {
-    return new NextResponse('Invalid domain: too long', { status: 400 });
-  }
-  if (!ALLOWED_DOMAIN_REGEX.test(nameParam)) {
-    return new NextResponse('Invalid domain: invalid characters', { status: 400 });
-  }
-  return null;
-}
-
-// --- Main Handler ---
-
-/**
- * Core DoH proxy handler, shared by the bare provider route
- * (/api/doh/<provider>) and the format-specific route
- * (/api/doh/<provider>/<format>).
- */
 export async function handleDoH(
   request: NextRequest,
   providerId: string,
   formatSegment?: string
-) {
-  const startTime = Date.now();
-  let upstreamEndpoint = '';
+): Promise<NextResponse> {
+  const startedAt = Date.now();
+
   let responseStatus = 500;
+  let errorMessage: string | undefined;
 
   try {
-    // 0. Handle HEAD requests immediately (Health Check)
-    if (request.method === 'HEAD') {
-      responseStatus = 200;
-      const responseHeaders = new Headers();
-      responseHeaders.set('Cache-Control', 'no-store, max-age=0');
-      responseHeaders.set('Pragma', 'no-cache');
-      responseHeaders.set('Expires', '0');
-      responseHeaders.set('Vary', 'Accept, Accept-Encoding');
-      responseHeaders.set('Access-Control-Allow-Origin', '*');
-
-      return new NextResponse(null, {
-        status: 200,
-        headers: responseHeaders,
-      });
+    if (request.method === 'OPTIONS') {
+      responseStatus = 204;
+      return createResponse(null, 204, '');
     }
 
-    // 1. Input Validation
+    if (request.method === 'HEAD') {
+      responseStatus = 204;
+      return createResponse(null, 204, '');
+    }
+
     const url = new URL(request.url);
     const validationError = validateRequest(url, request.method);
+
     if (validationError) {
       responseStatus = validationError.status;
       return validationError;
     }
 
-    // RFC 8484 POST body size guard (DoS protection).
+    let requestBody: ArrayBuffer | undefined;
+
     if (request.method === 'POST') {
-      const contentLength = request.headers.get('content-length');
-      if (contentLength && Number(contentLength) > MAX_BODY_SIZE) {
+      const contentLengthHeader = request.headers.get('content-length');
+
+      if (contentLengthHeader) {
+        const contentLength = Number(contentLengthHeader);
+
+        if (
+          !Number.isFinite(contentLength) ||
+          contentLength < 0 ||
+          contentLength > MAX_BODY_SIZE
+        ) {
+          responseStatus = 413;
+          return createResponse('Payload too large', 413);
+        }
+      }
+
+      requestBody = await request.arrayBuffer();
+
+      if (requestBody.byteLength === 0) {
+        responseStatus = 400;
+        return createResponse('Empty DNS request body', 400);
+      }
+
+      if (requestBody.byteLength > MAX_BODY_SIZE) {
         responseStatus = 413;
-        return new NextResponse('Payload too large', { status: 413 });
+        return createResponse('Payload too large', 413);
       }
     }
 
-    // 2. Provider Logic
-    const provider = getProvider(providerId);
-    if (!provider) {
-      responseStatus = 404;
-      return new NextResponse(`Provider '${providerId}' not found`, { status: 404 });
+    const upstreamResult = getUpstreamUrl(
+      providerId,
+      formatSegment,
+      url
+    );
+
+    if (upstreamResult instanceof NextResponse) {
+      responseStatus = upstreamResult.status;
+      return upstreamResult;
     }
 
-    // Resolve the upstream endpoint.
-    if (providerId === 'custom') {
-      const envUrl = process.env.CUSTOM_DOH_URL;
-      if (!envUrl) {
-        responseStatus = 500;
-        return new NextResponse('Configuration Error: CUSTOM_DOH_URL missing', { status: 500 });
-      }
-      upstreamEndpoint = envUrl;
-    } else if (providerId === 'manual') {
-      const manualUrl = url.searchParams.get('upstream');
-      if (!manualUrl) {
-        responseStatus = 400;
-        return new NextResponse('Missing "upstream" parameter', { status: 400 });
-      }
-      // SSRF guard: reject private/loopback/link-local and non-http(s) targets.
-      if (!isSafeUpstreamUrl(manualUrl)) {
-        responseStatus = 400;
-        return new NextResponse('Invalid or disallowed upstream URL', { status: 400 });
-      }
-      upstreamEndpoint = manualUrl;
-    } else {
-      // Built-in provider: pick the endpoint for the requested format segment
-      // (e.g. /api/doh/google/dns-query), or the default when omitted.
-      const resolved = resolveProviderEndpoint(provider, formatSegment);
-      if (!resolved) {
-        responseStatus = 404;
-        return new NextResponse(
-          `Endpoint '${formatSegment}' not found for provider '${providerId}'`,
-          { status: 404 }
-        );
-      }
-      upstreamEndpoint = resolved;
-    }
+    const upstreamUrl = new URL(upstreamResult);
 
-    // 3. Prepare Upstream Request
-    const upstreamUrl = new URL(upstreamEndpoint);
-
-    // Pass through query params for GET, excluding internal ones
     if (request.method === 'GET') {
       url.searchParams.forEach((value, key) => {
-        if (key !== 'upstream') { // Don't pass 'upstream' param to the DNS server
-           upstreamUrl.searchParams.append(key, value);
+        if (key !== 'upstream') {
+          upstreamUrl.searchParams.append(key, value);
         }
       });
     }
 
-    // Consistency Headers
-    const headers = new Headers();
+    const upstreamHeaders = new Headers();
 
-    // Forward the client's negotiated content type so both the JSON API
-    // (application/dns-json) and the RFC 8484 wire format
-    // (application/dns-message) work transparently. Fall back to a sensible
-    // default based on the request shape when the client omits Accept.
-    const clientAccept = request.headers.get('accept');
-    if (clientAccept) {
-      headers.set('Accept', clientAccept);
-    } else if (request.method === 'POST' || url.searchParams.has('dns')) {
-      headers.set('Accept', 'application/dns-message'); // RFC 8484 wire format
-    } else {
-      headers.set('Accept', 'application/dns-json'); // JSON API
-    }
-    headers.set('User-Agent', 'Secure-DoH-Proxy/1.0');
+    upstreamHeaders.set('Accept', getAcceptHeader(request, url));
+    upstreamHeaders.set('User-Agent', 'Secure-DoH-Proxy/1.2');
 
-    // For RFC 8484 POST the body is the raw DNS query message.
     if (request.method === 'POST') {
-      headers.set(
+      upstreamHeaders.set(
         'Content-Type',
         request.headers.get('content-type') || 'application/dns-message'
       );
     }
 
-    // 4. Fetch with Timeout
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      REQUEST_TIMEOUT_MS
+    );
+
+    let upstreamResponse: Response;
 
     try {
-      const upstreamResponse = await fetch(upstreamUrl.toString(), {
+      upstreamResponse = await fetch(upstreamUrl.toString(), {
         method: request.method,
-        headers: headers,
-        body: request.method === 'POST' ? request.body : undefined,
+        headers: upstreamHeaders,
+        body: request.method === 'POST' ? requestBody : undefined,
         signal: controller.signal,
-        // @ts-expect-error - 'duplex' is needed for Node/Edge streaming
-        duplex: 'half',
+        cache: 'no-store',
       });
-
+    } finally {
       clearTimeout(timeoutId);
-      responseStatus = upstreamResponse.status;
-
-      // 5. Secure Response Construction
-      const responseHeaders = new Headers();
-
-      // Strict Cache Control (User Req #1)
-      responseHeaders.set('Cache-Control', 'no-store, max-age=0');
-      responseHeaders.set('Pragma', 'no-cache');
-      responseHeaders.set('Expires', '0');
-      responseHeaders.set('Vary', 'Accept, Accept-Encoding');
-      responseHeaders.set('X-DoH-Proxy-Version', 'v1.1.0');
-
-      // CORS
-      responseHeaders.set('Access-Control-Allow-Origin', '*');
-
-      // Forward content type
-      const respContentType = upstreamResponse.headers.get('content-type');
-      if (respContentType) {
-        responseHeaders.set('Content-Type', respContentType);
-      }
-
-      return new NextResponse(upstreamResponse.body, {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        headers: responseHeaders,
-      });
-
-    } catch (fetchError: unknown) {
-      clearTimeout(timeoutId);
-      const isTimeout = (fetchError as Error).name === 'AbortError';
-      responseStatus = isTimeout ? 504 : 502;
-
-      return new NextResponse(
-        JSON.stringify({ error: isTimeout ? 'Upstream Timeout' : 'Upstream Connection Failed' }),
-        {
-          status: responseStatus,
-          headers: { 'Content-Type': 'application/json' }
-        }
-      );
     }
 
-  } catch (err) {
-    console.error('Internal Error:', err);
-    responseStatus = 500;
-    return new NextResponse('Internal Server Error', { status: 500 });
+    responseStatus = upstreamResponse.status;
+
+    const responseHeaders = getBaseHeaders();
+    const responseContentType =
+      upstreamResponse.headers.get('content-type');
+
+    if (responseContentType) {
+      responseHeaders.set('Content-Type', responseContentType);
+    }
+
+    return new NextResponse(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers: responseHeaders,
+    });
+  } catch (error: unknown) {
+    const isTimeout =
+      error instanceof Error && error.name === 'AbortError';
+
+    responseStatus = isTimeout ? 504 : 502;
+    errorMessage = isTimeout
+      ? 'Upstream Timeout'
+      : 'Upstream Connection Failed';
+
+    return createResponse(
+      JSON.stringify({ error: errorMessage }),
+      responseStatus,
+      'application/json; charset=utf-8'
+    );
   } finally {
-    // 6. Logging (User Req #6)
     logRequest({
       timestamp: new Date().toISOString(),
-      clientIp: getClientIP(request),
       provider: providerId,
-      durationMs: Date.now() - startTime,
+      durationMs: Date.now() - startedAt,
       status: responseStatus,
-      upstreamUrl: upstreamEndpoint, // Log the resolved endpoint
-      method: request.method
+      method: request.method,
+      error: errorMessage,
     });
   }
 }
