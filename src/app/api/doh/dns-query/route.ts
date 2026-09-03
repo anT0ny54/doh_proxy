@@ -14,6 +14,13 @@ type DoHResult = {
   contentType: string;
 };
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Accept",
+  "Cache-Control": "no-store",
+};
+
 async function queryUpstream(
   upstream: string,
   request: Request,
@@ -35,17 +42,14 @@ async function queryUpstream(
   try {
     const response = await fetch(upstreamUrl.toString(), {
       method: request.method,
-
       headers: {
         Accept:
           request.headers.get("accept") ||
           "application/dns-message",
-
         "Content-Type":
           request.headers.get("content-type") ||
           "application/dns-message",
       },
-
       body: request.method === "POST" ? requestBody : undefined,
       signal: controller.signal,
     });
@@ -70,11 +74,20 @@ async function queryUpstream(
 }
 
 async function handleDoH(request: Request): Promise<Response> {
+  // Handle CORS preflight requests
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders,
+    });
+  }
+
   if (request.method !== "GET" && request.method !== "POST") {
     return new Response("Method Not Allowed", {
       status: 405,
       headers: {
-        Allow: "GET, POST",
+        ...corsHeaders,
+        Allow: "GET, POST, OPTIONS",
       },
     });
   }
@@ -97,16 +110,16 @@ async function handleDoH(request: Request): Promise<Response> {
     return new Response(result.body, {
       status: 200,
       headers: {
+        ...corsHeaders,
         "Content-Type": result.contentType,
-        "Cache-Control": "no-store",
       },
     });
   } catch {
     return new Response("All DNS upstreams failed", {
       status: 502,
       headers: {
+        ...corsHeaders,
         "Content-Type": "text/plain",
-        "Cache-Control": "no-store",
       },
     });
   }
@@ -114,3 +127,4 @@ async function handleDoH(request: Request): Promise<Response> {
 
 export const GET = handleDoH;
 export const POST = handleDoH;
+export const OPTIONS = handleDoH;
