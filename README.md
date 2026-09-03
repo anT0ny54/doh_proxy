@@ -164,3 +164,29 @@ CUSTOM_DOH_URL=https://1.1.1.1/dns-query npm run dev
 ## License
 
 AGPL-3.0
+
+
+#### :department_store: **My Free DNS Server, free** <a name="dns server"></a>
+
+On [My Free DNS] you can use HaGeZi Blocklists Multi Pro + TIF.
+
+| Hagezi Blocklists | DNS-over-HTTPS |
+|:---------------|:---------------|
+| Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+
+
+# ⚡ Bandwidth Hero Server
+
+> A lightweight image optimization proxy designed to reduce bandwidth usage and speed up web browsing.
+
+Bandwidth Hero Server fetches remote images, compresses them, and delivers optimized versions to the client. It helps reduce data consumption while improving loading performance.
+
+🖥️ If you want, you can see this [Bandwidth Hero](https://bhserv.netlify.app/)
+
+
+## Supporting My Project
+
+If you are interested in supporting the project you can donate :
+ - Bitcoin: 1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
+   
