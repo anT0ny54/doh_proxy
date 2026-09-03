@@ -1,0 +1,55 @@
+# ==============================================================================
+# NETLIFY CONFIGURATION FOR DOH PROXY (NEXT.JS 16)
+# ==============================================================================
+
+[build]
+  # Menentukan direktori perintah build standar Next.js
+  command = "npm run build"
+  # Folder output yang dihasilkan oleh Next.js untuk dideploy oleh Netlify
+  publish = ".next"
+
+[build.environment]
+  # Memastikan Node.js menggunakan versi LTS yang stabil dan kompatibel dengan Next.js 16
+  NODE_VERSION = "20"
+  # Menyembunyikan log telemetri Next.js selama proses build berlangsung
+  NEXT_TELEMETRY_DISABLED = "1"
+
+[[plugins]]
+  # Plugin wajib untuk menjalankan framework Next.js secara native di infrastruktur Netlify
+  package = "@netlify/plugin-nextjs"
+
+# ==============================================================================
+# HEADERS OPTIMIZATION (Anti-Caching & Security)
+# ==============================================================================
+
+[[headers]]
+  # Menerapkan aturan header global khusus untuk seluruh endpoint API DNS over HTTPS
+  for = "/api/doh/*"
+  [headers.values]
+    # Memaksa CDN Netlify dan browser untuk TIDAK menyimpan cache data DNS (Sangat Krusial!)
+    Cache-Control = "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+    Pragma = "no-cache"
+    Expires = "0"
+    
+    # Pengamanan Header Tambahan (Security Headers)
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    X-XSS-Protection = "1; mode=block"
+    Referrer-Policy = "no-referrer"
+
+# ==============================================================================
+# REDIRECTS & ROUTING (Fallback Management)
+# ==============================================================================
+
+[[redirects]]
+  # Mengarahkan rute standar RFC 8484 umum ke handler internal proxy kita jika diperlukan
+  from = "/dns-query"
+  to = "/api/doh/custom"
+  status = 200
+
+[[redirects]]
+  # Memastikan rute API Next.js selalu diteruskan ke fungsi serverless/edge tanpa interupsi
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+  
