@@ -1,50 +1,54 @@
-# Secure DoH Proxy
+# 🛡️ Secure DoH Proxy
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/RATING3PRO/doh_proxy)
 
-A privacy-focused, multi-upstream DNS over HTTPS (DoH) proxy built with **Next.js 16**.
+**A privacy-first, multi-upstream DNS-over-HTTPS (DoH) proxy engineered with Next.js 16.**
 
-## Features
+Secure DoH Proxy provides a stateless, high-performance bridge between your clients and the world's most reliable DNS providers, ensuring your queries remain encrypted and private.
 
--  **Secure & Up-to-Date**: Built with the latest Next.js 16 (CVE-2025-66478 Patched).
--  **Multi-Upstream**: Support for Cloudflare, Google, AdGuard, DNS.SB, and Custom upstream.
--  **DNS Tester**: Built-in beautiful UI to test DNS resolution across different providers.
--  **Privacy First**: No logs, stateless proxying.
--  **Modern UI**: Built with Tailwind CSS and Lucide Icons.
+## ✨ Key Features
 
-###  Enterprise-Grade Security & Reliability (New in v1.1)
+*   **🚀 Cutting-Edge Stack**: Powered by **Next.js 16** with proactive security patching (CVE-2025-66478).
+*   **🌐 Multi-Upstream Support**: Seamlessly switch between Cloudflare, Google, AdGuard, DNS.SB, or your own custom provider.
+*   **🧪 Integrated DNS Tester**: A sleek, intuitive UI to benchmark and test DNS resolution across different providers in real-time.
+*   **🔒 Privacy by Design**: Zero logging. Purely stateless proxying to ensure no user footprints are left behind.
+*   **🎨 Modern Interface**: A clean, responsive design crafted with **Tailwind CSS** and **Lucide Icons**.
 
-- **Strict Caching Policy**: Enforces `Cache-Control: no-store` to prevent middlebox/CDN caching of sensitive DNS data.
-- **Request Lifecycle Management**: 
-  - 2500ms upstream timeout protection.
-  - 3000ms global budget to prevent edge function hangs.
-- **Enhanced Input Validation**: 
-  - Strict domain validation (RFC-compliant regex, length checks).
-  - Query string size limits to prevent DoS.
-- **Platform Agnostic**: 
-  - Normalized Headers (`Accept: application/dns-json`, `User-Agent`).
-  - Abstracted Client IP resolution (supports `x-forwarded-for`, `cf-connecting-ip`).
-- **Observability**: Structured JSON logging for errors and debug mode.
-- **Health Checks**: Native `HEAD` method support (returns 204) for load balancers.
+---
 
-## Deployment
+## 🛡️ Enterprise-Grade Security & Reliability
+
+*Version 1.1 introduces a hardened architecture designed for production environments:*
+
+*   **Strict Caching Policy**: Forces `Cache-Control: no-store` to eliminate the risk of sensitive DNS data being cached by middleboxes or CDNs.
+*   **Request Lifecycle Guard**: 
+    *   **Upstream Timeout**: 2500ms limit to prevent slow-upstream bottlenecks.
+    *   **Global Budget**: 3000ms hard cap to prevent edge function hangs and resource exhaustion.
+*   **Hardened Input Validation**: 
+    *   RFC-compliant regex and strict length checks for domain validation.
+    *   Query string size limits to mitigate Denial-of-Service (DoS) vectors.
+*   **Platform Agnostic Architecture**: 
+    *   **Normalized Headers**: Standardizes `Accept: application/dns-json` and `User-Agent` for maximum compatibility.
+    *   **Smart IP Resolution**: Abstracted client IP detection supporting `x-forwarded-for` and `cf-connecting-ip`.
+*   **Operational Excellence**: 
+    *   **Observability**: Structured JSON logging for streamlined debugging and error tracking.
+    *   **Health Monitoring**: Native `HEAD` method support (returning `204 No Content`) for seamless load balancer integration.
+
+---
+
+## 🚀 Deployment
 
 ### Option 1: Vercel (Recommended)
-
-The easiest way to deploy this Next.js app is to use the [Vercel Platform](https://vercel.com/new).
-
-1. Fork this repository to your own GitHub account.
-2. Import the project into Vercel.
-3. Vercel will automatically detect Next.js and configure the build settings.
-4. (Optional) Add environment variables like `CUSTOM_DOH_URL` in the Vercel dashboard.
+The fastest way to get online.
+1. **Fork** this repository to your GitHub account.
+2. **Import** the project into the [Vercel Dashboard](https://vercel.com/new).
+3. Vercel will automatically detect Next.js and configure the build.
+4. *(Optional)* Configure your `CUSTOM_DOH_URL` in the Environment Variables tab.
 
 ### Option 2: Docker / Self-Hosted
+Deploy on any VPS or container orchestrator.
 
-You can deploy this on any server that supports Docker or Node.js.
-
-**Run with Docker (Recommended):**
-
-This project includes a production-ready `Dockerfile` and automated GitHub Actions workflow that publishes images to GitHub Container Registry (GHCR).
+**Run with Docker:**
+The project includes a production-ready `Dockerfile` and a GitHub Actions workflow that publishes images to GHCR.
 
 ```bash
 docker run -d \
@@ -56,102 +60,85 @@ docker run -d \
 ```
 
 | Environment Variable | Description | Default |
-| -------------------- | ----------- | ------- |
-| `PORT`               | The port the application listens on. | `8367` |
-| `CUSTOM_DOH_URL`     | Upstream URL for 'Custom' provider. | - |
-| `DEBUG_LOG`          | Enable verbose logging. | `false` |
+| :--- | :--- | :--- |
+| `PORT` | The port the application listens on | `8367` |
+| `CUSTOM_DOH_URL` | Upstream URL for the 'Custom' provider | `-` |
+| `DEBUG_LOG` | Enable verbose JSON logging | `false` |
 
-**Build & Run with Node.js:**
-
+**Manual Node.js Setup:**
 ```bash
-# Install dependencies
 npm install
-
-# Build the project
 npm run build
-
-# Start the production server
 npm start
 ```
 
 ### Option 3: Other Platforms
+Compatible with any environment supporting Next.js 16:
+*   **Edge/Serverless**: Cloudflare Pages, AWS Amplify, Google Cloud Run, Azure Static Web Apps, Netlify.
+*   **Specialized**: TencentCloud Edgeone, AlibabaCloud ESA.
 
-Since this is a standard Next.js 16 application, it can be deployed on various platforms:
-- Cloudflare Pages
-- AWS Amplify
-- Google Cloud Run
-- Azure Static Web Apps
-- Netlify
-- TencentCloud Edgeone Functions
-- AlibabaCloud ESA Function
+---
 
-## Configuration
+## ⚙️ Configuration
 
 ### Environment Variables
 
-| Variable Name | Description | Required |
-| ------------- | ----------- | -------- |
-| `CUSTOM_DOH_URL` | The upstream DoH URL for the 'Custom' provider (e.g., `https://1.1.1.1/dns-query`) | No (Only for Custom provider) |
-| `DEBUG_LOG` | Set to `true` to enable verbose JSON logging for all requests. | No |
+| Variable | Description | Required |
+| :--- | :--- | :--- |
+| `CUSTOM_DOH_URL` | The upstream DoH URL for the 'Custom' provider (e.g., `https://1.1.1.1/dns-query`) | No |
+| `DEBUG_LOG` | Set to `true` to enable verbose JSON logging | No |
 
-### How to Change or Add Upstream Providers
+### Managing Upstream Providers
 
-You can manage your upstream DoH providers using two different approaches depending on your needs:
-
-#### Method 1: Using the `CUSTOM_DOH_URL` Environment Variable (No code changes required)
-If you only need to use a single custom upstream without modifying the code, you can use the built-in `custom` endpoint.
-Simply set the `CUSTOM_DOH_URL` environment variable when deploying or running the app:
+#### Method 1: Quick Config (No Code)
+To use a single custom upstream without modifying the source, set the `CUSTOM_DOH_URL` environment variable:
 ```bash
 CUSTOM_DOH_URL=https://doh.opendns.com/dns-query npm run dev
 ```
-Then point your clients to: `/api/doh/custom`
+Your endpoint will be: `/api/doh/custom`
 
-#### Method 2: Editing the Built-in Providers List
-If you want to add multiple providers or change the default list shown in the Web UI, you need to modify the source code.
-1. Open the file `src/lib/providers.ts`.
+#### Method 2: Advanced Config (Source Edit)
+To add multiple providers to the Web UI:
+1. Open `src/lib/providers.ts`.
 2. Locate the `DOH_PROVIDERS` array.
-3. Add a new provider object or modify existing ones. For example, to add OpenDNS:
+3. Add your provider object:
 ```typescript
-  {
-    id: 'opendns', // This will be your endpoint path: /api/doh/opendns
-    name: 'OpenDNS',
-    endpoint: 'https://doh.opendns.com/dns-query',
-    description: 'OpenDNS Family Shield',
-  },
+{
+  id: 'opendns', // Endpoint: /api/doh/opendns
+  name: 'OpenDNS',
+  endpoint: 'https://doh.opendns.com/dns-query',
+  description: 'OpenDNS Family Shield',
+},
 ```
-4. Save the file and rebuild the project (`npm run build`). The new provider will automatically appear in the Web UI and be available as an API endpoint.
+4. Save and rebuild: `npm run build`.
 
-## Usage
+---
+
+## 🛠️ Usage
 
 ### Web Interface
-Visit your deployed URL (e.g., `https://your-domain.com`) to use the visual DNS tester.
+Simply navigate to your deployed URL (e.g., `https://your-domain.com`) to access the visual DNS tester.
 
 ### API Endpoints
-Configure your DoH client (browser, router, or OS) with the following endpoints.
+Configure your clients (browsers, routers, or OS) using the endpoints below. The proxy is **format-agnostic**: it forwards the client's `Accept` header, supporting both the **JSON API** (`application/dns-json`) and **RFC 8484 Wire Format** (`application/dns-message`).
 
-Each built-in provider exposes its default endpoint plus optional
-format-specific sub-paths. The proxy is format-agnostic: it forwards the
-client's `Accept` header, so both the JSON API (`application/dns-json`) and
-the RFC 8484 wire format (`application/dns-message`, GET `?dns=` and POST)
-work transparently.
-
-| Provider | Default | JSON | Wire format (RFC 8484) |
-| -------- | ------- | ---- | ---------------------- |
+| Provider | Default Endpoint | JSON API | Wire Format (RFC 8484) |
+| :--- | :--- | :--- | :--- |
 | **Cloudflare** | `/api/doh/cloudflare` | `/api/doh/cloudflare` | `/api/doh/cloudflare/dns-query` |
 | **Google** | `/api/doh/google` | `/api/doh/google/resolve` | `/api/doh/google/dns-query` |
 | **AdGuard** | `/api/doh/adguard` | `/api/doh/adguard/resolve` | `/api/doh/adguard/dns-query` |
 | **DNS.SB** | `/api/doh/dnssb` | `/api/doh/dnssb` | `/api/doh/dnssb/dns-query` |
 
-- **Custom**: `/api/doh/custom` (Requires `CUSTOM_DOH_URL`)
-- **Manual**: `/api/doh/manual?upstream=<url>`
-
-> The `manual` endpoint accepts only `http(s)` URLs and rejects upstreams that
-> resolve to private, loopback or link-local address space (SSRF protection).
+*   **Custom**: `/api/doh/custom` (Requires `CUSTOM_DOH_URL`)
+*   **Manual**: `/api/doh/manual?upstream=<url>` 
+    *   *Note: The manual endpoint includes SSRF protection and rejects private/loopback/link-local IP space.*
 
 ### Health Check
-Send a `HEAD` request to any endpoint to verify service availability (returns 204 No Content).
+Perform a `HEAD` request to any endpoint to verify service availability. A `204 No Content` response indicates the service is healthy.
 
-## Development
+---
+
+## 💻 Development
 
 ```bash
 # Start local development server
@@ -161,32 +148,27 @@ npm run dev
 CUSTOM_DOH_URL=https://1.1.1.1/dns-query npm run dev
 ```
 
-## License
+## 📜 License
+Distributed under the **AGPL-3.0 License**.
 
-AGPL-3.0
+---
 
+## 🚀 More from the Author
 
-#### :department_store: **My Free DNS Server, free** <a name="dns server"></a>
+### 🌐 My Free DNS Server
+Access high-quality DNS filtering using **HaGeZi Blocklists Multi Pro + TIF**.
 
-On [My Free DNS] you can use HaGeZi Blocklists Multi Pro + TIF.
+| Filter Set | DNS-over-HTTPS Endpoint |
+| :--- | :--- |
+| **Multi Pro + TIF** | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
+| **Multi Pro + TIF** | `https://dnssix.netlify.app/api/doh/dns-query` |
 
-| Hagezi Blocklists | DNS-over-HTTPS |
-|:---------------|:---------------|
-| Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+### ⚡ Bandwidth Hero Server
+A lightweight image optimization proxy that fetches remote images and compresses them on the fly to reduce data usage and speed up page loads.
+👉 [Try Bandwidth Hero](https://bhserv.netlify.app/)
 
+---
 
-# ⚡ Bandwidth Hero Server
-
-> A lightweight image optimization proxy designed to reduce bandwidth usage and speed up web browsing.
-
-Bandwidth Hero Server fetches remote images, compresses them, and delivers optimized versions to the client. It helps reduce data consumption while improving loading performance.
-
-🖥️ If you want, you can see this [Bandwidth Hero](https://bhserv.netlify.app/)
-
-
-## Supporting My Project
-
-If you are interested in supporting the project you can donate :
- - Bitcoin: 1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
-   
+## ❤️ Supporting the Project
+If this tool helped you, consider supporting further development:
+**Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
