@@ -1,9 +1,9 @@
-'use client';
+"use client";
 
-import { useState } from 'react';
-import { DOH_PROVIDERS } from '@/lib/providers';
-import { Loader2 } from 'lucide-react';
-import clsx from 'clsx';
+import { useState } from "react";
+import clsx from "clsx";
+import { Loader2 } from "lucide-react";
+import { DOH_PROVIDERS } from "@/lib/providers";
 
 interface DnsAnswer {
   name: string;
@@ -26,167 +26,174 @@ interface DnsResponse {
   Comment?: string;
 }
 
+const RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SOA"] as const;
+const DEFAULT_DOMAIN = "google.com";
+const REQUEST_TIMEOUT_MS = 5_000;
+
 export default function DnsTester() {
-  const [domain, setDomain] = useState('google.com');
-  const [type, setType] = useState('A');
-  const [providerId, setProviderId] = useState(DOH_PROVIDERS[0].id);
-  const [manualUrl, setManualUrl] = useState('');
+  const [domain, setDomain] = useState(DEFAULT_DOMAIN);
+  const [type, setType] = useState<(typeof RECORD_TYPES)[number]>("A");
+  const [providerId, setProviderId] = useState(DOH_PROVIDERS[0]?.id ?? "cloudflare");
+  const [manualUrl, setManualUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<DnsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const recordTypes = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'PTR', 'SOA'];
+  async function handleTest(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (loading) return;
 
-  const handleTest = async (e: React.FormEvent) => {
-    e.preventDefault();
+    const trimmedDomain = domain.trim();
+    if (!trimmedDomain) {
+      setError("Please enter a domain name.");
+      return;
+    }
+
+    if (providerId === "manual" && !manualUrl.trim()) {
+      setError("Please enter a valid DoH URL.");
+      return;
+    }
+
     setLoading(true);
     setResult(null);
     setError(null);
 
-    let apiUrl = `/api/doh/${providerId}?name=${domain}&type=${type}`;
-    if (providerId === 'manual') {
-      if (!manualUrl) {
-        setError('Please enter a valid DoH URL');
-        setLoading(false);
-        return;
-      }
-      apiUrl += `&upstream=${encodeURIComponent(manualUrl)}`;
-    }
+    const params = new URLSearchParams({ name: trimmedDomain, type });
+    if (providerId === "manual") params.set("upstream", manualUrl.trim());
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const res = await fetch(apiUrl, {
-        headers: {
-          'Accept': 'application/dns-json',
-        },
+      const res = await fetch(`/api/doh/${encodeURIComponent(providerId)}?${params}`, {
+        headers: { Accept: "application/dns-json" },
+        signal: controller.signal,
       });
 
       if (!res.ok) {
-        throw new Error(`Error: ${res.status} ${res.statusText}`);
+        const message = await res.text().catch(() => "");
+        throw new Error(message || `Error: ${res.status} ${res.statusText}`);
       }
 
-      const data = await res.json() as DnsResponse;
+      const data = (await res.json()) as DnsResponse;
       setResult(data);
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to resolve DNS';
-      setError(errorMessage);
+    } catch (caught: unknown) {
+      if (caught instanceof DOMException && caught.name === "AbortError") {
+        setError("The DNS request timed out.");
+      } else {
+        setError(caught instanceof Error ? caught.message : "Failed to resolve DNS.");
+      }
     } finally {
+      window.clearTimeout(timeoutId);
       setLoading(false);
     }
-  };
+  }
 
   return (
-    <div className="w-full max-w-2xl mx-auto bg-white/60 backdrop-blur-md rounded-3xl shadow-sm border border-zinc-200/80 p-6 md:p-10">
+    <div className="w-full max-w-2xl mx-auto rounded-3xl border border-zinc-200/80 bg-white/60 p-6 shadow-sm backdrop-blur-md md:p-10">
       <div className="mb-8 text-center">
         <h2 className="text-2xl font-semibold text-zinc-900">DNS Tester</h2>
+        <p className="mt-2 text-sm text-zinc-500">Resolve a record through the selected DoH upstream.</p>
       </div>
 
       <form onSubmit={handleTest} className="space-y-6">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
           <div className="space-y-2">
-            <label className="text-sm font-medium text-zinc-700">Domain Name</label>
+            <label htmlFor="dns-domain" className="text-sm font-medium text-zinc-700">Domain Name</label>
             <input
+              id="dns-domain"
               type="text"
               value={domain}
-              onChange={(e) => setDomain(e.target.value)}
-              className="w-full px-4 py-2.5 rounded-xl border border-white/50 focus:ring-2 focus:ring-zinc-400 focus:border-transparent outline-none transition-all bg-white/40 backdrop-blur-sm shadow-sm"
+              onChange={(event) => setDomain(event.target.value)}
+              className="w-full rounded-xl border border-white/50 bg-white/40 px-4 py-2.5 shadow-sm outline-none backdrop-blur-sm transition-all focus:border-transparent focus:ring-2 focus:ring-zinc-400"
               placeholder="example.com"
+              autoComplete="off"
+              spellCheck={false}
               required
             />
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium text-zinc-700">Record Type</label>
+            <label htmlFor="dns-type" className="text-sm font-medium text-zinc-700">Record Type</label>
             <select
+              id="dns-type"
               value={type}
-              onChange={(e) => setType(e.target.value)}
-              className="w-full px-4 py-2.5 rounded-xl border border-white/50 focus:ring-2 focus:ring-zinc-400 focus:border-transparent outline-none transition-all bg-white/40 backdrop-blur-sm shadow-sm"
+              onChange={(event) => setType(event.target.value as (typeof RECORD_TYPES)[number])}
+              className="w-full rounded-xl border border-white/50 bg-white/40 px-4 py-2.5 shadow-sm outline-none backdrop-blur-sm transition-all focus:border-transparent focus:ring-2 focus:ring-zinc-400"
             >
-              {recordTypes.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
+              {RECORD_TYPES.map((recordType) => <option key={recordType} value={recordType}>{recordType}</option>)}
             </select>
           </div>
         </div>
 
-        <div className="space-y-3">
-          <label className="text-sm font-medium text-zinc-700">Upstream Provider</label>
+        <fieldset className="space-y-3">
+          <legend className="text-sm font-medium text-zinc-700">Upstream Provider</legend>
           <div className="flex flex-wrap gap-2">
-            {DOH_PROVIDERS.map((p) => (
+            {DOH_PROVIDERS.map((provider) => (
               <button
-                key={p.id}
+                key={provider.id}
                 type="button"
-                onClick={() => setProviderId(p.id)}
+                aria-pressed={providerId === provider.id}
+                onClick={() => setProviderId(provider.id)}
                 className={clsx(
-                  "px-4 py-2 rounded-full text-sm font-medium transition-all border backdrop-blur-md",
-                  providerId === p.id
-                    ? "bg-zinc-900/80 text-white border-zinc-700/50 shadow-md"
-                    : "bg-white/40 text-zinc-600 border-white/50 hover:bg-white/60 hover:text-zinc-900 shadow-sm"
+                  "rounded-full border px-4 py-2 text-sm font-medium transition-all backdrop-blur-md",
+                  providerId === provider.id
+                    ? "border-zinc-700/50 bg-zinc-900/80 text-white shadow-md"
+                    : "border-white/50 bg-white/40 text-zinc-600 shadow-sm hover:bg-white/60 hover:text-zinc-900",
                 )}
               >
-                {p.name}
+                {provider.name}
               </button>
             ))}
           </div>
-        </div>
+        </fieldset>
 
-        {providerId === 'manual' && (
-          <div className="space-y-2 animate-in fade-in slide-in-from-top-2">
-            <label className="text-sm font-medium text-zinc-700">Custom DoH URL</label>
+        {providerId === "manual" && (
+          <div className="space-y-2">
+            <label htmlFor="manual-doh-url" className="text-sm font-medium text-zinc-700">Custom DoH URL</label>
             <input
+              id="manual-doh-url"
               type="url"
               value={manualUrl}
-              onChange={(e) => setManualUrl(e.target.value)}
-              className="w-full px-4 py-2.5 rounded-xl border border-white/50 focus:ring-2 focus:ring-zinc-400 focus:border-transparent outline-none transition-all bg-white/40 backdrop-blur-sm shadow-sm"
+              onChange={(event) => setManualUrl(event.target.value)}
+              className="w-full rounded-xl border border-white/50 bg-white/40 px-4 py-2.5 shadow-sm outline-none backdrop-blur-sm transition-all focus:border-transparent focus:ring-2 focus:ring-zinc-400"
               placeholder="https://example.com/dns-query"
+              autoComplete="url"
               required
             />
-            <p className="text-xs text-zinc-500">
-              Note: The server must support CORS or be accessible by the proxy.
-            </p>
+            <p className="text-xs text-zinc-500">The proxy validates the URL before forwarding the request.</p>
           </div>
         )}
 
         <button
           type="submit"
           disabled={loading}
-          className="w-full py-3 mt-2 bg-zinc-900/80 backdrop-blur-md text-white font-medium rounded-xl shadow-md border border-zinc-700/50 hover:bg-zinc-800/90 transition-all disabled:opacity-70 disabled:hover:bg-zinc-900/80 flex items-center justify-center space-x-2"
+          className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-700/50 bg-zinc-900/80 py-3 font-medium text-white shadow-md backdrop-blur-md transition-all hover:bg-zinc-800/90 disabled:cursor-not-allowed disabled:opacity-70"
         >
-          {loading ? (
-            <>
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>Resolving...</span>
-            </>
-          ) : (
-            <span>Resolve DNS</span>
-          )}
+          {loading ? <><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /><span>Resolving...</span></> : <span>Resolve DNS</span>}
         </button>
       </form>
 
       {error && (
-        <div className="mt-8 p-4 rounded-xl bg-red-50/50 border border-red-100 text-red-600 text-sm">
-          <p className="font-medium mb-1">Resolution Failed</p>
+        <div role="alert" className="mt-8 rounded-xl border border-red-100 bg-red-50/50 p-4 text-sm text-red-600">
+          <p className="mb-1 font-medium">Resolution Failed</p>
           <p className="opacity-90">{error}</p>
         </div>
       )}
 
       {result && (
-        <div className="mt-8 space-y-4 animate-in fade-in">
+        <div className="mt-8 space-y-4">
           <div className="flex items-center justify-between px-1">
             <h3 className="text-sm font-medium text-zinc-700">Response</h3>
             <span className={clsx(
-              "px-3 py-1 rounded-full text-xs font-mono border",
-              result.Status === 0 
-                ? "bg-emerald-50 text-emerald-700 border-emerald-200" 
-                : "bg-amber-50 text-amber-700 border-amber-200"
-            )}>
-              Status: {result.Status}
-            </span>
+              "rounded-full border px-3 py-1 text-xs font-mono",
+              result.Status === 0
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-amber-200 bg-amber-50 text-amber-700",
+            )}>Status: {result.Status}</span>
           </div>
-          
-          <div className="bg-[#111111] rounded-2xl p-5 overflow-x-auto shadow-inner border border-zinc-800">
-            <pre className="text-[13px] leading-relaxed font-mono text-zinc-300">
-              {JSON.stringify(result, null, 2)}
-            </pre>
+          <div className="overflow-x-auto rounded-2xl border border-zinc-800 bg-[#111111] p-5 shadow-inner">
+            <pre className="text-[13px] leading-relaxed text-zinc-300">{JSON.stringify(result, null, 2)}</pre>
           </div>
         </div>
       )}
