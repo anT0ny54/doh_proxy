@@ -11,7 +11,7 @@ export default function Home() {
         </h1>
         <p className="text-lg md:text-xl text-zinc-500 mb-8 max-w-2xl mx-auto font-light leading-relaxed">
           A high-performance, multi-upstream DNS over HTTPS proxy running on the edge.
-          Protect your privacy and bypass censorship with sub-millisecond latency.
+          Protect your privacy and bypass censorship with low-latency edge execution.
         </p>
       </div>
 
@@ -28,11 +28,11 @@ export default function Home() {
         />
         <FeatureCard 
           title="Edge Powered"
-          description="Deployed seamlessly on Cloudflare Pages for true global low-latency performance."
+          description="Designed for edge/serverless deployment with low request overhead."
         />
         <FeatureCard 
           title="Privacy First"
-          description="No logs, no tracking. A pure and transparent DNS resolution proxying service."
+          description="Stateless request handling with conservative caching and input controls."
         />
       </div>
 
@@ -59,7 +59,7 @@ export default function Home() {
 
       <footer className="mt-32 pb-8 text-center text-zinc-400 text-sm">
         <p>
-          © {new Date().getFullYear()} <a href="https://github.com/RATING3PRO/doh_proxy" target="_blank" rel="noopener noreferrer" className="hover:text-zinc-800 transition-colors underline decoration-zinc-300 underline-offset-4">DoH Proxy</a>. Open Source.
+          © {new Date().getFullYear()} <a href="https://github.com/anT0ny54/doh_proxy" target="_blank" rel="noopener noreferrer" className="hover:text-zinc-800 transition-colors underline decoration-zinc-300 underline-offset-4">DoH Proxy</a>. Open Source.
         </p>
       </footer>
     </main>
