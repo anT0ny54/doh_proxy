@@ -1,82 +1,66 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Konfigurasi Rate Limit
-const WINDOW_MS = 60 * 1000; // Jendela waktu: 1 Menit
-const MAX_REQUESTS = 60;     // Maksimal 60 request per IP per menit
+const WINDOW_MS = 60_000;
+const MAX_REQUESTS = 60;
+const MAX_TRACKED_IPS = 10_000;
 
-// Penyimpanan in-memory sederhana di Edge (Map)
-// Catatan: Efektif untuk membatasi lonjakan instan di masing-masing region edge node.
-const ipRequestMap = new Map<string, { count: number; resetTime: number }>();
+type RateLimitRecord = { count: number; resetTime: number };
+const rateLimits = new Map<string, RateLimitRecord>();
 
-// Membersihkan data lama secara berkala agar memori tidak penuh
-setInterval(() => {
+function getClientIP(request: NextRequest): string {
+  return (
+    request.headers.get("cf-connecting-ip") ||
+    request.headers.get("x-nf-client-connection-ip") ||
+    request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim() ||
+    request.headers.get("x-real-ip") ||
+    "unknown"
+  );
+}
+
+function pruneExpired(now: number): void {
+  if (rateLimits.size < MAX_TRACKED_IPS) return;
+  for (const [ip, record] of rateLimits) {
+    if (record.resetTime <= now) rateLimits.delete(ip);
+  }
+  if (rateLimits.size >= MAX_TRACKED_IPS) {
+    const oldest = rateLimits.keys().next().value as string | undefined;
+    if (oldest) rateLimits.delete(oldest);
+  }
+}
+
+export function middleware(request: NextRequest): NextResponse {
   const now = Date.now();
-  ipRequestMap.forEach((data, ip) => {
-    if (now > data.resetTime) {
-      ipRequestMap.delete(ip);
-    }
-  }, 30000);
-}, 30000);
+  const ip = getClientIP(request);
+  pruneExpired(now);
 
-export function middleware(request: NextRequest) {
-  // Hanya terapkan rate limiting pada rute API DoH
-  if (!request.nextUrl.pathname.startsWith("/api/doh")) {
-    return NextResponse.next();
+  let record = rateLimits.get(ip);
+  if (!record || record.resetTime <= now) {
+    record = { count: 0, resetTime: now + WINDOW_MS };
+    rateLimits.set(ip, record);
   }
 
-  // Deteksi IP klien secara multi-platform (Vercel & Netlify)
-  const netlifyIP = request.headers.get("x-nf-client-connection-ip");
-  const forwardedFor = request.headers.get("x-forwarded-for");
-  const realIP = request.headers.get("x-real-ip");
-
-  const clientIP = netlifyIP || (forwardedFor ? forwardedFor.split(",")[0].trim() : null) || realIP || "127.0.0.1";
-
-  const now = Date.now();
-  let record = ipRequestMap.get(clientIP);
-
-  if (!record || now > record.resetTime) {
-    record = {
-      count: 1,
-      resetTime: now + WINDOW_MS,
-    };
-    ipRequestMap.set(clientIP, record);
-  } else {
-    record.count += 1;
-  }
-
-  // Hitung sisa kuota
+  record.count += 1;
   const remaining = Math.max(0, MAX_REQUESTS - record.count);
-  const resetSeconds = Math.ceil((record.resetTime - now) / 1000);
+  const resetSeconds = Math.max(1, Math.ceil((record.resetTime - now) / 1000));
+  const headers = new Headers({
+    "X-RateLimit-Limit": String(MAX_REQUESTS),
+    "X-RateLimit-Remaining": String(remaining),
+    "X-RateLimit-Reset": String(record.resetTime),
+  });
 
-  // Jika melebihi batas, kembalikan HTTP 429 Too Many Requests
   if (record.count > MAX_REQUESTS) {
+    headers.set("Retry-After", String(resetSeconds));
     return NextResponse.json(
-      {
-        error: "Too Many Requests",
-        message: "Batas permintaan DoH terlampaui. Silakan coba beberapa saat lagi.",
-      },
-      {
-        status: 429,
-        headers: {
-          "Retry-After": String(resetSeconds),
-          "X-RateLimit-Limit": String(MAX_REQUESTS),
-          "X-RateLimit-Remaining": "0",
-          "X-RateLimit-Reset": String(record.resetTime),
-        },
-      }
+      { error: "Too Many Requests", message: "DoH request rate limit exceeded. Please try again later." },
+      { status: 429, headers },
     );
   }
 
-  // Lanjutkan request dan sisipkan header informasi rate limit
   const response = NextResponse.next();
-  response.headers.set("X-RateLimit-Limit", String(MAX_REQUESTS));
-  response.headers.set("X-RateLimit-Remaining", String(remaining));
-  response.headers.set("X-RateLimit-Reset", String(record.resetTime));
-
+  for (const [key, value] of headers) response.headers.set(key, value);
   return response;
 }
 
-// Konfigurasi matcher agar middleware hanya berjalan pada rute API yang dituju
 export const config = {
   matcher: "/api/doh/:path*",
 };
