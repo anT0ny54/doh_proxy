@@ -1,38 +1,24 @@
-import { NextRequest } from 'next/server';
-import { handleDoH } from '@/lib/doh';
+import { NextRequest } from "next/server";
+import { handleDoH } from "@/lib/doh";
 
-export const runtime = 'edge';
+export const runtime = "edge";
 
-type RouteContext = {
-  params: Promise<{
-    provider: string;
-  }>;
-};
-
-export async function GET(
-  request: NextRequest,
-  { params }: RouteContext
-) {
-  const { provider } = await params;
-  return handleDoH(request, provider);
+interface RouteContext {
+  params: Promise<{ provider: string }>;
 }
 
-export async function POST(
-  request: NextRequest,
-  { params }: RouteContext
-) {
-  const { provider } = await params;
-  return handleDoH(request, provider);
+export async function GET(request: NextRequest, { params }: RouteContext) {
+  return handleDoH(request, (await params).provider);
 }
 
-export async function HEAD(
-  request: NextRequest,
-  { params }: RouteContext
-) {
-  const { provider } = await params;
-  return handleDoH(request, provider);
+export async function POST(request: NextRequest, { params }: RouteContext) {
+  return handleDoH(request, (await params).provider);
 }
 
-export async function OPTIONS(request: NextRequest) {
-  return handleDoH(request, '');
+export async function HEAD(request: NextRequest, { params }: RouteContext) {
+  return handleDoH(request, (await params).provider);
+}
+
+export function OPTIONS(request: NextRequest) {
+  return handleDoH(request, "");
 }
