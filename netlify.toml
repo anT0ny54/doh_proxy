@@ -1,0 +1,5 @@
+[build]
+  command = "npm run build"
+
+# The public DoH rate limit is defined in netlify/edge-functions/doh-rate-limit.ts.
+# Netlify validates code-based rate-limit rules during deploy post-processing.
