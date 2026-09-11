@@ -1,8 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import clsx from "clsx";
-import { Loader2 } from "lucide-react";
 import { DOH_PROVIDERS } from "@/lib/providers";
 
 interface DnsAnswer {
@@ -90,10 +88,10 @@ export default function DnsTester() {
   }
 
   return (
-    <div className="w-full max-w-2xl mx-auto rounded-3xl border border-zinc-200/80 bg-white/60 p-6 shadow-sm backdrop-blur-md md:p-10">
-      <div className="mb-8 text-center">
+    <div className="mx-auto w-full max-w-2xl rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:p-6 md:p-8">
+      <div className="mb-6 text-center">
         <h2 className="text-2xl font-semibold text-zinc-900">DNS Tester</h2>
-        <p className="mt-2 text-sm text-zinc-500">Resolve a record through the selected DoH upstream.</p>
+        <p className="mt-2 text-sm text-zinc-500">Optional diagnostic tool for comparing the supported upstream JSON endpoints.</p>
       </div>
 
       <form onSubmit={handleTest} className="space-y-6">
@@ -105,7 +103,7 @@ export default function DnsTester() {
               type="text"
               value={domain}
               onChange={(event) => setDomain(event.target.value)}
-              className="w-full rounded-xl border border-white/50 bg-white/40 px-4 py-2.5 shadow-sm outline-none backdrop-blur-sm transition-all focus:border-transparent focus:ring-2 focus:ring-zinc-400"
+              className="w-full rounded-xl border border-zinc-300 bg-white px-4 py-2.5 shadow-sm outline-none transition focus:border-zinc-500 focus:ring-2 focus:ring-zinc-300"
               placeholder="example.com"
               autoComplete="off"
               spellCheck={false}
@@ -119,7 +117,7 @@ export default function DnsTester() {
               id="dns-type"
               value={type}
               onChange={(event) => setType(event.target.value as (typeof RECORD_TYPES)[number])}
-              className="w-full rounded-xl border border-white/50 bg-white/40 px-4 py-2.5 shadow-sm outline-none backdrop-blur-sm transition-all focus:border-transparent focus:ring-2 focus:ring-zinc-400"
+              className="w-full rounded-xl border border-zinc-300 bg-white px-4 py-2.5 shadow-sm outline-none transition focus:border-zinc-500 focus:ring-2 focus:ring-zinc-300"
             >
               {RECORD_TYPES.map((recordType) => <option key={recordType} value={recordType}>{recordType}</option>)}
             </select>
@@ -135,12 +133,11 @@ export default function DnsTester() {
                 type="button"
                 aria-pressed={providerId === provider.id}
                 onClick={() => setProviderId(provider.id)}
-                className={clsx(
-                  "rounded-full border px-4 py-2 text-sm font-medium transition-all backdrop-blur-md",
+                className={`rounded-full border px-4 py-2 text-sm font-medium transition ${
                   providerId === provider.id
-                    ? "border-zinc-700/50 bg-zinc-900/80 text-white shadow-md"
-                    : "border-white/50 bg-white/40 text-zinc-600 shadow-sm hover:bg-white/60 hover:text-zinc-900",
-                )}
+                    ? "border-zinc-700 bg-zinc-900 text-white shadow-sm"
+                    : "border-zinc-300 bg-white text-zinc-600 shadow-sm hover:bg-zinc-50 hover:text-zinc-900"
+                }`}
               >
                 {provider.name}
               </button>
@@ -156,7 +153,7 @@ export default function DnsTester() {
               type="url"
               value={manualUrl}
               onChange={(event) => setManualUrl(event.target.value)}
-              className="w-full rounded-xl border border-white/50 bg-white/40 px-4 py-2.5 shadow-sm outline-none backdrop-blur-sm transition-all focus:border-transparent focus:ring-2 focus:ring-zinc-400"
+              className="w-full rounded-xl border border-zinc-300 bg-white px-4 py-2.5 shadow-sm outline-none transition focus:border-zinc-500 focus:ring-2 focus:ring-zinc-300"
               placeholder="https://example.com/dns-query"
               autoComplete="url"
               required
@@ -168,14 +165,14 @@ export default function DnsTester() {
         <button
           type="submit"
           disabled={loading}
-          className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-700/50 bg-zinc-900/80 py-3 font-medium text-white shadow-md backdrop-blur-md transition-all hover:bg-zinc-800/90 disabled:cursor-not-allowed disabled:opacity-70"
+          className="mt-2 flex min-h-11 w-full items-center justify-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900 py-3 font-medium text-white shadow-sm transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-70"
         >
-          {loading ? <><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /><span>Resolving...</span></> : <span>Resolve DNS</span>}
+          {loading ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" aria-hidden="true" /><span>Resolving...</span></> : <span>Resolve DNS</span>}
         </button>
       </form>
 
       {error && (
-        <div role="alert" className="mt-8 rounded-xl border border-red-100 bg-red-50/50 p-4 text-sm text-red-600">
+        <div role="alert" className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
           <p className="mb-1 font-medium">Resolution Failed</p>
           <p className="opacity-90">{error}</p>
         </div>
@@ -185,14 +182,13 @@ export default function DnsTester() {
         <div className="mt-8 space-y-4">
           <div className="flex items-center justify-between px-1">
             <h3 className="text-sm font-medium text-zinc-700">Response</h3>
-            <span className={clsx(
-              "rounded-full border px-3 py-1 text-xs font-mono",
+            <span className={`rounded-full border px-3 py-1 text-xs font-mono ${
               result.Status === 0
                 ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                : "border-amber-200 bg-amber-50 text-amber-700",
-            )}>Status: {result.Status}</span>
+                : "border-amber-200 bg-amber-50 text-amber-700"
+            }`}>Status: {result.Status}</span>
           </div>
-          <div className="overflow-x-auto rounded-2xl border border-zinc-800 bg-[#111111] p-5 shadow-inner">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800 bg-[#111111] p-4 shadow-inner">
             <pre className="text-[13px] leading-relaxed text-zinc-300">{JSON.stringify(result, null, 2)}</pre>
           </div>
         </div>
