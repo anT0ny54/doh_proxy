@@ -1,19 +1,28 @@
 @import "tailwindcss";
 
-body {
-  @apply bg-zinc-100 text-zinc-900 relative;
-  min-height: 100vh;
+html {
+  background: #f4f4f5;
 }
 
-body::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  /* Darker dots */
-  background-image: radial-gradient(#9ca3af 1.5px, transparent 1.5px);
-  background-size: 24px 24px;
-  /* Apply blur to the background dots */
-  filter: blur(1px);
-  opacity: 0.6;
+body {
+  min-height: 100vh;
+  background: #f4f4f5;
+  color: #18181b;
+}
+
+button,
+input,
+select {
+  touch-action: manipulation;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

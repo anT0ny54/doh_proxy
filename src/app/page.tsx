@@ -1,76 +1,86 @@
-import DnsTester from '@/components/DnsTester';
-import { DOH_PROVIDERS } from '@/lib/providers';
+import DnsTester from "@/components/DnsTester";
+import CopyButton from "@/components/CopyButton";
+
+const PUBLIC_DOH_ENDPOINT = "https://freedns-six.vercel.app/api/doh/dns-query";
+const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
 
 export default function Home() {
   return (
-    <main className="min-h-screen py-16 px-4 sm:px-6 lg:px-8">
-      {/* Hero Section */}
-      <div className="text-center max-w-3xl mx-auto mb-20 mt-10">
-        <h1 className="text-4xl md:text-6xl font-extrabold text-zinc-900 tracking-tight mb-6">
-          Secure DoH Proxy
-        </h1>
-        <p className="text-lg md:text-xl text-zinc-500 mb-8 max-w-2xl mx-auto font-light leading-relaxed">
-          A high-performance, multi-upstream DNS over HTTPS proxy running on the edge.
-          Protect your privacy and bypass censorship with low-latency edge execution.
-        </p>
-      </div>
+    <main className="min-h-screen px-4 py-8 sm:px-6 sm:py-12 lg:px-8">
+      <div className="mx-auto max-w-4xl">
+        <header className="mx-auto max-w-3xl text-center">
+          <p className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-zinc-500">FreeDNS</p>
+          <h1 className="text-4xl font-extrabold tracking-tight text-zinc-900 sm:text-5xl">
+            Fast DNS-over-HTTPS
+          </h1>
+          <p className="mx-auto mt-4 max-w-2xl text-base leading-7 text-zinc-600 sm:text-lg">
+            A lightweight public DoH resolver using HaGeZi upstreams with automatic rotation,
+            sequential failover, strict request validation, and layered abuse protection.
+          </p>
+        </header>
 
-      {/* Tester Section */}
-      <div className="mb-24">
-        <DnsTester />
-      </div>
-
-      {/* Features Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl mx-auto mb-24">
-        <FeatureCard 
-          title="Multi-Provider"
-          description="Switch between Cloudflare, Google, AdGuard, DNS.SB, and custom endpoints instantly."
-        />
-        <FeatureCard 
-          title="Edge Powered"
-          description="Designed for edge/serverless deployment with low request overhead."
-        />
-        <FeatureCard 
-          title="Privacy First"
-          description="Stateless request handling with conservative caching and input controls."
-        />
-      </div>
-
-      {/* Endpoints Section */}
-      <div className="max-w-4xl mx-auto">
-        <h2 className="text-xl font-semibold text-zinc-900 mb-8 text-center">Available Endpoints</h2>
-        <div className="bg-white/60 backdrop-blur-md rounded-2xl shadow-sm border border-zinc-200 overflow-hidden">
-          {DOH_PROVIDERS.map((provider) => (
-            <div key={provider.id} className="p-5 border-b border-zinc-100 last:border-0 hover:bg-zinc-50/50 transition-colors flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div>
-                <div className="flex items-center gap-3 mb-1">
-                  <span className="font-semibold text-zinc-800">{provider.name}</span>
-                  <span className="text-[11px] px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-500 font-mono tracking-wide">{provider.id}</span>
-                </div>
-                <p className="text-sm text-zinc-500">{provider.description}</p>
-              </div>
-              <div className="flex items-center gap-2 bg-zinc-100/80 rounded-lg p-2.5 font-mono text-sm text-zinc-600 break-all border border-zinc-200/50">
-                <span className="select-all">/api/doh/{provider.id}</span>
-              </div>
+        <section className="mt-8 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:p-6" aria-labelledby="endpoint-title">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <div className="min-w-0">
+              <h2 id="endpoint-title" className="text-sm font-semibold text-zinc-900">Public DoH endpoint</h2>
+              <code className="mt-2 block break-all rounded-xl bg-zinc-100 px-3 py-3 text-sm text-zinc-700 select-all">
+                {PUBLIC_DOH_ENDPOINT}
+              </code>
             </div>
-          ))}
-        </div>
-      </div>
+            <CopyButton value={PUBLIC_DOH_ENDPOINT} />
+          </div>
+          <p className="mt-3 text-xs leading-5 text-zinc-500">
+            RFC 8484 GET and POST are supported. The endpoint returns wire-format DNS responses and does not intentionally cache DNS answers.
+          </p>
+        </section>
 
-      <footer className="mt-32 pb-8 text-center text-zinc-400 text-sm">
-        <p>
-          © {new Date().getFullYear()} <a href="https://github.com/anT0ny54/doh_proxy" target="_blank" rel="noopener noreferrer" className="hover:text-zinc-800 transition-colors underline decoration-zinc-300 underline-offset-4">DoH Proxy</a>. Open Source.
-        </p>
-      </footer>
+        <section className="mt-10" aria-labelledby="tester-title">
+          <DnsTester />
+        </section>
+
+        <section className="mt-10 grid gap-4 sm:grid-cols-3" aria-label="Service features">
+          <FeatureCard title="HaGeZi upstreams" description="Three trusted upstream endpoints with deterministic 30-minute primary rotation." />
+          <FeatureCard title="Fast failover" description="Only one upstream is tried at a time, with a shared three-second request budget." />
+          <FeatureCard title="Abuse protection" description="Strict DNS validation, per-instance limits, CORS controls, and platform WAF support." />
+        </section>
+
+        <section className="mt-10 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:p-6" aria-labelledby="usage-title">
+          <h2 id="usage-title" className="text-lg font-semibold text-zinc-900">How to use it</h2>
+          <div className="mt-4 grid gap-4 text-sm text-zinc-600 sm:grid-cols-3">
+            <Step number="1" text="Set your device or browser DNS-over-HTTPS URL to the public endpoint above." />
+            <Step number="2" text="For RFC 8484 clients, use GET with dns= or POST with application/dns-message." />
+            <Step number="3" text="For public deployment, add a Vercel Firewall rate-limit rule for /api/doh/dns-query." />
+          </div>
+        </section>
+
+        <footer className="mt-12 pb-4 text-center text-sm text-zinc-400">
+          <p>
+            © {new Date().getFullYear()} {" "}
+            <a href={REPOSITORY_URL} target="_blank" rel="noopener noreferrer" className="underline decoration-zinc-300 underline-offset-4 hover:text-zinc-700">
+              FreeDNS / DoH Proxy
+            </a>
+            {" "}· Open source under AGPL-3.0
+          </p>
+        </footer>
+      </div>
     </main>
   );
 }
 
-function FeatureCard({ title, description }: { title: string, description: string }) {
+function FeatureCard({ title, description }: { title: string; description: string }) {
   return (
-    <div className="bg-white/60 backdrop-blur-sm p-8 rounded-2xl border border-zinc-200/80 hover:border-zinc-300 transition-colors">
-      <h3 className="text-lg font-semibold text-zinc-800 mb-3">{title}</h3>
-      <p className="text-zinc-500 leading-relaxed text-sm">{description}</p>
+    <article className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+      <h3 className="font-semibold text-zinc-900">{title}</h3>
+      <p className="mt-2 text-sm leading-6 text-zinc-600">{description}</p>
+    </article>
+  );
+}
+
+function Step({ number, text }: { number: string; text: string }) {
+  return (
+    <div className="flex gap-3">
+      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-zinc-900 text-xs font-semibold text-white">{number}</span>
+      <p className="leading-6">{text}</p>
     </div>
   );
 }

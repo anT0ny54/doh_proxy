@@ -1,19 +1,23 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
+const SITE_URL = "https://freedns-six.vercel.app";
 const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://github.com/anT0ny54/doh_proxy"),
-  title: "Secure DoH Proxy | Fast, Privacy-First DNS",
+  metadataBase: new URL(SITE_URL),
+  title: "FreeDNS — Fast DNS-over-HTTPS",
   description:
-    "A high-performance DNS-over-HTTPS proxy with multiple public upstream providers and a browser-based DNS tester.",
-  keywords: ["DoH", "DNS over HTTPS", "DNS proxy", "Cloudflare", "Google DNS", "AdGuard DNS"],
-  authors: [{ name: "DoH Proxy", url: REPOSITORY_URL }],
+    "A lightweight public DNS-over-HTTPS resolver using HaGeZi upstreams with automatic rotation and failover.",
+  keywords: ["FreeDNS", "DNS over HTTPS", "DoH", "HaGeZi", "public DNS"],
+  authors: [{ name: "FreeDNS", url: REPOSITORY_URL }],
+  alternates: { canonical: "/" },
+  robots: { index: true, follow: true },
   openGraph: {
-    title: "Secure DoH Proxy",
-    description: "Fast, privacy-first DNS-over-HTTPS proxy.",
+    title: "FreeDNS — Fast DNS-over-HTTPS",
+    description: "A lightweight public DoH resolver with automatic rotation and failover.",
     type: "website",
+    url: SITE_URL,
   },
 };
 
@@ -22,9 +26,7 @@ export const viewport: Viewport = {
   colorScheme: "light",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{ children: React.ReactNode }>) {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
       <body className="antialiased">{children}</body>
