@@ -1,113 +1,99 @@
-# 🛡️ Secure DoH Proxy v1.4.1
+# FreeDNS DoH Proxy
 
-A privacy-focused DNS-over-HTTPS proxy built with Next.js 16 and designed for edge/serverless deployments, including Vercel and Netlify.
+A lightweight, mobile-friendly DNS-over-HTTPS proxy for the public FreeDNS endpoint.
 
-## Public DoH features
 
-- **Three HaGeZi upstreams:** `root → wurzn → juist → root`.
-- **Stateless rotation:** the primary upstream changes every 30 minutes by default, without Redis/KV/SQLite.
-- **Sequential failover:** if the selected upstream fails, the request tries the other two in order.
-- **One upstream request at a time:** avoids the old three-way race and reduces unnecessary upstream traffic.
-- **Global upstream budget:** one client query gets at most 3 seconds for all upstream attempts.
-- **RFC 8484 wire format:** GET `dns=` and POST `application/dns-message` are supported on the public endpoint.
-- **Strict request bounds:** query strings and DNS bodies are limited to 4 KiB; GET DNS messages must decode to a plausible DNS packet.
-- **Application rate limit:** 120 DNS requests/minute/IP per running instance; health and preflight requests do not consume the budget.
-- **Netlify edge rate limit:** 100 requests/minute/IP/domain on the public endpoint.
-- **Vercel WAF support:** documented rule for edge rate limiting by IP.
-- **No DNS query logging by default.**
-- **No response caching:** DNS answers are not intentionally cached by the application.
-- **No upstream disclosure:** the selected HaGeZi endpoint is not returned to clients.
-- **SSRF hardening:** custom/manual upstreams reject common private and reserved targets.
-- **Security headers:** enabled globally.
-- **Non-root Docker runtime.**
+## Public DoH endpoint
 
-## Public endpoint
+`https://freedns-six.vercel.app/api/doh/dns-query`
 
-After deployment, use:
+The public endpoint keeps the existing `/api/doh/dns-query` wire-format behavior and uses the supported HaGeZi upstream resolvers with sequential failover.
 
-```text
-https://YOUR-VERCEL-DOMAIN/api/doh/dns-query
-https://YOUR-NETLIFY-DOMAIN/api/doh/dns-query
-```
 
-Both deployments can use the same Git repository.
+The V2 cleanup keeps the existing public DoH route and its wire-format behavior while reducing frontend work, removing unused deployment files/utilities, and making the website mobile-first.
 
-## HaGeZi rotation
+## What changed in V2
 
-The three upstreams are:
+- Kept `/api/doh/dns-query` as the primary public endpoint.
+- Kept RFC 8484 GET and POST support.
+- Kept stateless HaGeZi rotation and sequential failover.
+- Reduced the per-upstream timeout from 1.2s to 1.0s while keeping the 3s global budget.
+- Removed the unused `src/lib/platform.ts` helper.
+- Removed committed TypeScript build output (`tsconfig.tsbuildinfo`).
+- Removed unused Netlify, Wrangler, Docker and keep-alive deployment artifacts from the Vercel-focused project.
+- Removed `clsx` and `lucide-react`; the UI now uses small local class expressions and a CSS spinner.
+- Removed the blurred/dotted page background and heavy backdrop filters for better mobile rendering.
+- Reduced excessive vertical spacing and improved touch target sizing.
+- Added a prominent one-tap public DoH endpoint copy control.
+- Corrected site metadata to use `https://freedns-six.vercel.app` instead of the GitHub repository as `metadataBase`.
+- Added canonical, robots and Open Graph metadata.
+- Disabled TypeScript incremental build artifacts in the repository.
+- Kept the older provider routes for compatibility with the built-in diagnostic tester; they are no longer presented as the primary public FreeDNS service.
 
-1. `https://root.hagezi.org/dns-query`
-2. `https://wurzn.hagezi.org/dns-query`
-3. `https://juuri.hagezi.org/dns-query`
+## V2.1 highlights
 
-Default:
-
-```text
-HAGEZI_ROTATION_SECONDS=1800
-```
-
-Rotation is calculated from the current UTC epoch time. This makes the selection deterministic across cold starts and multiple serverless instances.
-
-Within each rotation slot the selected endpoint is tried first. Failures then fall through to the next endpoint, then the third endpoint. A single successful DNS query therefore normally creates only one upstream request.
-
-The valid rotation range is 60 seconds to 24 hours.
+- Vercel deployment support retained.
+- Netlify deployment support retained, including the Edge Function rate limiter.
+- Existing `/api/doh/dns-query` route and request/response behavior preserved.
+- Mobile UI simplified for faster rendering and less visual overhead.
+- Removed unused frontend dependencies (`clsx`, `lucide-react`).
+- Added a lightweight copy-to-clipboard control for the public endpoint.
+- Reduced unnecessary CSS effects and spacing while preserving responsive behavior.
+- Added `Vary: Accept, Origin` to improve cache correctness.
+- Public upstream timeout reduced from 1200 ms to 1000 ms without changing the failover architecture.
+- Removed unused `src/lib/platform.ts` and TypeScript incremental build state.
 
 ## Public DoH API
 
 ### GET
 
-Use standard RFC 8484 `dns` query encoding:
+### RFC 8484 usage
+
+- **GET:** send the DNS wire message in the `dns` query parameter.
+- **POST:** send an `application/dns-message` request body.
+- The endpoint does not accept arbitrary upstream URLs.
+
+
+### Response behavior
+
+The public route:
+
+- rotates the primary HaGeZi upstream every 30 minutes by default;
+- tries only one upstream at a time;
+- falls through to the next upstream after a failure;
+- gives the complete request a maximum 3-second upstream budget;
+- does not intentionally cache DNS responses;
+- does not expose the selected upstream URL;
+- validates GET DNS messages and POST size/content type;
+- returns CORS headers for public DoH clients.
+
+The three upstreams are:
 
 ```text
-GET /api/doh/dns-query?dns=<base64url DNS message>
+https://root.hagezi.org/dns-query
+https://wurzn.hagezi.org/dns-query
+https://juuri.hagezi.org/dns-query
 ```
 
-The proxy rejects missing, malformed, or oversized DNS messages.
-
-### POST
+Rotation can be changed with:
 
 ```text
-POST /api/doh/dns-query
-Content-Type: application/dns-message
+HAGEZI_ROTATION_SECONDS=1800
 ```
 
-The DNS wire message must be at least 12 bytes and no larger than 4096 bytes.
+The allowed range is 60 seconds to 24 hours.
 
-### OPTIONS / HEAD
+## Rate limiting and abuse protection
 
-Both return `204 No Content`. They do not consume the application DNS rate limit.
+The application limiter remains:
 
-### Errors
+```text
+120 DNS requests/minute/IP per running instance
+```
 
-- `400` malformed or missing DNS message
-- `405` unsupported method
-- `413` oversized request
-- `415` unsupported POST content type
-- `429` application rate limit exceeded
-- `502` all upstreams failed
-- `504` global upstream timeout
+This is intentionally not treated as a global distributed limiter because serverless instances do not share an in-memory counter. For a public Vercel deployment, use the Vercel Firewall/WAF as the platform-level control and keep the application limiter as a second safety layer.
 
-Rate-limited responses include `Retry-After` and standard `RateLimit-*` headers.
-
-## Configuration
-
-| Variable | Description | Default |
-|---|---|---|
-| `HAGEZI_ROTATION_SECONDS` | HaGeZi primary-upstream rotation interval. | `1800` |
-| `CUSTOM_DOH_URL` | Upstream URL for the `custom` provider. | unset |
-| `DEBUG_LOG` | Set to `true` to log successful requests as well as errors. | `false` |
-| `PORT` | Standalone Docker HTTP port. | `8367` |
-
-## Vercel deployment
-
-1. Push this repository to GitHub.
-2. Import it into Vercel.
-3. Keep the normal Next.js build settings.
-4. Deploy.
-5. Test `HEAD /api/doh/dns-query`.
-6. Add a Vercel Firewall/WAF rate-limit rule for `/api/doh/dns-query`.
-
-A good starting rule is:
+Recommended starting rule:
 
 ```text
 Path: /api/doh/dns-query
@@ -115,91 +101,73 @@ Limit: 120 requests/minute/IP
 Action: rate limit
 ```
 
-For a public resolver, start conservatively and tune from real traffic. Vercel Firewall supports custom WAF rules that can rate-limit by IP and path. The current Vercel CLI also supports adding a rule with a natural-language command, for example:
+Vercel provides a global firewall/WAF layer that can apply application-aware traffic rules at the edge.
 
-```bash
-vercel firewall rules add --ai "Rate limit /api/doh/dns-query to 120 requests per minute by IP"
-```
+## Website
 
-Vercel's WAF rate-limited/blocked traffic is currently excluded from CDN request and Fast Data Transfer charges. Verify the exact rule in the Vercel dashboard after creation. 
+The homepage is intentionally focused on the actual FreeDNS service rather than advertising the legacy multi-provider proxy as the main product.
 
-## Netlify deployment
+It provides:
 
-1. Push this repository to GitHub.
-2. Create a new Netlify site from the repository.
-3. Let Netlify use its Next.js integration.
-4. Deploy.
-5. Check the deploy log for the code-based rate-limit rule.
-6. Test `HEAD /api/doh/dns-query`.
+- the public DoH URL with a copy button;
+- a compact DNS diagnostic tester;
+- a short explanation of rotation/failover and abuse protection;
+- mobile-friendly spacing and controls;
+- lightweight CSS without the previous blurred background layers.
 
-This repository includes:
+The diagnostic tester still exposes the compatibility provider routes because they are useful for comparing DNS responses. These routes are separate from the public FreeDNS wire endpoint.
 
-```text
-netlify/edge-functions/doh-rate-limit.ts
-```
+## Configuration
 
-It defines a Netlify Edge Function middleware rule:
+| Variable | Description | Default |
+|---|---|---|
+| `HAGEZI_ROTATION_SECONDS` | Primary-upstream rotation interval. | `1800` |
+| `CUSTOM_DOH_URL` | Upstream for the legacy `custom` provider. | unset |
+| `DEBUG_LOG` | Set to `true` to log successful request metadata as well as errors. | `false` |
+| `PORT` | Standalone server port when using a custom Next.js deployment. | `8367` |
 
-```text
-100 requests / 60 seconds / IP + domain
-```
+## Security notes
 
-The middleware calls `context.next()` so the normal Next.js DoH route continues after Netlify applies the rate-limit policy.
-
-Netlify documents code-based rate limiting for Edge Functions on all plans. Enforcement can take up to about 10 seconds to catch up after a client crosses the threshold, so the application limiter remains enabled as a second safety layer.
-
-## Layered abuse protection
-
-The public resolver intentionally uses multiple layers:
-
-```text
-Client
-  ↓
-Vercel WAF / Netlify DDoS + rate limiting
-  ↓
-Next.js application rate limiter
-  ↓
-Strict DNS request validation
-  ↓
-HaGeZi rotation + sequential failover
-```
-
-The application limiter is **per running instance**, not a global distributed counter. Platform-level protection is therefore recommended for public use.
-
-## Rate-limit tuning
-
-The application default is:
-
-```text
-120 DNS requests/minute/IP
-```
-
-This is deliberately higher than a very strict API limit because several devices can share one public IP through NAT.
-
-If the service is private/personal, a lower platform limit such as 30–60/min/IP may be appropriate. For a genuinely public resolver, start around 60–120/min/IP and observe legitimate traffic before tightening it.
-
-## Security and privacy
-
-- DNS query contents are not intentionally written to application logs.
+- DNS query bodies are not intentionally written to application logs.
 - `DEBUG_LOG=true` logs request metadata, not the DNS message body.
-- The selected upstream URL is not returned to the client.
 - `Cache-Control: no-store` is used for DNS responses.
-- Manual/custom upstream URLs are checked against common localhost, private, link-local, multicast, and reserved IP ranges.
-- DNS rebinding cannot be completely prevented in an Edge Runtime by hostname validation alone; do not expose arbitrary upstream selection unless the endpoint is trusted.
-- A public DoH service can still be abused for bandwidth consumption even with rate limiting. Monitor platform usage and upstream traffic.
+- The public endpoint does not accept arbitrary upstream URLs.
+- The legacy manual/custom provider routes retain their existing validation and should not be considered equivalent to the hardened public FreeDNS endpoint.
+- A public DoH service can still consume substantial bandwidth under abuse, so platform-level traffic controls remain important.
 
-## Other providers
+## Deployment
 
-The existing provider routes remain available:
+This V2 package is focused on Vercel/Next.js deployment.
 
-| Provider | Default | JSON | Wire format |
-|---|---|---|---|
-| Cloudflare | `/api/doh/cloudflare` | `/api/doh/cloudflare` | `/api/doh/cloudflare/dns-query` |
-| Google | `/api/doh/google` | `/api/doh/google/resolve` | `/api/doh/google/dns-query` |
-| AdGuard | `/api/doh/adguard` | `/api/doh/adguard/resolve` | `/api/doh/adguard/dns-query` |
-| DNS.SB | `/api/doh/dnssb` | `/api/doh/dnssb` | `/api/doh/dnssb/dns-query` |
-| Custom | `/api/doh/custom` | depends on upstream | depends on upstream |
-| Manual | `/api/doh/manual?upstream=<url>` | depends on upstream | depends on upstream |
+1. Push the repository to GitHub.
+2. Import it into Vercel.
+3. Deploy using the normal Next.js settings.
+4. Test `HEAD /api/doh/dns-query`.
+5. Add a Vercel Firewall rate-limit rule for `/api/doh/dns-query`.
+
+Before production deployment, use the latest patched Next.js release available for your environment. Vercel's May 2026 security release notes specifically recommend upgrading affected Next.js applications to patched releases.
+## Deployment
+
+### Vercel
+
+This repository is ready for Vercel deployment using the existing Next.js configuration.
+
+### Netlify
+
+Netlify support is intentionally preserved. The repository includes:
+
+- `netlify.toml`
+- `netlify/edge-functions/doh-rate-limit.ts`
+
+The Netlify Edge Function provides the existing per-IP/domain rate-limit layer while the Next.js application handles the DoH proxy route.
+
+### Other deployment files
+
+The existing Docker, Wrangler, and GitHub Actions deployment/maintenance files are retained to avoid breaking previously supported workflows.
+
+## Compatibility
+
+The older provider JSON routes and DNS tester remain in the project for compatibility. The public FreeDNS DoH endpoint is the recommended wire-format interface.
 
 ## Development
 
@@ -208,25 +176,14 @@ npm ci
 npm run dev
 ```
 
-Production build:
+Production checks:
 
 ```bash
 npm run lint
 npm run build
 ```
 
-## Docker
-
-The included multi-stage Dockerfile builds a standalone Next.js image and runs it as a non-root user.
-
-```bash
-docker build -t doh-proxy .
-docker run --rm -p 8367:8367 doh-proxy
-```
-
 ## Validation checklist
-
-Before making the endpoint public:
 
 ```text
 ✓ HEAD /api/doh/dns-query → 204
@@ -236,9 +193,10 @@ Before making the endpoint public:
 ✓ Malformed dns → 400
 ✓ Oversized body → 413
 ✓ Unsupported POST content type → 415
-✓ Rate limit → 429 + Retry-After
-✓ Upstream failure → fallback to next HaGeZi endpoint
-✓ All upstreams unavailable → 502/504
+✓ Application rate limit → 429 + Retry-After
+✓ Upstream failure → sequential HaGeZi fallback
+✓ Global timeout → bounded failure response
+✓ No intentional DNS response caching
 ```
 
 ## License
@@ -248,31 +206,3 @@ AGPL-3.0
 ## Repository
 
 https://github.com/anT0ny54/doh_proxy
-
-
-## 🌐 Free DNS Services
-
-High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
-
-| Blocklist | DNS-over-HTTPS (DoH) |
-| :--- | :--- |
-| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://freedns-six.vercel.app/api/doh/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-
----
-
-# ⚡ Bandwidth Hero Server
-
-A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
-
-Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
-
-🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/)
-
-
-## Supporting the Project
-
-If you find this project useful, donations are appreciated:
-- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
-  
