@@ -9,12 +9,12 @@ const UPSTREAMS = [
   "https://juuri.hagezi.org/dns-query",
 ] as const;
 
-const UPSTREAM_TIMEOUT_MS = 1_200;
+const UPSTREAM_TIMEOUT_MS = 1_000;
 const GLOBAL_TIMEOUT_MS = 3_000;
 const MAX_QUERY_STRING_LENGTH = 1_024;
 const MAX_BODY_SIZE = 4_096;
 const MAX_DNS_MESSAGE_SIZE = 4_096;
-const PROXY_VERSION = "v1.4.1";
+const PROXY_VERSION = "v2.0.0";
 const DEFAULT_WIRE_ACCEPT = "application/dns-message";
 const USER_AGENT = `DoH-Proxy/${PROXY_VERSION.slice(1)}`;
 const DEFAULT_ROTATION_SECONDS = 1_800;
@@ -25,6 +25,7 @@ const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
   "Access-Control-Allow-Headers": "Content-Type, Accept",
+  Vary: "Accept, Origin",
   "Cache-Control": "no-store, max-age=0",
   Pragma: "no-cache",
   Expires: "0",
