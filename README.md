@@ -199,6 +199,31 @@ npm run build
 ✓ No intentional DNS response caching
 ```
 
+
+## 🏪 My Free DNS Server
+
+Use **HaGeZi Blocklists Multi Pro + TIF** with My Free DNS.
+
+| Service | DNS-over-HTTPS URL |
+| --- | --- |
+| Multi Pro + TIF (Recommended) | `https://freedns.koyeb.app/dns-query` |
+| Multi Pro + TIF (Recommended) | `https://freedns-six.vercel.app/api/doh/dns-query` |
+| Multi Pro + TIF (Backup) | `https://dnssix.netlify.app/api/doh/dns-query` |
+
+## ⚡ Bandwidth Hero Server
+
+A lightweight image proxy that cuts bandwidth and speeds up browsing. Fetches remote images, compresses them, and returns optimized versions for faster loading and lower data use.
+
+🖥️ **Try it out:** https://bhserv.netlify.app/
+
+
+## 💜 Support This Project
+
+If you'd like to support development, consider donating:
+
+**Bitcoin:** `1HntwKxyGCfnSGvGLMUTRAqLnTvLarAQP`
+
+
 ## License
 
 AGPL-3.0
