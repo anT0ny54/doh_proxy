@@ -28,7 +28,7 @@ The V2 cleanup keeps the existing public DoH route and its wire-format behavior 
 - Corrected site metadata to use `https://freedns-six.vercel.app` instead of the GitHub repository as `metadataBase`.
 - Added canonical, robots and Open Graph metadata.
 - Disabled TypeScript incremental build artifacts in the repository.
-- Kept the older provider routes for compatibility with the built-in diagnostic tester; they are no longer presented as the primary public FreeDNS service.
+- Kept the supported provider routes for diagnostics; the public FreeDNS wire endpoint remains the primary service.
 
 ## V2.1 highlights
 
@@ -122,7 +122,6 @@ The diagnostic tester still exposes the compatibility provider routes because th
 | Variable | Description | Default |
 |---|---|---|
 | `HAGEZI_ROTATION_SECONDS` | Primary-upstream rotation interval. | `1800` |
-| `CUSTOM_DOH_URL` | Upstream for the legacy `custom` provider. | unset |
 | `DEBUG_LOG` | Set to `true` to log successful request metadata as well as errors. | `false` |
 | `PORT` | Standalone server port when using a custom Next.js deployment. | `8367` |
 
@@ -132,7 +131,7 @@ The diagnostic tester still exposes the compatibility provider routes because th
 - `DEBUG_LOG=true` logs request metadata, not the DNS message body.
 - `Cache-Control: no-store` is used for DNS responses.
 - The public endpoint does not accept arbitrary upstream URLs.
-- The legacy manual/custom provider routes retain their existing validation and should not be considered equivalent to the hardened public FreeDNS endpoint.
+- Provider routes are fixed to known public resolver endpoints; arbitrary upstream URLs are not accepted.
 - A public DoH service can still consume substantial bandwidth under abuse, so platform-level traffic controls remain important.
 
 ## Deployment
