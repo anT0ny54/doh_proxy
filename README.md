@@ -30,17 +30,6 @@ The V2 cleanup keeps the existing public DoH route and its wire-format behavior 
 - Disabled TypeScript incremental build artifacts in the repository.
 - Kept the older provider routes for compatibility with the built-in diagnostic tester; they are no longer presented as the primary public FreeDNS service.
 
-## V2.2 highlights
-
-- Removed the `Custom` and `Manual Input` provider entries and their request-time upstream code.
-- Fixed provider JSON routing so `/api/doh/google` uses Google `/resolve` and `/api/doh/adguard` uses AdGuard `/resolve`.
-- Prevented RFC 8484 `dns=` payloads from being incorrectly forwarded to JSON `/resolve` endpoints.
-- Kept `/api/doh/dns-query` unchanged as the primary public wire-format service.
-- Kept provider-specific RFC 8484 routes such as `/api/doh/google/dns-query` and `/api/doh/adguard/dns-query`.
-- Fixed OPTIONS handling and kept HEAD health responses local so upstreams do not need to support HEAD.
-- Forwarded only allowlisted DNS query parameters to JSON upstreams, reducing accidental/conflicting parameters.
-- Removed DNS.SB from the JSON tester because its configured route is wire-format oriented.
-
 ## V2.1 highlights
 
 - Vercel deployment support retained.
@@ -126,13 +115,14 @@ It provides:
 - mobile-friendly spacing and controls;
 - lightweight CSS without the previous blurred background layers.
 
-The diagnostic tester exposes only providers that support the JSON API. Google and AdGuard use their `/resolve` JSON APIs, while RFC 8484 wire-format clients should use their `/dns-query` routes.
+The diagnostic tester still exposes the compatibility provider routes because they are useful for comparing DNS responses. These routes are separate from the public FreeDNS wire endpoint.
 
 ## Configuration
 
 | Variable | Description | Default |
 |---|---|---|
 | `HAGEZI_ROTATION_SECONDS` | Primary-upstream rotation interval. | `1800` |
+| `CUSTOM_DOH_URL` | Upstream for the legacy `custom` provider. | unset |
 | `DEBUG_LOG` | Set to `true` to log successful request metadata as well as errors. | `false` |
 | `PORT` | Standalone server port when using a custom Next.js deployment. | `8367` |
 
@@ -142,7 +132,7 @@ The diagnostic tester exposes only providers that support the JSON API. Google a
 - `DEBUG_LOG=true` logs request metadata, not the DNS message body.
 - `Cache-Control: no-store` is used for DNS responses.
 - The public endpoint does not accept arbitrary upstream URLs.
-- The provider JSON routes are diagnostic compatibility endpoints; the hardened public service remains `/api/doh/dns-query`.
+- The legacy manual/custom provider routes retain their existing validation and should not be considered equivalent to the hardened public FreeDNS endpoint.
 - A public DoH service can still consume substantial bandwidth under abuse, so platform-level traffic controls remain important.
 
 ## Deployment
@@ -177,7 +167,7 @@ The existing Docker, Wrangler, and GitHub Actions deployment/maintenance files a
 
 ## Compatibility
 
-The provider JSON routes and DNS tester remain for diagnostics. Custom/manual upstream selection is intentionally not exposed.
+The older provider JSON routes and DNS tester remain in the project for compatibility. The public FreeDNS DoH endpoint is the recommended wire-format interface.
 
 ## Development
 
