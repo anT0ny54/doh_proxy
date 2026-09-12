@@ -4,7 +4,7 @@ import { getProvider, resolveProviderEndpoint } from "@/lib/providers";
 const REQUEST_TIMEOUT_MS = 2_500;
 const MAX_QUERY_STRING_LENGTH = 1_024;
 const MAX_BODY_SIZE = 4_096;
-const PROXY_VERSION = "v1.3.0";
+const PROXY_VERSION = "v2.1.0";
 const DEFAULT_JSON_ACCEPT = "application/dns-json";
 const DEFAULT_WIRE_ACCEPT = "application/dns-message";
 const USER_AGENT = `DoH-Proxy/${PROXY_VERSION.slice(1)}`;
@@ -91,105 +91,43 @@ function validateRequest(url: URL, method: string): NextResponse | null {
   return null;
 }
 
-/**
- * Rejects obvious private/reserved literal addresses for caller-supplied URLs.
- * Hostname DNS rebinding cannot be completely prevented by an Edge Runtime
- * without a platform DNS/IP policy layer.
- */
-function isSafeUpstreamUrl(rawUrl: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return false;
-  }
-
-  if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.hash) {
-    return false;
-  }
-
-  let host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal")
-  ) {
-    return false;
-  }
-
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (ipv4) {
-    const octets = ipv4.slice(1).map(Number);
-    if (octets.some((n) => n > 255)) return false;
-
-    const [a, b] = octets;
-    return !(
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      a >= 224
-    );
-  }
-
-  if (host.includes(":")) {
-    const normalized = host.replace(/^::ffff:/, "");
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(normalized)) {
-      return isSafeUpstreamUrl(`${url.protocol}//${normalized}`);
-    }
-
-    return !(
-      host === "::" ||
-      host === "::1" ||
-      /^fe[89ab]/.test(host) ||
-      /^f[cd]/.test(host) ||
-      host.startsWith("::ffff:")
-    );
-  }
-
-  return host.length > 0;
-}
-
 function resolveUpstream(
   providerId: string,
   formatSegment: string | undefined,
-  url: URL,
 ): string | NextResponse {
   const provider = getProvider(providerId);
   if (!provider) return response(`Provider '${providerId}' not found`, 404);
 
-  if (providerId === "custom") {
-    const customUrl = process.env.CUSTOM_DOH_URL;
-    if (!customUrl) return response("Configuration Error: CUSTOM_DOH_URL missing", 500);
-    if (!isSafeUpstreamUrl(customUrl)) {
-      return response("Configuration Error: invalid CUSTOM_DOH_URL", 500);
-    }
-    return customUrl;
-  }
-
-  if (providerId === "manual") {
-    const manualUrl = url.searchParams.get("upstream");
-    if (!manualUrl) return response('Missing "upstream" parameter', 400);
-    return isSafeUpstreamUrl(manualUrl)
-      ? manualUrl
-      : response("Invalid or disallowed upstream URL", 400);
-  }
-
   const endpoint = resolveProviderEndpoint(provider, formatSegment);
-  return endpoint
-    ? endpoint
-    : response(
-        `Endpoint '${formatSegment}' not found for provider '${providerId}'`,
-        404,
-      );
+  if (!endpoint) {
+    return response(
+      `Endpoint '${formatSegment}' not found for provider '${providerId}'`,
+      404,
+    );
+  }
+
+  return endpoint;
 }
 
-function acceptHeader(request: NextRequest, url: URL): string {
+function acceptHeader(
+  request: NextRequest,
+  providerId: string,
+  formatSegment: string | undefined,
+  url: URL,
+): string {
+  if (formatSegment === "dns-query") return DEFAULT_WIRE_ACCEPT;
+
+  // The default Google/AdGuard/Cloudflare routes are JSON diagnostic APIs.
+  // Force the correct media type so browser Accept headers cannot change the
+  // upstream representation unexpectedly.
+  if (
+    request.method === "GET" &&
+    !url.searchParams.has("dns") &&
+    (providerId === "google" || providerId === "adguard" || providerId === "cloudflare")
+  ) {
+    return DEFAULT_JSON_ACCEPT;
+  }
+
   return (
     request.headers.get("accept") ||
     (request.method === "POST" || url.searchParams.has("dns")
@@ -236,6 +174,22 @@ export async function handleDoH(
       return validationError;
     }
 
+    // Google and AdGuard expose a JSON API at the default /resolve route.
+    // Their RFC 8484 wire-format endpoints remain available at /dns-query.
+    if (
+      request.method === "POST" &&
+      formatSegment !== "dns-query" &&
+      (providerId === "google" || providerId === "adguard")
+    ) {
+      status = 405;
+      const result = response(
+        "POST is only supported on /dns-query for this provider",
+        405,
+      );
+      result.headers.set("Allow", "GET, OPTIONS, HEAD");
+      return result;
+    }
+
     let body: ArrayBuffer | undefined;
     if (request.method === "POST") {
       const bodyResult = await readBody(request);
@@ -246,7 +200,7 @@ export async function handleDoH(
       body = bodyResult;
     }
 
-    const upstreamResult = resolveUpstream(providerId, formatSegment, url);
+    const upstreamResult = resolveUpstream(providerId, formatSegment);
     if (upstreamResult instanceof NextResponse) {
       status = upstreamResult.status;
       return upstreamResult;
@@ -260,7 +214,7 @@ export async function handleDoH(
     }
 
     const headers = new Headers({
-      Accept: acceptHeader(request, url),
+      Accept: acceptHeader(request, providerId, formatSegment, url),
       "User-Agent": USER_AGENT,
     });
 
