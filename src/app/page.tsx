@@ -39,7 +39,7 @@ export default function Home() {
         </section>
 
         <section className="mt-10 grid gap-4 sm:grid-cols-3" aria-label="Service features">
-          <FeatureCard title="HaGeZi upstreams" description="Three trusted upstream endpoints with deterministic 30-minute primary rotation." />
+          <FeatureCard title="HaGeZi upstreams" description="Four public resolvers with provider-specific JSON/wire-format support." />
           <FeatureCard title="Fast failover" description="Only one upstream is tried at a time, with a shared three-second request budget." />
           <FeatureCard title="Abuse protection" description="Strict DNS validation, per-instance limits, CORS controls, and platform WAF support." />
         </section>
