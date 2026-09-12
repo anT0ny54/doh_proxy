@@ -1,14 +1,11 @@
 export interface DoHProvider {
-  id: string;
-  name: string;
-  description: string;
-  endpoint: string;
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
+  readonly endpoint: string;
 }
 
-/**
- * Fixed, server-owned upstreams. There is deliberately no custom/manual URL
- * input, so the proxy cannot be turned into an arbitrary URL forwarder.
- */
+/** Fixed server-owned upstreams. No arbitrary/custom forwarding is supported. */
 export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "google",
@@ -36,6 +33,8 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   },
 ] as const;
 
+const PROVIDER_MAP = new Map(DOH_PROVIDERS.map((provider) => [provider.id, provider]));
+
 export function getProvider(id: string): DoHProvider | undefined {
-  return DOH_PROVIDERS.find((provider) => provider.id === id);
+  return PROVIDER_MAP.get(id);
 }
