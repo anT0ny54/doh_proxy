@@ -56,7 +56,7 @@ export default function DnsTester() {
     const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const res = await fetch(`/api/doh/${encodeURIComponent(providerId)}?${params.toString()}`, {
+      const res = await fetch(`/api/doh/${encodeURIComponent(providerId)}/resolve?${params.toString()}`, {
         headers: { Accept: "application/dns-json" },
         signal: controller.signal,
         cache: "no-store",
@@ -89,7 +89,7 @@ export default function DnsTester() {
       <div className="mb-6 text-center">
         <h2 className="text-2xl font-semibold text-zinc-900">DNS Tester</h2>
         <p className="mt-2 text-sm text-zinc-500">
-          Compare DNS JSON responses from the supported public resolvers, including DNS.SB.
+          Compare JSON responses from the supported public resolvers. DNS.SB is converted from its RFC 8484 wire response by this proxy.
         </p>
       </div>
 
