@@ -20,5 +20,5 @@ export async function HEAD(request: NextRequest, { params }: RouteContext) {
 }
 
 export function OPTIONS(request: NextRequest) {
-  return handleDoH(request, "cloudflare");
+  return handleDoH(request, "");
 }
