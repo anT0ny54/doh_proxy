@@ -230,3 +230,55 @@ AGPL-3.0
 ## Repository
 
 https://github.com/anT0ny54/doh_proxy
+
+## Diagnostic provider routes
+
+The diagnostic provider routes are separate from the primary public `/api/doh/dns-query` service. They are fixed upstream adapters and do not accept arbitrary upstream URLs.
+
+### Google
+
+`GET /api/doh/google?name=example.com&type=A`
+
+`GET /api/doh/google/resolve?name=example.com&type=A`
+
+`GET /api/doh/google/dns-query?dns=BASE64URL_DNS_MESSAGE`
+
+Google's JSON API is `https://dns.google/resolve` and its RFC 8484 endpoint is `https://dns.google/dns-query`. Google supports GET/POST for wire-format DoH, while the JSON API is GET-only. citeturn1search9
+
+### AdGuard
+
+`GET /api/doh/adguard?name=example.com&type=A`
+
+`GET /api/doh/adguard/resolve?name=example.com&type=A`
+
+`GET /api/doh/adguard/dns-query?dns=BASE64URL_DNS_MESSAGE`
+
+The JSON routes use `https://dns.adguard-dns.com/resolve`; the wire-format route uses `https://dns.adguard-dns.com/dns-query`. AdGuard documents the JSON API as GET-based. citeturn1search5turn1search12
+
+### Cloudflare
+
+`GET /api/doh/cloudflare?name=example.com&type=A`
+
+`GET /api/doh/cloudflare/dns-query?dns=BASE64URL_DNS_MESSAGE`
+
+Cloudflare uses `https://cloudflare-dns.com/dns-query`. Its endpoint supports JSON GET requests with `Accept: application/dns-json` and wire-format GET/POST requests with `application/dns-message`. citeturn1search14turn0search3
+
+### DNS.SB
+
+`GET /api/doh/dnssb?name=example.com&type=A`
+
+`GET /api/doh/dnssb/resolve?name=example.com&type=A`
+
+`GET /api/doh/dnssb/dns-query?dns=BASE64URL_DNS_MESSAGE`
+
+DNS.SB's official DoH service is `https://doh.dns.sb/dns-query`. The proxy exposes the JSON-compatible GET form for the DNS Tester and keeps the RFC 8484 wire-format path available. DNS.SB also documents its DoH URL as `https://doh.dns.sb/dns-query`. citeturn1search2turn1search1
+
+### How to configure a client
+
+For a normal DoH client/browser, use the public wire-format endpoint:
+
+`https://freedns-six.vercel.app/api/doh/dns-query`
+
+Do not configure `/google`, `/adguard`, `/cloudflare`, or `/dnssb` as the system DoH endpoint unless the client specifically supports a JSON-style GET API. Those provider routes are primarily diagnostic/compatibility endpoints.
+
+For DNS.SB directly, its documented DoH endpoint is `https://doh.dns.sb/dns-query`. citeturn1search2
