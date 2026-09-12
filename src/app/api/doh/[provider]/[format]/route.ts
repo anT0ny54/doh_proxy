@@ -22,6 +22,7 @@ export async function HEAD(request: NextRequest, { params }: RouteContext) {
   return handleDoH(request, provider, format);
 }
 
-export function OPTIONS(request: NextRequest) {
-  return handleDoH(request, "");
+export async function OPTIONS(request: NextRequest, { params }: RouteContext) {
+  const { provider, format } = await params;
+  return handleDoH(request, provider, format);
 }
