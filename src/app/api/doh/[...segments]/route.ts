@@ -32,4 +32,4 @@ export async function HEAD(request: NextRequest, context: RouteContext) {
 
 export async function OPTIONS(request: NextRequest, context: RouteContext) {
   return dispatch(request, context);
-                        }
+  }
