@@ -1,13 +1,15 @@
 {
   "name": "doh_proxy",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "license": "AGPL-3.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run lint"
   },
   "dependencies": {
     "next": "^16.1.1",
