@@ -23,5 +23,5 @@ export async function HEAD(request: NextRequest, { params }: RouteContext) {
 }
 
 export function OPTIONS(request: NextRequest) {
-  return handleDoH(request, "cloudflare", "dns-query");
-                           }
+  return handleDoH(request, "");
+}
