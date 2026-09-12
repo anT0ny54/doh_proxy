@@ -28,7 +28,18 @@ The V2 cleanup keeps the existing public DoH route and its wire-format behavior 
 - Corrected site metadata to use `https://freedns-six.vercel.app` instead of the GitHub repository as `metadataBase`.
 - Added canonical, robots and Open Graph metadata.
 - Disabled TypeScript incremental build artifacts in the repository.
-- Kept the supported provider routes for diagnostics; the public FreeDNS wire endpoint remains the primary service.
+- Kept the older provider routes for compatibility with the built-in diagnostic tester; they are no longer presented as the primary public FreeDNS service.
+
+## V2.2 highlights
+
+- Removed the `Custom` and `Manual Input` provider entries and their request-time upstream code.
+- Fixed provider JSON routing so `/api/doh/google` uses Google `/resolve` and `/api/doh/adguard` uses AdGuard `/resolve`.
+- Prevented RFC 8484 `dns=` payloads from being incorrectly forwarded to JSON `/resolve` endpoints.
+- Kept `/api/doh/dns-query` unchanged as the primary public wire-format service.
+- Kept provider-specific RFC 8484 routes such as `/api/doh/google/dns-query` and `/api/doh/adguard/dns-query`.
+- Fixed OPTIONS handling and kept HEAD health responses local so upstreams do not need to support HEAD.
+- Forwarded only allowlisted DNS query parameters to JSON upstreams, reducing accidental/conflicting parameters.
+- Removed DNS.SB from the JSON tester because its configured route is wire-format oriented.
 
 ## V2.1 highlights
 
@@ -115,7 +126,7 @@ It provides:
 - mobile-friendly spacing and controls;
 - lightweight CSS without the previous blurred background layers.
 
-The diagnostic tester still exposes the compatibility provider routes because they are useful for comparing DNS responses. These routes are separate from the public FreeDNS wire endpoint.
+The diagnostic tester exposes only providers that support the JSON API. Google and AdGuard use their `/resolve` JSON APIs, while RFC 8484 wire-format clients should use their `/dns-query` routes.
 
 ## Configuration
 
@@ -131,7 +142,7 @@ The diagnostic tester still exposes the compatibility provider routes because th
 - `DEBUG_LOG=true` logs request metadata, not the DNS message body.
 - `Cache-Control: no-store` is used for DNS responses.
 - The public endpoint does not accept arbitrary upstream URLs.
-- Provider routes are fixed to known public resolver endpoints; arbitrary upstream URLs are not accepted.
+- The provider JSON routes are diagnostic compatibility endpoints; the hardened public service remains `/api/doh/dns-query`.
 - A public DoH service can still consume substantial bandwidth under abuse, so platform-level traffic controls remain important.
 
 ## Deployment
@@ -166,7 +177,7 @@ The existing Docker, Wrangler, and GitHub Actions deployment/maintenance files a
 
 ## Compatibility
 
-The older provider JSON routes and DNS tester remain in the project for compatibility. The public FreeDNS DoH endpoint is the recommended wire-format interface.
+The provider JSON routes and DNS tester remain for diagnostics. Custom/manual upstream selection is intentionally not exposed.
 
 ## Development
 
@@ -230,71 +241,3 @@ AGPL-3.0
 ## Repository
 
 https://github.com/anT0ny54/doh_proxy
-
-## Diagnostic provider routes
-
-The diagnostic provider routes are separate from the primary public `/api/doh/dns-query` service. They are fixed upstream adapters and do not accept arbitrary upstream URLs.
-
-### Google
-
-`GET /api/doh/google?name=example.com&type=A`
-
-`GET /api/doh/google/resolve?name=example.com&type=A`
-
-`GET /api/doh/google/dns-query?dns=BASE64URL_DNS_MESSAGE`
-
-Google's JSON API is `https://dns.google/resolve` and its RFC 8484 endpoint is `https://dns.google/dns-query`. Google supports GET/POST for wire-format DoH, while the JSON API is GET-only. citeturn1search9
-
-### AdGuard
-
-`GET /api/doh/adguard?name=example.com&type=A`
-
-`GET /api/doh/adguard/resolve?name=example.com&type=A`
-
-`GET /api/doh/adguard/dns-query?dns=BASE64URL_DNS_MESSAGE`
-
-The JSON routes use `https://dns.adguard-dns.com/resolve`; the wire-format route uses `https://dns.adguard-dns.com/dns-query`. AdGuard documents the JSON API as GET-based. citeturn1search5turn1search12
-
-### Cloudflare
-
-`GET /api/doh/cloudflare?name=example.com&type=A`
-
-`GET /api/doh/cloudflare/dns-query?dns=BASE64URL_DNS_MESSAGE`
-
-Cloudflare uses `https://cloudflare-dns.com/dns-query`. Its endpoint supports JSON GET requests with `Accept: application/dns-json` and wire-format GET/POST requests with `application/dns-message`. citeturn1search14turn0search3
-
-### DNS.SB
-
-`GET /api/doh/dnssb?name=example.com&type=A`
-
-`GET /api/doh/dnssb/resolve?name=example.com&type=A`
-
-`GET /api/doh/dnssb/dns-query?dns=BASE64URL_DNS_MESSAGE`
-
-DNS.SB's official DoH service is `https://doh.dns.sb/dns-query`. The proxy exposes the JSON-compatible GET form for the DNS Tester and keeps the RFC 8484 wire-format path available. DNS.SB also documents its DoH URL as `https://doh.dns.sb/dns-query`. citeturn1search2turn1search1
-
-### How to configure a client
-
-For a normal DoH client/browser, use the public wire-format endpoint:
-
-`https://freedns-six.vercel.app/api/doh/dns-query`
-
-Do not configure `/google`, `/adguard`, `/cloudflare`, or `/dnssb` as the system DoH endpoint unless the client specifically supports a JSON-style GET API. Those provider routes are primarily diagnostic/compatibility endpoints.
-
-For DNS.SB directly, its documented DoH endpoint is `https://doh.dns.sb/dns-query`. citeturn1search2
-
-## DoH routes
-
-- `GET/POST /api/doh/dns-query` — canonical RFC 8484 proxy backed by the existing HaGeZi rotation/failover path. Use this URL for browsers, operating systems, routers, and other real DoH clients.
-- `GET /api/doh/google/resolve?name=example.com&type=A` — Google JSON API compatibility route.
-- `GET /api/doh/google/dns-query?dns=...` or `POST /api/doh/google/dns-query` — Google RFC 8484 route.
-- `GET /api/doh/adguard/resolve?name=example.com&type=A` — AdGuard JSON API compatibility route.
-- `GET /api/doh/adguard/dns-query?dns=...` or `POST /api/doh/adguard/dns-query` — AdGuard RFC 8484 route.
-- `GET /api/doh/cloudflare/resolve?name=example.com&type=A` — Cloudflare JSON compatibility route (Cloudflare serves JSON from `/dns-query` when `Accept: application/dns-json` is sent).
-- `GET /api/doh/cloudflare/dns-query?dns=...` or `POST /api/doh/cloudflare/dns-query` — Cloudflare RFC 8484 route.
-- `GET /api/doh/dnssb/resolve?name=example.com&type=A` — local JSON compatibility adapter backed by DNS.SB wire-format DoH.
-- `GET /api/doh/dnssb/dns-query?dns=...` or `POST /api/doh/dnssb/dns-query` — DNS.SB RFC 8484 route.
-
-### DNS leak testing
-
-A DNS Tester request is only an HTTP diagnostic request; it does not configure the device's DNS. To test whether a device actually uses this proxy, configure its DoH URL to the canonical `/api/doh/dns-query` endpoint, turn off insecure DNS fallback where the client exposes that option, then run the leak test again. If a browser or OS falls back to ordinary UDP/TCP DNS, a leak-test site can still see the ISP resolver even though the proxy endpoint itself works.
