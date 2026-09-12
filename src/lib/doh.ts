@@ -4,7 +4,7 @@ import { getProvider, resolveProviderEndpoint } from "@/lib/providers";
 const REQUEST_TIMEOUT_MS = 2_500;
 const MAX_QUERY_STRING_LENGTH = 1_024;
 const MAX_BODY_SIZE = 4_096;
-const PROXY_VERSION = "v2.1.0";
+const PROXY_VERSION = "v2.2.0";
 const DEFAULT_JSON_ACCEPT = "application/dns-json";
 const DEFAULT_WIRE_ACCEPT = "application/dns-message";
 const USER_AGENT = `DoH-Proxy/${PROXY_VERSION.slice(1)}`;
@@ -123,7 +123,7 @@ function acceptHeader(
   if (
     request.method === "GET" &&
     !url.searchParams.has("dns") &&
-    (providerId === "google" || providerId === "adguard" || providerId === "cloudflare")
+    (providerId === "google" || providerId === "adguard" || providerId === "cloudflare" || providerId === "dnssb")
   ) {
     return DEFAULT_JSON_ACCEPT;
   }
@@ -179,7 +179,7 @@ export async function handleDoH(
     if (
       request.method === "POST" &&
       formatSegment !== "dns-query" &&
-      (providerId === "google" || providerId === "adguard")
+      (providerId === "google" || providerId === "adguard" || providerId === "dnssb")
     ) {
       status = 405;
       const result = response(

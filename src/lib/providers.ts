@@ -45,8 +45,9 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
     name: "DNS.SB",
     description: "DNS.SB",
     paths: {
-      default: "https://dns.sb/dns-query",
-      "dns-query": "https://dns.sb/dns-query",
+      default: "https://doh.dns.sb/dns-query",
+      resolve: "https://doh.dns.sb/dns-query",
+      "dns-query": "https://doh.dns.sb/dns-query",
     },
   },
 ];
