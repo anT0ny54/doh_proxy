@@ -226,6 +226,11 @@ function wireToJson(bytes: Uint8Array): Record<string, unknown> {
 async function dnsSbJson(name: string, typeParam: string, cd: string | null, dnssec: string | null): Promise<NextResponse> {
   const type = Number(typeParam) || TYPE_TO_CODE[typeParam.toUpperCase()] || 1;
   const body = makeDnsQuery(name, type);
+  // Next.js 16 / TypeScript 5 DOM typings require a concrete ArrayBuffer for
+  // fetch() request bodies. Copy the query into a real ArrayBuffer rather than
+  // passing Uint8Array<ArrayBufferLike> directly.
+  const queryBuffer = new ArrayBuffer(body.byteLength);
+  new Uint8Array(queryBuffer).set(body);
   const upstream = new URL("https://doh.dns.sb/dns-query");
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -233,7 +238,7 @@ async function dnsSbJson(name: string, typeParam: string, cd: string | null, dns
     const result = await fetch(upstream, {
       method: "POST",
       headers: { Accept: DEFAULT_WIRE_ACCEPT, "Content-Type": DEFAULT_WIRE_ACCEPT, "User-Agent": USER_AGENT },
-      body,
+      body: queryBuffer,
       signal: controller.signal,
       cache: "no-store",
     });
