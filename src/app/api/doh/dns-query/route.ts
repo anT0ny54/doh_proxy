@@ -20,7 +20,7 @@ const MAX_DNS_MESSAGE_SIZE = 4_096;
 const MAX_QUERY_STRING_LENGTH = 8_192;
 const DNS_MESSAGE = "application/dns-message";
 const PROXY_VERSION = "v2.2.1";
-const USER_AGENT = `DoH-Proxy/${PROXY_VERSION.slice(1)}`;
+const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -108,7 +108,7 @@ async function queryUpstream(
 
   try {
     const headers = new Headers({
-      Accept: request.headers.get("accept") || DNS_MESSAGE,
+      Accept: DNS_MESSAGE,
       "User-Agent": USER_AGENT,
     });
 
