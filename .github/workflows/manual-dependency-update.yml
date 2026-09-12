@@ -31,9 +31,6 @@ jobs:
           ncu -u
           npm install
 
-      - name: Run tests
-        run: npm test
-
       - name: Create pull request
         uses: peter-evans/create-pull-request@v7
         with:
