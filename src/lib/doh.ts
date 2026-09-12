@@ -6,10 +6,10 @@ export const PROXY_VERSION = "2.6.0";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MIN_DNS_MESSAGE_SIZE = 12;
-const MAX_DNS_MESSAGE_SIZE = 65_535; // RFC 8484 section 6
-const DEFAULT_PROVIDER_TIMEOUT_MS = 5_000;
-const HAGEZI_UPSTREAM_TIMEOUT_MS = 3_500;
-const HAGEZI_TOTAL_TIMEOUT_MS = 9_000;
+const MAX_DNS_MESSAGE_SIZE = 65_535;
+const MAX_GET_QUERY_SIZE = 90_000;
+const DEFAULT_TIMEOUT_MS = 2_500;
+const HAGEZI_TIMEOUT_MS = 3_000;
 const BASE64URL = /^[A-Za-z0-9_-]+={0,2}$/;
 
 export interface DoHUpstream {
@@ -20,7 +20,6 @@ export interface DoHUpstream {
 export interface DoHOptions {
   readonly upstreams: readonly DoHUpstream[];
   readonly timeoutMs?: number;
-  readonly totalTimeoutMs?: number;
   readonly failover?: boolean;
 }
 
@@ -36,6 +35,7 @@ function baseHeaders(): Headers {
     "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Accept, Content-Type",
     "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'",
     "Cross-Origin-Resource-Policy": "cross-origin",
     Expires: "0",
     Pragma: "no-cache",
@@ -61,21 +61,19 @@ function errorResponse(message: string, status: number, allow?: string): NextRes
   return result;
 }
 
-function clampTimeout(timeoutMs: number | undefined, fallback: number): number {
-  const configured = Number.isFinite(timeoutMs) ? Math.floor(timeoutMs!) : fallback;
-  return Math.min(Math.max(configured, 500), 10_000);
+function clampTimeout(timeoutMs: number | undefined): number {
+  const configured = Number.isFinite(timeoutMs) ? Math.floor(timeoutMs!) : DEFAULT_TIMEOUT_MS;
+  return Math.min(Math.max(configured, 250), 5_000);
 }
 
 function decodeBase64Url(value: string): Uint8Array | null {
-  if (!value || value.length > 90_000 || value.length % 4 === 1 || !BASE64URL.test(value)) return null;
+  if (!value || value.length > MAX_GET_QUERY_SIZE || value.length % 4 === 1 || !BASE64URL.test(value)) return null;
 
   try {
     const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
     const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
     if (binary.length < MIN_DNS_MESSAGE_SIZE || binary.length > MAX_DNS_MESSAGE_SIZE) return null;
 
-    // Do not impose DNS semantic restrictions here. RFC 8484 transports
-    // DNS wire messages, including EDNS and other valid DNS extensions.
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   } catch {
     return null;
@@ -83,12 +81,15 @@ function decodeBase64Url(value: string): Uint8Array | null {
 }
 
 function validateGet(url: URL): NextResponse | null {
+  if (url.search.length > MAX_GET_QUERY_SIZE) return errorResponse("Query string too long", 414);
+
   const dns = url.searchParams.get("dns");
   if (!dns || decodeBase64Url(dns) === null) return errorResponse("Invalid DNS message", 400);
+
   return null;
 }
 
-async function readPostBody(request: NextRequest): Promise<Uint8Array | NextResponse> {
+async function readPostBody(request: NextRequest): Promise<ArrayBuffer | NextResponse> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== DNS_MESSAGE) return errorResponse("Unsupported Content-Type", 415);
 
@@ -101,9 +102,10 @@ async function readPostBody(request: NextRequest): Promise<Uint8Array | NextResp
     if (contentLength > MAX_DNS_MESSAGE_SIZE) return errorResponse("Payload too large", 413);
   }
 
-  const body = new Uint8Array(await request.arrayBuffer());
+  const body = await request.arrayBuffer();
   if (body.byteLength < MIN_DNS_MESSAGE_SIZE) return errorResponse("Invalid DNS message", 400);
   if (body.byteLength > MAX_DNS_MESSAGE_SIZE) return errorResponse("Payload too large", 413);
+
   return body;
 }
 
@@ -111,7 +113,7 @@ async function fetchUpstream(
   request: NextRequest,
   upstream: DoHUpstream,
   dnsQuery: string | undefined,
-  body: Uint8Array | undefined,
+  body: ArrayBuffer | undefined,
   timeoutMs: number,
 ): Promise<Response> {
   const url = new URL(upstream.endpoint);
@@ -130,7 +132,10 @@ async function fetchUpstream(
     return await fetch(url, {
       method: request.method,
       headers,
-      body,
+      // Keep the original buffer: no extra copy on the hot path.
+      // Next.js 16 DOM typings reject ArrayBuffer here even though the Edge
+      // fetch runtime accepts it, so cast only at this boundary.
+      body: body as unknown as BodyInit,
       cache: "no-store",
       redirect: "error",
       signal: controller.signal,
@@ -141,27 +146,28 @@ async function fetchUpstream(
 }
 
 function upstreamResponse(result: Response): NextResponse | null {
-  if (!result.ok || !result.body) return null;
+  if (!result.ok) return null;
 
   const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== DNS_MESSAGE) return null;
 
-  const contentLengthHeader = result.headers.get("content-length");
-  if (contentLengthHeader !== null) {
-    const size = Number(contentLengthHeader);
-    if (!Number.isSafeInteger(size) || size < MIN_DNS_MESSAGE_SIZE || size > MAX_DNS_MESSAGE_SIZE) return null;
-  }
-
   const headers = baseHeaders();
   headers.set("Content-Type", DNS_MESSAGE);
-  if (contentLengthHeader !== null) headers.set("Content-Length", contentLengthHeader);
+
+  // Do not trust an upstream Content-Length beyond our own safety bound.
+  const contentLength = result.headers.get("content-length");
+  if (contentLength !== null) {
+    const size = Number(contentLength);
+    if (!Number.isSafeInteger(size) || size < MIN_DNS_MESSAGE_SIZE || size > MAX_DNS_MESSAGE_SIZE) return null;
+    headers.set("Content-Length", String(size));
+  }
 
   return new NextResponse(result.body, { status: 200, headers });
 }
 
 async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
   if (request.method === "OPTIONS") return emptyResponse();
-  if (request.method === "HEAD") return emptyResponse(200);
+  if (request.method === "HEAD") return emptyResponse();
 
   if (request.method !== "GET" && request.method !== "POST") {
     return errorResponse("Method Not Allowed", 405, "GET, POST, HEAD, OPTIONS");
@@ -169,7 +175,7 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
 
   const requestUrl = new URL(request.url);
   let dnsQuery: string | undefined;
-  let body: Uint8Array | undefined;
+  let body: ArrayBuffer | undefined;
 
   if (request.method === "GET") {
     const validationError = validateGet(requestUrl);
@@ -181,15 +187,8 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
     body = bodyResult;
   }
 
-  const perUpstreamTimeout = clampTimeout(
-    options.timeoutMs,
-    options.failover === false ? DEFAULT_PROVIDER_TIMEOUT_MS : HAGEZI_UPSTREAM_TIMEOUT_MS,
-  );
-  const totalTimeout = clampTimeout(
-    options.totalTimeoutMs,
-    options.failover === false ? perUpstreamTimeout : HAGEZI_TOTAL_TIMEOUT_MS,
-  );
-  const deadline = Date.now() + totalTimeout;
+  const timeout = clampTimeout(options.timeoutMs);
+  const deadline = Date.now() + timeout;
   const upstreams = options.failover === false ? options.upstreams.slice(0, 1) : options.upstreams;
 
   for (const upstream of upstreams) {
@@ -197,17 +196,11 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
     if (remaining <= 0) break;
 
     try {
-      const result = await fetchUpstream(
-        request,
-        upstream,
-        dnsQuery,
-        body,
-        Math.min(perUpstreamTimeout, remaining),
-      );
+      const result = await fetchUpstream(request, upstream, dnsQuery, body, remaining);
       const proxied = upstreamResponse(result);
       if (proxied) return proxied;
     } catch {
-      // Network, timeout, and redirect failures are eligible for failover.
+      // Timeout/network/redirect errors are intentionally failover-able.
     }
   }
 
@@ -241,8 +234,7 @@ export async function handleDoH(
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
   return proxyRequest(request, {
     upstreams: getHageziUpstreams(),
-    timeoutMs: HAGEZI_UPSTREAM_TIMEOUT_MS,
-    totalTimeoutMs: HAGEZI_TOTAL_TIMEOUT_MS,
+    timeoutMs: HAGEZI_TIMEOUT_MS,
     failover: true,
   });
 }
