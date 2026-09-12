@@ -1,24 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getProvider, type DoHProvider } from "@/lib/providers";
+import { getProvider } from "@/lib/providers";
 
 export const DNS_MESSAGE = "application/dns-message";
-export const PROXY_VERSION = "2.4.0";
+export const PROXY_VERSION = "2.5.0";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
-const MAX_DNS_MESSAGE_SIZE = 4_096;
-const MAX_QUERY_STRING_LENGTH = 8_192;
-const REQUEST_TIMEOUT_MS = 2_500;
+const MIN_DNS_MESSAGE_SIZE = 12;
+const MAX_POST_BODY_SIZE = 8_192;
+const MAX_GET_QUERY_SIZE = 8_192;
+const DEFAULT_TIMEOUT_MS = 2_500;
+const HAGEZI_TIMEOUT_MS = 3_000;
 const BASE64URL = /^[A-Za-z0-9_-]+={0,2}$/;
 
 export interface DoHUpstream {
-  endpoint: string;
-  name: string;
+  readonly endpoint: string;
+  readonly name: string;
 }
 
 export interface DoHOptions {
-  upstreams: readonly DoHUpstream[];
-  timeoutMs?: number;
-  failover?: boolean;
+  readonly upstreams: readonly DoHUpstream[];
+  readonly timeoutMs?: number;
+  readonly failover?: boolean;
 }
 
 const HAGEZI_UPSTREAMS: readonly DoHUpstream[] = [
@@ -27,33 +29,14 @@ const HAGEZI_UPSTREAMS: readonly DoHUpstream[] = [
   { name: "HaGeZi juuri", endpoint: "https://juuri.hagezi.org/dns-query" },
 ];
 
-export function getHageziUpstreams(): readonly DoHUpstream[] {
-  const defaultSeconds = 1_800;
-  const minSeconds = 60;
-  const maxSeconds = 86_400;
-  const configured = Number(process.env.HAGEZI_ROTATION_SECONDS ?? defaultSeconds);
-  const seconds = Number.isFinite(configured)
-    ? Math.min(Math.max(Math.floor(configured), minSeconds), maxSeconds)
-    : defaultSeconds;
-  const slot = Math.floor(Date.now() / (seconds * 1_000)) % HAGEZI_UPSTREAMS.length;
-
-  return Array.from({ length: HAGEZI_UPSTREAMS.length }, (_, offset) =>
-    HAGEZI_UPSTREAMS[(slot + offset) % HAGEZI_UPSTREAMS.length],
-  );
-}
-
-export function getProviderUpstream(providerId: string): DoHUpstream | undefined {
-  const provider = getProvider(providerId);
-  return provider ? { name: provider.name, endpoint: provider.endpoint } : undefined;
-}
-
 function baseHeaders(): Headers {
   return new Headers({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Accept, Content-Type",
-    "Cache-Control": "no-store, max-age=0",
+    "Cache-Control": "no-store",
     "Content-Security-Policy": "default-src 'none'",
+    "Cross-Origin-Resource-Policy": "cross-origin",
     Expires: "0",
     Pragma: "no-cache",
     Vary: "Accept, Origin",
@@ -62,29 +45,43 @@ function baseHeaders(): Headers {
   });
 }
 
-export function textResponse(message: string, status: number): NextResponse {
+function response(body: BodyInit | null, status: number, contentType?: string): NextResponse {
   const headers = baseHeaders();
-  headers.set("Content-Type", "text/plain; charset=utf-8");
-  return new NextResponse(message, { status, headers });
+  if (contentType) headers.set("Content-Type", contentType);
+  return new NextResponse(body, { status, headers });
 }
 
 function emptyResponse(status = 204): NextResponse {
-  return new NextResponse(null, { status, headers: baseHeaders() });
+  return response(null, status);
+}
+
+function errorResponse(message: string, status: number, allow?: string): NextResponse {
+  const result = response(message, status, "text/plain; charset=utf-8");
+  if (allow) result.headers.set("Allow", allow);
+  return result;
+}
+
+function clampTimeout(timeoutMs: number | undefined): number {
+  const configured = Number.isFinite(timeoutMs) ? Math.floor(timeoutMs!) : DEFAULT_TIMEOUT_MS;
+  return Math.min(Math.max(configured, 250), 5_000);
 }
 
 function decodeBase64Url(value: string): Uint8Array | null {
-  if (!value || value.length > MAX_QUERY_STRING_LENGTH || value.length % 4 === 1 || !BASE64URL.test(value)) {
-    return null;
-  }
+  if (!value || value.length > MAX_GET_QUERY_SIZE || value.length % 4 === 1 || !BASE64URL.test(value)) return null;
 
   try {
     const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
     const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
-    if (binary.length < 12 || binary.length > MAX_DNS_MESSAGE_SIZE) return null;
+    if (binary.length < MIN_DNS_MESSAGE_SIZE || binary.length > MAX_POST_BODY_SIZE) return null;
 
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const flags = (bytes[2] << 8) | bytes[3];
     const qdCount = (bytes[4] << 8) | bytes[5];
-    if (qdCount < 1) return null;
+
+    // This proxy accepts DNS queries, not client-supplied DNS responses.
+    // Opcode 0 is the normal DNS query opcode; exactly one question keeps
+    // malformed/ambiguous traffic out of the upstream pool.
+    if ((flags & 0x8000) !== 0 || ((flags >> 11) & 0x0f) !== 0 || qdCount !== 1) return null;
     return bytes;
   } catch {
     return null;
@@ -92,47 +89,56 @@ function decodeBase64Url(value: string): Uint8Array | null {
 }
 
 function validateGet(url: URL): NextResponse | null {
-  if (url.search.length > MAX_QUERY_STRING_LENGTH) return textResponse("Query string too long", 414);
+  if (url.search.length > MAX_GET_QUERY_SIZE) return errorResponse("Query string too long", 414);
 
   const dns = url.searchParams.get("dns");
-  if (!dns || decodeBase64Url(dns) === null) return textResponse("Invalid DNS message", 400);
+  if (!dns || decodeBase64Url(dns) === null) return errorResponse("Invalid DNS message", 400);
 
   return null;
 }
 
 async function readPostBody(request: NextRequest): Promise<ArrayBuffer | NextResponse> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-  if (contentType !== DNS_MESSAGE) return textResponse("Unsupported Content-Type", 415);
+  if (contentType !== DNS_MESSAGE) return errorResponse("Unsupported Content-Type", 415);
 
-  const contentLength = request.headers.get("content-length");
-  if (contentLength !== null) {
-    const size = Number(contentLength);
-    if (!Number.isInteger(size) || size < 12) return textResponse("Invalid DNS message", 400);
-    if (size > MAX_DNS_MESSAGE_SIZE) return textResponse("Payload too large", 413);
+  const contentLengthHeader = request.headers.get("content-length");
+  if (contentLengthHeader !== null) {
+    const contentLength = Number(contentLengthHeader);
+    if (!Number.isSafeInteger(contentLength) || contentLength < MIN_DNS_MESSAGE_SIZE) {
+      return errorResponse("Invalid DNS message", 400);
+    }
+    if (contentLength > MAX_POST_BODY_SIZE) return errorResponse("Payload too large", 413);
   }
 
   const body = await request.arrayBuffer();
-  if (body.byteLength < 12) return textResponse("Invalid DNS message", 400);
-  if (body.byteLength > MAX_DNS_MESSAGE_SIZE) return textResponse("Payload too large", 413);
+  if (body.byteLength < MIN_DNS_MESSAGE_SIZE) return errorResponse("Invalid DNS message", 400);
+  if (body.byteLength > MAX_POST_BODY_SIZE) return errorResponse("Payload too large", 413);
+
+  const bytes = new Uint8Array(body);
+  const flags = (bytes[2] << 8) | bytes[3];
+  const qdCount = (bytes[4] << 8) | bytes[5];
+  if ((flags & 0x8000) !== 0 || ((flags >> 11) & 0x0f) !== 0 || qdCount !== 1) {
+    return errorResponse("Invalid DNS query", 400);
+  }
+
   return body;
 }
 
 async function fetchUpstream(
   request: NextRequest,
   upstream: DoHUpstream,
+  dnsQuery: string | undefined,
   body: ArrayBuffer | undefined,
   timeoutMs: number,
 ): Promise<Response> {
   const url = new URL(upstream.endpoint);
-  if (request.method === "GET") {
-    url.search = new URL(request.url).search;
-  }
+  if (dnsQuery !== undefined) url.searchParams.set("dns", dnsQuery);
 
   const headers = new Headers({
     Accept: DNS_MESSAGE,
     "User-Agent": USER_AGENT,
   });
-  if (request.method === "POST") headers.set("Content-Type", DNS_MESSAGE);
+  if (body !== undefined) headers.set("Content-Type", DNS_MESSAGE);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -142,45 +148,58 @@ async function fetchUpstream(
       method: request.method,
       headers,
       body,
-      signal: controller.signal,
       cache: "no-store",
+      redirect: "error",
+      signal: controller.signal,
     });
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function proxyRequest(
-  request: NextRequest,
-  options: DoHOptions,
-): Promise<NextResponse> {
-  if (request.method === "OPTIONS") return emptyResponse();
+function upstreamResponse(result: Response): NextResponse | null {
+  if (!result.ok) return null;
 
-  if (request.method === "HEAD") {
-    const result = emptyResponse();
-    result.headers.set("Content-Length", "0");
-    return result;
+  const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== DNS_MESSAGE) return null;
+
+  const headers = baseHeaders();
+  headers.set("Content-Type", DNS_MESSAGE);
+
+  // Do not trust an upstream Content-Length beyond our own safety bound.
+  const contentLength = result.headers.get("content-length");
+  if (contentLength !== null) {
+    const size = Number(contentLength);
+    if (!Number.isSafeInteger(size) || size < MIN_DNS_MESSAGE_SIZE || size > MAX_POST_BODY_SIZE) return null;
+    headers.set("Content-Length", String(size));
   }
+
+  return new NextResponse(result.body, { status: 200, headers });
+}
+
+async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
+  if (request.method === "OPTIONS") return emptyResponse();
+  if (request.method === "HEAD") return emptyResponse();
 
   if (request.method !== "GET" && request.method !== "POST") {
-    const result = textResponse("Method Not Allowed", 405);
-    result.headers.set("Allow", "GET, POST, HEAD, OPTIONS");
-    return result;
+    return errorResponse("Method Not Allowed", 405, "GET, POST, HEAD, OPTIONS");
   }
 
-  const url = new URL(request.url);
+  const requestUrl = new URL(request.url);
+  let dnsQuery: string | undefined;
   let body: ArrayBuffer | undefined;
 
   if (request.method === "GET") {
-    const validationError = validateGet(url);
+    const validationError = validateGet(requestUrl);
     if (validationError) return validationError;
+    dnsQuery = requestUrl.searchParams.get("dns")!;
   } else {
     const bodyResult = await readPostBody(request);
     if (bodyResult instanceof NextResponse) return bodyResult;
     body = bodyResult;
   }
 
-  const timeout = Math.max(250, options.timeoutMs ?? REQUEST_TIMEOUT_MS);
+  const timeout = clampTimeout(options.timeoutMs);
   const deadline = Date.now() + timeout;
   const upstreams = options.failover === false ? options.upstreams.slice(0, 1) : options.upstreams;
 
@@ -189,21 +208,25 @@ async function proxyRequest(
     if (remaining <= 0) break;
 
     try {
-      const result = await fetchUpstream(request, upstream, body, remaining);
-      if (!result.ok) continue;
-
-      const headers = baseHeaders();
-      headers.set("Content-Type", DNS_MESSAGE);
-      if (result.headers.has("Content-Length")) headers.set("Content-Length", result.headers.get("Content-Length")!);
-      if (result.headers.has("Cache-Control")) headers.set("Cache-Control", result.headers.get("Cache-Control")!);
-
-      return new NextResponse(result.body, { status: 200, headers });
+      const result = await fetchUpstream(request, upstream, dnsQuery, body, remaining);
+      const proxied = upstreamResponse(result);
+      if (proxied) return proxied;
     } catch {
-      // Fail closed and try the next fixed upstream, if one exists.
+      // Timeout/network/redirect errors are intentionally failover-able.
     }
   }
 
-  return textResponse("DNS upstream unavailable", 502);
+  return errorResponse("DNS upstream unavailable", 502);
+}
+
+export function getHageziUpstreams(): readonly DoHUpstream[] {
+  const configured = Number(process.env.HAGEZI_ROTATION_SECONDS ?? 1_800);
+  const seconds = Number.isFinite(configured)
+    ? Math.min(Math.max(Math.floor(configured), 60), 86_400)
+    : 1_800;
+  const slot = Math.floor(Date.now() / (seconds * 1_000)) % HAGEZI_UPSTREAMS.length;
+
+  return HAGEZI_UPSTREAMS.map((_, offset) => HAGEZI_UPSTREAMS[(slot + offset) % HAGEZI_UPSTREAMS.length]);
 }
 
 export async function handleDoH(
@@ -211,18 +234,19 @@ export async function handleDoH(
   providerId: string,
   formatSegment?: string,
 ): Promise<NextResponse> {
-  if (formatSegment !== "dns-query") return textResponse("Not Found", 404);
+  if (formatSegment !== "dns-query" || !getProvider(providerId)) return errorResponse("Not Found", 404);
 
-  const upstream = getProviderUpstream(providerId);
-  if (!upstream) return textResponse("Not Found", 404);
-
-  return proxyRequest(request, { upstreams: [upstream], failover: false });
+  const provider = getProvider(providerId)!;
+  return proxyRequest(request, {
+    upstreams: [{ name: provider.name, endpoint: provider.endpoint }],
+    failover: false,
+  });
 }
 
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
   return proxyRequest(request, {
     upstreams: getHageziUpstreams(),
-    timeoutMs: 3_000,
+    timeoutMs: HAGEZI_TIMEOUT_MS,
     failover: true,
   });
 }
