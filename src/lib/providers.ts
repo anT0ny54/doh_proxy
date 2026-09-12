@@ -1,5 +1,7 @@
+export type DoHProviderId = "cloudflare" | "google" | "adguard" | "dnssb";
+
 export interface DoHProvider {
-  id: "cloudflare" | "google" | "adguard" | "dnssb";
+  id: DoHProviderId;
   name: string;
   description: string;
   paths: {
@@ -13,7 +15,7 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "cloudflare",
     name: "Cloudflare",
-    description: "Cloudflare Public DNS (1.1.1.1)",
+    description: "Cloudflare Public DNS (JSON and RFC 8484)",
     paths: {
       default: "https://cloudflare-dns.com/dns-query",
       resolve: "https://cloudflare-dns.com/dns-query",
@@ -23,7 +25,7 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "google",
     name: "Google",
-    description: "Google Public DNS (8.8.8.8)",
+    description: "Google Public DNS (JSON /resolve and RFC 8484)",
     paths: {
       default: "https://dns.google/resolve",
       resolve: "https://dns.google/resolve",
@@ -33,7 +35,7 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "adguard",
     name: "AdGuard",
-    description: "AdGuard DNS",
+    description: "AdGuard DNS (JSON /resolve and RFC 8484)",
     paths: {
       default: "https://dns.adguard-dns.com/resolve",
       resolve: "https://dns.adguard-dns.com/resolve",
@@ -43,7 +45,7 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "dnssb",
     name: "DNS.SB",
-    description: "DNS.SB",
+    description: "DNS.SB RFC 8484 DoH; JSON is provided by this proxy adapter",
     paths: {
       default: "https://doh.dns.sb/dns-query",
       resolve: "https://doh.dns.sb/dns-query",
@@ -61,12 +63,7 @@ export function resolveProviderEndpoint(
   segment?: string,
 ): string | undefined {
   if (!segment || segment === "default") return provider.paths.default;
-
-  // Route params are plain strings at runtime. Narrow them before indexing
-  // the strongly-typed provider path map. Unknown formats must not silently
-  // fall back to another upstream.
   if (segment === "resolve") return provider.paths.resolve;
   if (segment === "dns-query") return provider.paths["dns-query"];
-
   return undefined;
 }
