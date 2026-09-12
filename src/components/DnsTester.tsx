@@ -31,8 +31,7 @@ const REQUEST_TIMEOUT_MS = 5_000;
 export default function DnsTester() {
   const [domain, setDomain] = useState(DEFAULT_DOMAIN);
   const [type, setType] = useState<(typeof RECORD_TYPES)[number]>("A");
-  const JSON_PROVIDERS = DOH_PROVIDERS.filter((provider) => provider.supportsJson);
-  const [providerId, setProviderId] = useState(JSON_PROVIDERS[0]?.id ?? "cloudflare");
+  const [providerId, setProviderId] = useState(DOH_PROVIDERS[0]?.id ?? "cloudflare");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<DnsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,6 +51,7 @@ export default function DnsTester() {
     setError(null);
 
     const params = new URLSearchParams({ name: trimmedDomain, type });
+
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -84,7 +84,7 @@ export default function DnsTester() {
     <div className="mx-auto w-full max-w-2xl rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:p-6 md:p-8">
       <div className="mb-6 text-center">
         <h2 className="text-2xl font-semibold text-zinc-900">DNS Tester</h2>
-        <p className="mt-2 text-sm text-zinc-500">Optional diagnostic tool for checking the supported JSON DNS providers.</p>
+        <p className="mt-2 text-sm text-zinc-500">Optional diagnostic tool for comparing the supported upstream JSON endpoints.</p>
       </div>
 
       <form onSubmit={handleTest} className="space-y-6">
@@ -120,7 +120,7 @@ export default function DnsTester() {
         <fieldset className="space-y-3">
           <legend className="text-sm font-medium text-zinc-700">Upstream Provider</legend>
           <div className="flex flex-wrap gap-2">
-            {JSON_PROVIDERS.map((provider) => (
+            {DOH_PROVIDERS.map((provider) => (
               <button
                 key={provider.id}
                 type="button"
@@ -137,8 +137,6 @@ export default function DnsTester() {
             ))}
           </div>
         </fieldset>
-
-
 
         <button
           type="submit"
