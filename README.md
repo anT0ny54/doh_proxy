@@ -122,7 +122,6 @@ The diagnostic tester still exposes the compatibility provider routes because th
 | Variable | Description | Default |
 |---|---|---|
 | `HAGEZI_ROTATION_SECONDS` | Primary-upstream rotation interval. | `1800` |
-| `CUSTOM_DOH_URL` | Upstream for the legacy `custom` provider. | unset |
 | `DEBUG_LOG` | Set to `true` to log successful request metadata as well as errors. | `false` |
 | `PORT` | Standalone server port when using a custom Next.js deployment. | `8367` |
 
@@ -132,7 +131,7 @@ The diagnostic tester still exposes the compatibility provider routes because th
 - `DEBUG_LOG=true` logs request metadata, not the DNS message body.
 - `Cache-Control: no-store` is used for DNS responses.
 - The public endpoint does not accept arbitrary upstream URLs.
-- The legacy manual/custom provider routes retain their existing validation and should not be considered equivalent to the hardened public FreeDNS endpoint.
+- The public `/api/doh/dns-query` route accepts only the fixed HaGeZi upstream set and never accepts arbitrary upstream URLs.
 - A public DoH service can still consume substantial bandwidth under abuse, so platform-level traffic controls remain important.
 
 ## Deployment
