@@ -4,8 +4,7 @@ import { getProvider, resolveProviderEndpoint } from "@/lib/providers";
 const REQUEST_TIMEOUT_MS = 2_500;
 const MAX_QUERY_STRING_LENGTH = 1_024;
 const MAX_BODY_SIZE = 4_096;
-const MAX_DNS_MESSAGE_SIZE = 4_096;
-const PROXY_VERSION = "v2.2.0";
+const PROXY_VERSION = "v1.3.0";
 const DEFAULT_JSON_ACCEPT = "application/dns-json";
 const DEFAULT_WIRE_ACCEPT = "application/dns-message";
 const USER_AGENT = `DoH-Proxy/${PROXY_VERSION.slice(1)}`;
@@ -66,80 +65,100 @@ function isValidDomainName(value: string): boolean {
   });
 }
 
-function isValidDnsMessage(value: string): boolean {
-  if (
-    !value ||
-    value.length > MAX_QUERY_STRING_LENGTH ||
-    value.length % 4 === 1 ||
-    !DNS_MESSAGE.test(value)
-  ) {
-    return false;
-  }
-
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  try {
-    const decoded = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
-    return decoded.length >= 12 && decoded.length <= MAX_DNS_MESSAGE_SIZE;
-  } catch {
-    return false;
-  }
-}
-
-function validateRequest(
-  url: URL,
-  method: string,
-  isWireEndpoint: boolean,
-): NextResponse | null {
+function validateRequest(url: URL, method: string): NextResponse | null {
   if (url.search.length > MAX_QUERY_STRING_LENGTH) {
     return response("Query string too long", 414);
   }
 
-  if (method === "OPTIONS" || method === "HEAD") return null;
-
-  if (isWireEndpoint) {
-    if (method !== "GET" && method !== "POST") {
-      const result = response("Method not allowed", 405);
-      result.headers.set("Allow", "GET, POST, HEAD, OPTIONS");
-      return result;
-    }
-
-    if (method === "GET") {
-      const dns = url.searchParams.get("dns");
-      if (!dns || !isValidDnsMessage(dns)) {
-        return response("Invalid DNS message parameter", 400);
-      }
-    }
-
+  if (method === "OPTIONS" || method === "HEAD" || method === "POST") {
     return null;
   }
 
-  // The legacy/provider root is a JSON API. Do not pass RFC 8484 `dns=`
-  // payloads to /resolve; use /api/doh/<provider>/dns-query instead.
-  if (method !== "GET") {
-    const result = response("JSON DNS endpoint only supports GET", 405);
-    result.headers.set("Allow", "GET, HEAD, OPTIONS");
-    return result;
-  }
+  if (method !== "GET") return response("Method not allowed", 405);
 
-  if (url.searchParams.has("dns")) {
-    return response(
-      "RFC 8484 wire queries must use /dns-query",
-      400,
-      "text/plain; charset=utf-8",
-    );
+  const dns = url.searchParams.get("dns");
+  if (dns !== null) {
+    if (!dns || dns.length > MAX_QUERY_STRING_LENGTH || !DNS_MESSAGE.test(dns)) {
+      return response("Invalid DNS message parameter", 400);
+    }
+    return null;
   }
 
   const name = url.searchParams.get("name");
-  if (!name || !isValidDomainName(name)) {
-    return response("Invalid domain name", 400);
-  }
+  if (!name) return response("Invalid domain: empty", 400);
+  if (!isValidDomainName(name)) return response("Invalid domain name", 400);
 
   return null;
+}
+
+/**
+ * Rejects obvious private/reserved literal addresses for caller-supplied URLs.
+ * Hostname DNS rebinding cannot be completely prevented by an Edge Runtime
+ * without a platform DNS/IP policy layer.
+ */
+function isSafeUpstreamUrl(rawUrl: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+
+  if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.hash) {
+    return false;
+  }
+
+  let host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    return false;
+  }
+
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some((n) => n > 255)) return false;
+
+    const [a, b] = octets;
+    return !(
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      a >= 224
+    );
+  }
+
+  if (host.includes(":")) {
+    const normalized = host.replace(/^::ffff:/, "");
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(normalized)) {
+      return isSafeUpstreamUrl(`${url.protocol}//${normalized}`);
+    }
+
+    return !(
+      host === "::" ||
+      host === "::1" ||
+      /^fe[89ab]/.test(host) ||
+      /^f[cd]/.test(host) ||
+      host.startsWith("::ffff:")
+    );
+  }
+
+  return host.length > 0;
 }
 
 function resolveUpstream(
   providerId: string,
   formatSegment: string | undefined,
+  url: URL,
 ): string | NextResponse {
   const provider = getProvider(providerId);
   if (!provider) return response(`Provider '${providerId}' not found`, 404);
@@ -153,16 +172,13 @@ function resolveUpstream(
       );
 }
 
-function acceptHeader(
-  request: NextRequest,
-  isWireEndpoint: boolean,
-): string {
-  if (isWireEndpoint) {
-    return request.headers.get("accept") || DEFAULT_WIRE_ACCEPT;
-  }
-  // JSON endpoints should always ask the upstream for the JSON representation.
-  // This is especially important for Google /resolve and AdGuard /resolve.
-  return DEFAULT_JSON_ACCEPT;
+function acceptHeader(request: NextRequest, url: URL): string {
+  return (
+    request.headers.get("accept") ||
+    (request.method === "POST" || url.searchParams.has("dns")
+      ? DEFAULT_WIRE_ACCEPT
+      : DEFAULT_JSON_ACCEPT)
+  );
 }
 
 async function readBody(request: NextRequest): Promise<ArrayBuffer | NextResponse> {
@@ -176,7 +192,6 @@ async function readBody(request: NextRequest): Promise<ArrayBuffer | NextRespons
 
   const body = await request.arrayBuffer();
   if (body.byteLength === 0) return response("Empty DNS request body", 400);
-  if (body.byteLength < 12) return response("DNS message too short", 400);
   if (body.byteLength > MAX_BODY_SIZE) return response("Payload too large", 413);
   return body;
 }
@@ -191,42 +206,36 @@ export async function handleDoH(
   let error: string | undefined;
 
   try {
-    if (request.method === "OPTIONS") {
+    if (request.method === "OPTIONS" || request.method === "HEAD") {
       status = 204;
       return response(null, 204, "");
     }
 
-    const isWireEndpoint = formatSegment === "dns-query";
     const url = new URL(request.url);
-    const validationError = validateRequest(url, request.method, isWireEndpoint);
+    const validationError = validateRequest(url, request.method);
     if (validationError) {
       status = validationError.status;
+      if (status === 405) validationError.headers.set("Allow", "GET, POST, HEAD, OPTIONS");
       return validationError;
     }
 
-    // HEAD is handled locally. Some upstream JSON APIs do not implement HEAD.
-    if (request.method === "HEAD") {
-      status = 204;
-      return response(null, 204, "");
+    // Google and AdGuard JSON endpoints are GET-based. Their RFC 8484
+    // wire-format endpoints remain available explicitly under /dns-query.
+    if (
+      (providerId === "google" || providerId === "adguard") &&
+      !formatSegment &&
+      request.method !== "GET"
+    ) {
+      const result = response(
+        "This endpoint is JSON GET only; use /dns-query for RFC 8484 POST.",
+        405,
+      );
+      result.headers.set("Allow", "GET, HEAD, OPTIONS");
+      return result;
     }
 
     let body: ArrayBuffer | undefined;
     if (request.method === "POST") {
-      const contentType = request.headers
-        .get("content-type")
-        ?.split(";", 1)[0]
-        .trim()
-        .toLowerCase();
-
-      if (
-        contentType &&
-        contentType !== "application/dns-message" &&
-        contentType !== "application/octet-stream"
-      ) {
-        status = 415;
-        return response("Unsupported Content-Type", 415);
-      }
-
       const bodyResult = await readBody(request);
       if (bodyResult instanceof NextResponse) {
         status = bodyResult.status;
@@ -235,35 +244,26 @@ export async function handleDoH(
       body = bodyResult;
     }
 
-    const upstreamResult = resolveUpstream(providerId, formatSegment);
+    const upstreamResult = resolveUpstream(providerId, formatSegment, url);
     if (upstreamResult instanceof NextResponse) {
       status = upstreamResult.status;
       return upstreamResult;
     }
 
     const upstreamUrl = new URL(upstreamResult);
-
-    // Forward only the query parameters that belong to the selected API.
-    // Never forward arbitrary proxy-control parameters.
     if (request.method === "GET") {
-      if (isWireEndpoint) {
-        const dns = url.searchParams.get("dns");
-        if (dns) upstreamUrl.searchParams.set("dns", dns);
-      } else {
-        for (const key of ["name", "type", "cd", "do", "edns_client_subnet", "ct"]) {
-          const value = url.searchParams.get(key);
-          if (value !== null) upstreamUrl.searchParams.set(key, value);
-        }
+      for (const [key, value] of url.searchParams) {
+        if (key !== "upstream") upstreamUrl.searchParams.append(key, value);
       }
     }
 
     const headers = new Headers({
-      Accept: acceptHeader(request, isWireEndpoint),
+      Accept: acceptHeader(request, url),
       "User-Agent": USER_AGENT,
     });
 
     if (request.method === "POST") {
-      headers.set("Content-Type", "application/dns-message");
+      headers.set("Content-Type", request.headers.get("content-type") || DEFAULT_WIRE_ACCEPT);
     }
 
     const controller = new AbortController();
@@ -283,17 +283,9 @@ export async function handleDoH(
     }
 
     status = upstreamResponse.status;
-
     const responseHeaders = baseHeaders();
     const contentType = upstreamResponse.headers.get("content-type");
-    if (contentType) {
-      responseHeaders.set("Content-Type", contentType);
-    } else {
-      responseHeaders.set(
-        "Content-Type",
-        isWireEndpoint ? DEFAULT_WIRE_ACCEPT : DEFAULT_JSON_ACCEPT,
-      );
-    }
+    if (contentType) responseHeaders.set("Content-Type", contentType);
 
     return new NextResponse(upstreamResponse.body, {
       status: upstreamResponse.status,
@@ -304,11 +296,7 @@ export async function handleDoH(
     const timeout = caught instanceof Error && caught.name === "AbortError";
     status = timeout ? 504 : 502;
     error = timeout ? "Upstream Timeout" : "Upstream Connection Failed";
-    return response(
-      JSON.stringify({ error }),
-      status,
-      "application/json; charset=utf-8",
-    );
+    return response(JSON.stringify({ error }), status, "application/json; charset=utf-8");
   } finally {
     logRequest({
       timestamp: new Date().toISOString(),
