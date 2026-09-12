@@ -89,7 +89,7 @@ export default function DnsTester() {
       <div className="mb-6 text-center">
         <h2 className="text-2xl font-semibold text-zinc-900">DNS Tester</h2>
         <p className="mt-2 text-sm text-zinc-500">
-          Compare DNS JSON responses from the supported public resolvers.
+          Compare DNS JSON responses from the supported public resolvers, including DNS.SB.
         </p>
       </div>
 
