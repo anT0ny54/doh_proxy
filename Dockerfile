@@ -10,7 +10,6 @@ FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY src ./src
-COPY public ./public
 COPY next.config.ts tsconfig.json eslint.config.mjs postcss.config.mjs ./
 RUN npm run build
 
