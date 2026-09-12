@@ -1,32 +1,39 @@
-export type DoHProviderId = "cloudflare" | "google" | "adguard" | "dnssb";
-
 export interface DoHProvider {
-  id: DoHProviderId;
+  id: string;
   name: string;
   description: string;
-  paths: {
-    default: string;
-    resolve?: string;
-    "dns-query": string;
-  };
+  /**
+   * Supported upstream endpoints.
+   *
+   * "default" is used by the JSON diagnostic endpoint:
+   *   /api/doh/<provider>
+   *
+   * "dns-query" is the RFC 8484 wire-format endpoint:
+   *   /api/doh/<provider>/dns-query
+   */
+  paths: Record<string, string>;
+  supportsJson: boolean;
 }
 
-export const DOH_PROVIDERS: readonly DoHProvider[] = [
+export const DOH_PROVIDERS: DoHProvider[] = [
   {
     id: "cloudflare",
     name: "Cloudflare",
-    description: "Cloudflare Public DNS (JSON and RFC 8484)",
+    description: "Cloudflare Public DNS (1.1.1.1)",
+    supportsJson: true,
     paths: {
+      // Cloudflare supports Google's DNS JSON schema on /dns-query.
       default: "https://cloudflare-dns.com/dns-query",
-      resolve: "https://cloudflare-dns.com/dns-query",
       "dns-query": "https://cloudflare-dns.com/dns-query",
     },
   },
   {
     id: "google",
     name: "Google",
-    description: "Google Public DNS (JSON /resolve and RFC 8484)",
+    description: "Google Public DNS (8.8.8.8)",
+    supportsJson: true,
     paths: {
+      // Google JSON API is /resolve; RFC 8484 is /dns-query.
       default: "https://dns.google/resolve",
       resolve: "https://dns.google/resolve",
       "dns-query": "https://dns.google/dns-query",
@@ -35,8 +42,10 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "adguard",
     name: "AdGuard",
-    description: "AdGuard DNS (JSON /resolve and RFC 8484)",
+    description: "AdGuard Public DNS",
+    supportsJson: true,
     paths: {
+      // AdGuard provides a Google-compatible JSON API at /resolve.
       default: "https://dns.adguard-dns.com/resolve",
       resolve: "https://dns.adguard-dns.com/resolve",
       "dns-query": "https://dns.adguard-dns.com/dns-query",
@@ -45,11 +54,11 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
   {
     id: "dnssb",
     name: "DNS.SB",
-    description: "DNS.SB RFC 8484 DoH; JSON is provided by this proxy adapter",
+    description: "DNS.SB",
+    supportsJson: false,
     paths: {
-      default: "https://doh.dns.sb/dns-query",
-      resolve: "https://doh.dns.sb/dns-query",
-      "dns-query": "https://doh.dns.sb/dns-query",
+      default: "https://dns.sb/dns-query",
+      "dns-query": "https://dns.sb/dns-query",
     },
   },
 ];
@@ -62,8 +71,5 @@ export function resolveProviderEndpoint(
   provider: DoHProvider,
   segment?: string,
 ): string | undefined {
-  if (!segment || segment === "default") return provider.paths.default;
-  if (segment === "resolve") return provider.paths.resolve;
-  if (segment === "dns-query") return provider.paths["dns-query"];
-  return undefined;
+  return provider.paths[segment || "default"];
 }
