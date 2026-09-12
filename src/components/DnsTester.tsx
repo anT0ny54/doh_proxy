@@ -46,6 +46,7 @@ export default function DnsTester() {
       return;
     }
 
+
     setLoading(true);
     setResult(null);
     setError(null);
@@ -137,6 +138,7 @@ export default function DnsTester() {
             ))}
           </div>
         </fieldset>
+
 
         <button
           type="submit"
