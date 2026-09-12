@@ -19,6 +19,6 @@ export async function HEAD(request: NextRequest, { params }: RouteContext) {
   return handleDoH(request, (await params).provider);
 }
 
-export function OPTIONS(request: NextRequest) {
-  return handleDoH(request, "");
+export async function OPTIONS(request: NextRequest, { params }: RouteContext) {
+  return handleDoH(request, (await params).provider);
 }
