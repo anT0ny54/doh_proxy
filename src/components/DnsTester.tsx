@@ -139,7 +139,6 @@ export default function DnsTester() {
           </div>
         </fieldset>
 
-
         <button
           type="submit"
           disabled={loading}
