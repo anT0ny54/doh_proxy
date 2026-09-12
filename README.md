@@ -282,3 +282,19 @@ For a normal DoH client/browser, use the public wire-format endpoint:
 Do not configure `/google`, `/adguard`, `/cloudflare`, or `/dnssb` as the system DoH endpoint unless the client specifically supports a JSON-style GET API. Those provider routes are primarily diagnostic/compatibility endpoints.
 
 For DNS.SB directly, its documented DoH endpoint is `https://doh.dns.sb/dns-query`. citeturn1search2
+
+## DoH routes
+
+- `GET/POST /api/doh/dns-query` — canonical RFC 8484 proxy backed by the existing HaGeZi rotation/failover path. Use this URL for browsers, operating systems, routers, and other real DoH clients.
+- `GET /api/doh/google/resolve?name=example.com&type=A` — Google JSON API compatibility route.
+- `GET /api/doh/google/dns-query?dns=...` or `POST /api/doh/google/dns-query` — Google RFC 8484 route.
+- `GET /api/doh/adguard/resolve?name=example.com&type=A` — AdGuard JSON API compatibility route.
+- `GET /api/doh/adguard/dns-query?dns=...` or `POST /api/doh/adguard/dns-query` — AdGuard RFC 8484 route.
+- `GET /api/doh/cloudflare/resolve?name=example.com&type=A` — Cloudflare JSON compatibility route (Cloudflare serves JSON from `/dns-query` when `Accept: application/dns-json` is sent).
+- `GET /api/doh/cloudflare/dns-query?dns=...` or `POST /api/doh/cloudflare/dns-query` — Cloudflare RFC 8484 route.
+- `GET /api/doh/dnssb/resolve?name=example.com&type=A` — local JSON compatibility adapter backed by DNS.SB wire-format DoH.
+- `GET /api/doh/dnssb/dns-query?dns=...` or `POST /api/doh/dnssb/dns-query` — DNS.SB RFC 8484 route.
+
+### DNS leak testing
+
+A DNS Tester request is only an HTTP diagnostic request; it does not configure the device's DNS. To test whether a device actually uses this proxy, configure its DoH URL to the canonical `/api/doh/dns-query` endpoint, turn off insecure DNS fallback where the client exposes that option, then run the leak test again. If a browser or OS falls back to ordinary UDP/TCP DNS, a leak-test site can still see the ISP resolver even though the proxy endpoint itself works.
