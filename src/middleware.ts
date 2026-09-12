@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 const WINDOW_MS = 60_000;
 const MAX_REQUESTS = 120;
 const MAX_TRACKED_IPS = 10_000;
-const DOH_PATH = "/api/doh/dns-query";
+const DOH_PREFIX = "/api/doh/";
 
 type RateLimitRecord = { count: number; resetTime: number };
 const rateLimits = new Map<string, RateLimitRecord>();
@@ -30,12 +30,7 @@ function pruneExpired(now: number): void {
 }
 
 export function middleware(request: NextRequest): NextResponse {
-  // Health/preflight requests should never consume the DNS query budget.
-  if (
-    request.nextUrl.pathname !== DOH_PATH ||
-    request.method === "OPTIONS" ||
-    request.method === "HEAD"
-  ) {
+  if (!request.nextUrl.pathname.startsWith(DOH_PREFIX) || request.method === "OPTIONS" || request.method === "HEAD") {
     return NextResponse.next();
   }
 
@@ -75,5 +70,5 @@ export function middleware(request: NextRequest): NextResponse {
 }
 
 export const config = {
-  matcher: "/api/doh/dns-query",
+  matcher: "/api/doh/:path*",
 };
