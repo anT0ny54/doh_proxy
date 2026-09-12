@@ -39,19 +39,9 @@ export default function Home() {
         </section>
 
         <section className="mt-10 grid gap-4 sm:grid-cols-3" aria-label="Service features">
-          <FeatureCard title="HaGeZi upstreams" description="Four public resolvers with provider-specific JSON/wire-format support." />
+          <FeatureCard title="HaGeZi upstreams" description="Three trusted upstream endpoints with deterministic 30-minute primary rotation." />
           <FeatureCard title="Fast failover" description="Only one upstream is tried at a time, with a shared three-second request budget." />
           <FeatureCard title="Abuse protection" description="Strict DNS validation, per-instance limits, CORS controls, and platform WAF support." />
-        </section>
-
-        <section className="mt-10 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:p-6" aria-labelledby="api-title">
-          <h2 id="api-title" className="text-lg font-semibold text-zinc-900">DoH API routes</h2>
-          <div className="mt-4 space-y-3 text-sm leading-6 text-zinc-600">
-            <p><code>/api/doh/dns-query</code> is the canonical RFC 8484 endpoint. Use this URL in a browser, OS, router, or DoH client.</p>
-            <p><code>/api/doh/google/resolve</code> and <code>/api/doh/adguard/resolve</code> expose their JSON APIs for diagnostics. <code>/api/doh/cloudflare/resolve</code> uses Cloudflare&apos;s JSON mode on its <code>/dns-query</code> endpoint.</p>
-            <p><code>/api/doh/dnssb/resolve</code> is a JSON compatibility adapter: DNS.SB itself exposes RFC 8484 at <code>/dns-query</code>, so this proxy converts the wire response to the Google/Cloudflare-style JSON shape. For real DoH clients use <code>/api/doh/dnssb/dns-query</code>.</p>
-            <p className="font-medium text-zinc-700">Important for DNS-leak testing: configure your device/browser to use the canonical <code>/api/doh/dns-query</code> URL and disable DNS fallback/unencrypted DNS. The DNS Tester menu only tests the proxy&apos;s upstream API routes; it does not change your device&apos;s DNS configuration.</p>
-          </div>
         </section>
 
         <section className="mt-10 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm sm:p-6" aria-labelledby="usage-title">
