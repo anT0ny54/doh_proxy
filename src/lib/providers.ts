@@ -59,5 +59,13 @@ export function resolveProviderEndpoint(
   provider: DoHProvider,
   segment?: string,
 ): string | undefined {
-  return provider.paths[segment || "default"];
+  if (!segment || segment === "default") return provider.paths.default;
+
+  // Route params are plain strings at runtime. Narrow them before indexing
+  // the strongly-typed provider path map. Unknown formats must not silently
+  // fall back to another upstream.
+  if (segment === "resolve") return provider.paths.resolve;
+  if (segment === "dns-query") return provider.paths["dns-query"];
+
+  return undefined;
 }
