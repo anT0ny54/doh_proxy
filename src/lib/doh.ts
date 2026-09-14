@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getProvider } from "@/lib/providers";
 
 export const DNS_MESSAGE = "application/dns-message";
-export const PROXY_VERSION = "2.4.0";
+export const PROXY_VERSION = "2.5.0";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_DNS_MESSAGE_SIZE = 4_096;
@@ -111,22 +111,50 @@ async function readPostBody(request: NextRequest): Promise<ArrayBuffer | NextRes
     if (size > MAX_DNS_MESSAGE_SIZE) return textResponse("Payload too large", 413);
   }
 
-  const body = await request.arrayBuffer();
-  if (body.byteLength < 12) return textResponse("Invalid DNS message", 400);
-  if (body.byteLength > MAX_DNS_MESSAGE_SIZE) return textResponse("Payload too large", 413);
-  return body;
+  if (!request.body) return textResponse("Invalid DNS message", 400);
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      total += value.byteLength;
+      if (total > MAX_DNS_MESSAGE_SIZE) {
+        await reader.cancel();
+        return textResponse("Payload too large", 413);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (total < 12) return textResponse("Invalid DNS message", 400);
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return body.buffer;
 }
 
 async function fetchUpstream(
   request: NextRequest,
-  requestUrl: URL,
+  dnsParam: string | undefined,
   upstream: DoHUpstream,
   body: ArrayBuffer | undefined,
   timeoutMs: number,
 ): Promise<Response> {
   const url = new URL(upstream.endpoint);
-  if (request.method === "GET") {
-    url.search = requestUrl.search;
+  if (request.method === "GET" && dnsParam) {
+    url.searchParams.set("dns", dnsParam);
   }
 
   const headers = new Headers({
@@ -171,10 +199,12 @@ async function proxyRequest(
 
   const url = new URL(request.url);
   let body: ArrayBuffer | undefined;
+  let dnsParam: string | undefined;
 
   if (request.method === "GET") {
     const validationError = validateGet(url);
     if (validationError) return validationError;
+    dnsParam = url.searchParams.get("dns") ?? undefined;
   } else {
     const bodyResult = await readPostBody(request);
     if (bodyResult instanceof NextResponse) return bodyResult;
@@ -190,13 +220,12 @@ async function proxyRequest(
     if (remaining <= 0) break;
 
     try {
-      const result = await fetchUpstream(request, url, upstream, body, remaining);
+      const result = await fetchUpstream(request, dnsParam, upstream, body, remaining);
       if (!result.ok) continue;
 
       const headers = baseHeaders();
       headers.set("Content-Type", DNS_MESSAGE);
       if (result.headers.has("Content-Length")) headers.set("Content-Length", result.headers.get("Content-Length")!);
-      if (result.headers.has("Cache-Control")) headers.set("Cache-Control", result.headers.get("Cache-Control")!);
 
       return new NextResponse(result.body, { status: 200, headers });
     } catch {
