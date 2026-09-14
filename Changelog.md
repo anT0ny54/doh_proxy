@@ -1,5 +1,14 @@
 # FreeDNS DoH Proxy — Changelog
 
+## v2.6.0 — Build/tooling conflict fixes
+
+- Fixed a regression from v2.5.0: removing the standalone Next.js output (to stop it breaking the Vercel/Netlify build) had left `Dockerfile` still copying `.next/standalone`, so `docker build` no longer produced a working image. `next.config.ts` now emits `output: "standalone"` only when neither `VERCEL` nor `NETLIFY` is set in the build environment, so Docker gets its standalone bundle back without reintroducing the managed-platform build failure.
+- Pinned `typescript` to `^6.0.3` instead of `^7`. TypeScript 7's npm package dropped the classic JS compiler API that `typescript-eslint` needs (it's pulled in by `eslint-config-next`'s `next/typescript` preset in `eslint.config.mjs`), so `npm run lint` would fail under TypeScript 7 as installed. `next build`'s own type-checking is unaffected by this change either way.
+- Removed the now-stale `package-lock.json` rather than leave it out of sync with the `typescript` version change; the repo's existing "Generate package-lock.json" workflow regenerates it. `Dockerfile`'s dependency stage now uses `npm install` instead of `npm ci` so a regenerating/absent lockfile doesn't hard-fail the build; `README.md` updated to match.
+- Documented the previously-undocumented Docker self-host path in `README.md`.
+- Bumped the application/proxy version to 2.6.0.
+- No public API, route, or wire-format behavior changed.
+
 ## v2.5.0 — Vercel + Netlify optimization
 
 - Preserved all five public DoH endpoint paths and their RFC 8484 GET/POST behavior.

@@ -75,12 +75,23 @@ For a public deployment on either platform, also add a platform firewall/WAF rul
 2. Netlify picks up `netlify.toml` and `netlify/edge-functions/doh-rate-limit.ts` automatically; the edge function's `rateLimit` config is validated at deploy time.
 3. Verify with `HEAD /api/doh/dns-query` → expect `204`.
 
+### Docker (self-hosted)
+
+```bash
+docker build -t doh-proxy .
+docker run -p 8367:8367 doh-proxy
+```
+
+`next.config.ts` only emits the standalone server bundle the `Dockerfile` copies (`.next/standalone`) when neither `VERCEL` nor `NETLIFY` is set in the build environment — both platforms run their own build-output tracing and fail if `output: "standalone"` is on, so this keeps the same `next.config.ts` correct for all three targets.
+
 ## Development
 
 ```bash
-npm ci
+npm install
 npm run dev
 ```
+
+`package-lock.json` is regenerated automatically by the "Generate package-lock.json" GitHub Actions workflow whenever `package.json` changes (also runs weekly), so it doesn't need to be hand-maintained.
 
 Before shipping:
 
@@ -88,6 +99,8 @@ Before shipping:
 npm run lint
 npm run build
 ```
+
+`typescript` is pinned to the 6.x line rather than 7.x: TypeScript 7's package no longer ships the classic JS compiler API, and `typescript-eslint` (pulled in by `eslint-config-next`'s `next/typescript` preset, used in `eslint.config.mjs`) still requires it, so `npm run lint` fails on TypeScript 7 today. `next build`'s own type-checking is unaffected either way. Revisit this pin once `typescript-eslint` supports TypeScript 7 (tracking: their `>=4.8.4 <6.1.0` peer range).
 
 ## Validation checklist
 
@@ -112,6 +125,14 @@ npm run build
 | HaGeZi Multi Pro + TIF (this project, Vercel) | `https://freedns-six.vercel.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (this project, Netlify) | `https://dnssix.netlify.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (alternate host) | `https://freedns.koyeb.app/dns-query` |
+
+## 🚀 Bandwidth Hero Server
+
+A lightweight image proxy designed to slash bandwidth usage and accelerate your browsing experience. 
+
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to your device for faster loading and lower data consumption.
+
+🖥️ **Try it out:** [Bandwidth Hero](https://bhserv.netlify.app/)
 
 ## Support
 
