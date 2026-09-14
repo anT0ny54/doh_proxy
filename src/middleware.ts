@@ -8,10 +8,13 @@ const DOH_PREFIX = "/api/doh/";
 type RateLimitRecord = { count: number; resetTime: number };
 const rateLimits = new Map<string, RateLimitRecord>();
 
+// Keep this file as middleware (not Next.js 16 Proxy) so the limiter remains Edge-compatible.
+
 function getClientIP(request: NextRequest): string {
   return (
     request.headers.get("cf-connecting-ip") ||
     request.headers.get("x-nf-client-connection-ip") ||
+    request.headers.get("x-vercel-forwarded-for")?.split(",", 1)[0]?.trim() ||
     request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim() ||
     request.headers.get("x-real-ip") ||
     "unknown"
