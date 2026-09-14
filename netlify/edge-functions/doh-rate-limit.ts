@@ -9,7 +9,7 @@ export default async (_request: Request, context: { next: () => Promise<Response
 };
 
 export const config = {
-  path: "/api/doh/dns-query",
+  path: "/api/doh/*",
   rateLimit: {
     windowLimit: 100,
     windowSize: 60,
