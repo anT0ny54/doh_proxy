@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getProvider } from "@/lib/providers";
 
 export const DNS_MESSAGE = "application/dns-message";
-export const PROXY_VERSION = "2.5.0";
+export const PROXY_VERSION = "2.6.0";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_DNS_MESSAGE_SIZE = 4_096;
