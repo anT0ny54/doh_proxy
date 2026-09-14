@@ -1,5 +1,16 @@
 # FreeDNS DoH Proxy — Changelog
 
+## v2.5.0 — Vercel + Netlify optimization
+
+- Preserved all five public DoH endpoint paths and their RFC 8484 GET/POST behavior.
+- Added bounded streaming POST-body reads so oversized chunked uploads are rejected without buffering an unbounded request body.
+- Forwarded only the validated `dns` query parameter to GET upstreams, preventing unrelated query parameters from being propagated.
+- Kept `Cache-Control: no-store` authoritative instead of allowing an upstream cache header to override the proxy policy.
+- Preferred Vercel's `x-vercel-forwarded-for` client-IP header for the application rate limiter.
+- Expanded Netlify's platform rate-limit rule from the primary route to every `/api/doh/*` route.
+- Removed the self-hosting-only Next.js standalone output from the Vercel/Netlify build target.
+- Bumped the application/proxy version to 2.5.0.
+
 ## v2.4.0 — Codebase cleanup
 
 - Removed a dead, unused `DoHProvider` type import in `src/lib/doh.ts`.

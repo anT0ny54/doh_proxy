@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight, mobile-friendly DNS-over-HTTPS (DoH) proxy built on Next.js, optimized for deployment on **Vercel** and **Netlify**.
+A lightweight public DNS-over-HTTPS (DoH) proxy built on Next.js, tuned for low-latency Edge execution on **Vercel** and **Netlify**.
 
 ## Public DoH endpoint
 
@@ -43,7 +43,7 @@ The proxy:
 Two independent layers are provided; use whichever fit your deployment target, or both:
 
 1. **Application-level (`src/middleware.ts`)** — an in-memory per-IP limiter (120 requests/minute) applied to every `/api/doh/*` route, on any platform. Because serverless/edge instances don't share memory, this is a best-effort per-instance safety net, not a global limiter.
-2. **Netlify Edge Function (`netlify/edge-functions/doh-rate-limit.ts`)** — uses Netlify's platform-level `rateLimit` config (100 requests/minute, aggregated by IP + domain) for `/api/doh/dns-query` specifically.
+2. **Netlify Edge Function (`netlify/edge-functions/doh-rate-limit.ts`)** — uses Netlify's platform-level `rateLimit` config (100 requests/minute, aggregated by IP + domain) for all `/api/doh/*` routes.
 
 For a public deployment on either platform, also add a platform firewall/WAF rule (e.g. Vercel Firewall) on `/api/doh/*` as the primary line of defense — the application limiter is a second safety layer, not a replacement for it.
 
@@ -52,7 +52,6 @@ For a public deployment on either platform, also add a platform firewall/WAF rul
 | Variable | Description | Default |
 |---|---|---|
 | `HAGEZI_ROTATION_SECONDS` | How often the primary HaGeZi upstream rotates. Clamped to 60–86400 seconds. | `1800` |
-| `PORT` | Listener port when self-hosting the standalone server (Docker). Not used on Vercel/Netlify. | `8367` |
 
 ## Security notes
 
@@ -63,22 +62,18 @@ For a public deployment on either platform, also add a platform firewall/WAF rul
 
 ## Deployment
 
-### Vercel (primary target)
+### Vercel
 
 1. Push the repository to GitHub.
 2. Import it into Vercel and deploy with the default Next.js settings.
 3. Add a Vercel Firewall rate-limit rule for `/api/doh/*`.
 4. Verify with `HEAD /api/doh/dns-query` → expect `204`.
 
-### Netlify (primary target)
+### Netlify
 
 1. Import the repository into Netlify.
 2. Netlify picks up `netlify.toml` and `netlify/edge-functions/doh-rate-limit.ts` automatically; the edge function's `rateLimit` config is validated at deploy time.
 3. Verify with `HEAD /api/doh/dns-query` → expect `204`.
-
-### Self-hosting (optional)
-
-A `Dockerfile` is included for self-hosted deployments (e.g. via the published `ghcr.io` image built by `.github/workflows/docker-publish.yml`). This path is not required for Vercel or Netlify and can be ignored if you only deploy to those platforms.
 
 ## Development
 
@@ -109,14 +104,6 @@ npm run build
 ✓ Global timeout                       → bounded failure response
 ✓ No intentional DNS response caching
 ```
-
-## Related services
-
-| Service | DNS-over-HTTPS URL |
-| --- | --- |
-| HaGeZi Multi Pro + TIF (this project, Vercel) | `https://freedns-six.vercel.app/api/doh/dns-query` |
-| HaGeZi Multi Pro + TIF (this project, Netlify) | `https://dnssix.netlify.app/api/doh/dns-query` |
-| HaGeZi Multi Pro + TIF (alternate host) | `https://freedns.koyeb.app/dns-query` |
 
 ## Support
 
