@@ -1,15 +1,15 @@
 import CopyButton from "@/components/CopyButton";
+import { DOH_PROVIDERS } from "@/lib/providers";
 
 const SITE_URL = "https://freedns-six.vercel.app";
 const PUBLIC_DOH_ENDPOINT = `${SITE_URL}/api/doh/dns-query`;
 const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
 
-const PROVIDER_ENDPOINTS = [
-  ["Google", `${SITE_URL}/api/doh/google/dns-query`, "Google Public DNS"],
-  ["Cloudflare", `${SITE_URL}/api/doh/cloudflare/dns-query`, "Cloudflare Public DNS"],
-  ["AdGuard", `${SITE_URL}/api/doh/adguard/dns-query`, "AdGuard Public DNS"],
-  ["DNS.SB", `${SITE_URL}/api/doh/dnssb/dns-query`, "DNS.SB Public DNS"],
-] as const;
+const PROVIDER_ENDPOINTS = DOH_PROVIDERS.map((provider) => ({
+  name: provider.name,
+  endpoint: `${SITE_URL}/api/doh/${provider.id}/dns-query`,
+  description: provider.description,
+}));
 
 export default function Home() {
   return (
@@ -42,7 +42,7 @@ export default function Home() {
             <p className="mt-1 text-sm leading-6 text-zinc-600">Fixed upstreams for direct provider testing through the same proxy. No custom upstream URL is accepted.</p>
           </div>
           <div className="grid gap-4 sm:grid-cols-2">
-            {PROVIDER_ENDPOINTS.map(([name, endpoint, description]) => (
+            {PROVIDER_ENDPOINTS.map(({ name, endpoint, description }) => (
               <article key={endpoint} className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
                 <div className="flex items-start justify-between gap-3">
                   <div>
