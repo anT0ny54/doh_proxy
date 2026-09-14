@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getProvider, type DoHProvider } from "@/lib/providers";
+import { getProvider } from "@/lib/providers";
 
 export const DNS_MESSAGE = "application/dns-message";
 export const PROXY_VERSION = "2.4.0";
@@ -119,13 +119,14 @@ async function readPostBody(request: NextRequest): Promise<ArrayBuffer | NextRes
 
 async function fetchUpstream(
   request: NextRequest,
+  requestUrl: URL,
   upstream: DoHUpstream,
   body: ArrayBuffer | undefined,
   timeoutMs: number,
 ): Promise<Response> {
   const url = new URL(upstream.endpoint);
   if (request.method === "GET") {
-    url.search = new URL(request.url).search;
+    url.search = requestUrl.search;
   }
 
   const headers = new Headers({
@@ -189,7 +190,7 @@ async function proxyRequest(
     if (remaining <= 0) break;
 
     try {
-      const result = await fetchUpstream(request, upstream, body, remaining);
+      const result = await fetchUpstream(request, url, upstream, body, remaining);
       if (!result.ok) continue;
 
       const headers = baseHeaders();
