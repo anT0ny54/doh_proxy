@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { handleDoH } from "@/lib/doh";
 
 export const runtime = "edge";
+export const maxDuration = 3;
 
 interface RouteContext {
   params: Promise<{ provider: string; format: string }>;
