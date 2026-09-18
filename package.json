@@ -1,14 +1,13 @@
 {
   "name": "doh_proxy",
-  "version": "2.7.1",
+  "version": "2.6.1",
   "license": "AGPL-3.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build --webpack",
+    "build": "next build",
     "start": "next start",
-    "lint": "eslint",
-    "test": "node scripts/test-dns.mjs"
+    "lint": "eslint"
   },
   "dependencies": {
     "next": "^16.3.5",
@@ -20,7 +19,7 @@
     "@types/node": "^22",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "eslint": "^10",
+    "eslint": "^9.7.0",
     "eslint-config-next": "^16.3.5",
     "tailwindcss": "^4",
     "typescript": "^6.0.3"
