@@ -195,6 +195,18 @@ function cancelResponseBody(response: Response): void {
   response.body?.cancel().catch(() => undefined);
 }
 
+/**
+ * TypeScript 6 models Uint8Array as possibly backed by SharedArrayBuffer,
+ * while fetch()/NextResponse BodyInit requires an ArrayBuffer in this context.
+ * Copying into a fresh ArrayBuffer preserves the bytes and satisfies the
+ * server-side fetch/Response body types.
+ */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
 interface UpstreamFetch {
   readonly response: Response;
   readonly cleanup: () => void;
@@ -223,7 +235,7 @@ async function fetchUpstream(
     const response = await fetch(url, {
       method: request.method,
       headers,
-      body,
+      body: body === undefined ? undefined : toArrayBuffer(body),
       signal: controller.signal,
       cache: "no-store",
     });
@@ -314,7 +326,7 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
         const headers = baseHeaders();
         headers.set("Content-Type", DNS_MESSAGE);
         headers.set("Content-Length", String(responseBody.byteLength));
-        return new NextResponse(responseBody, { status: 200, headers });
+        return new NextResponse(toArrayBuffer(responseBody), { status: 200, headers });
       } finally {
         upstreamFetch.cleanup();
       }
