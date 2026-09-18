@@ -2,15 +2,15 @@ import { NextRequest } from "next/server";
 import { handleDoH } from "@/lib/doh";
 
 export const runtime = "edge";
-export const maxDuration = 4;
+export const maxDuration = 3;
 
 interface RouteContext {
-  params: Promise<{ provider: string }>;
+  params: Promise<{ provider: string; format: string }>;
 }
 
 async function route(request: NextRequest, { params }: RouteContext) {
-  const { provider } = await params;
-  return handleDoH(request, provider);
+  const { provider, format } = await params;
+  return handleDoH(request, provider, format);
 }
 
 export const GET = route;
