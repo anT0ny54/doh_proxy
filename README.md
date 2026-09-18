@@ -216,7 +216,7 @@ Runtime behavior should additionally be checked after deployment with:
 
 | Service | DNS-over-HTTPS URL |
 | --- | --- |
-| HaGeZi Multi Pro + TIF (this project, Vercel) | `https://freedns-six.vercel.app/api/doh/dns-query` |
+| HaGeZi Multi Pro + TIF (this project, Vercel) | `https://dns-pi.vercel.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (this project, Netlify) | `https://dnssix.netlify.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (alternate host) | `https://freedns.koyeb.app/dns-query` |
 
