@@ -1,9 +1,10 @@
 import CopyButton from "@/components/CopyButton";
 import { DOH_PROVIDERS } from "@/lib/providers";
+import { getSiteUrl, REPOSITORY_URL } from "@/lib/site";
+import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-const SITE_URL = "https://freedns-six.vercel.app";
+const SITE_URL = getSiteUrl();
 const PUBLIC_DOH_ENDPOINT = `${SITE_URL}/api/doh/dns-query`;
-const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
 
 const PROVIDER_ENDPOINTS = DOH_PROVIDERS.map((provider) => ({
   name: provider.name,
@@ -29,7 +30,7 @@ export default function Home() {
               <h2 id="endpoint-title" className="text-sm font-semibold text-zinc-900">Recommended FreeDNS endpoint</h2>
               <code className="mt-2 block break-all rounded-xl bg-zinc-100 px-3 py-3 text-sm text-zinc-700 select-all">{PUBLIC_DOH_ENDPOINT}</code>
             </div>
-            <CopyButton value={PUBLIC_DOH_ENDPOINT} />
+            <CopyButton value={PUBLIC_DOH_ENDPOINT} label="Copy public DoH endpoint" />
           </div>
           <p className="mt-3 text-xs leading-5 text-zinc-500">
             RFC 8484 GET (<code>?dns=</code>) and POST (<code>application/dns-message</code>) are supported. The selected HaGeZi upstream is hidden from clients.
@@ -49,7 +50,7 @@ export default function Home() {
                     <h3 className="font-semibold text-zinc-900">{name}</h3>
                     <p className="mt-1 text-sm text-zinc-500">{description}</p>
                   </div>
-                  <CopyButton value={endpoint} />
+                  <CopyButton value={endpoint} label={`Copy ${name} DoH endpoint`} />
                 </div>
                 <code className="mt-4 block break-all rounded-xl bg-zinc-100 px-3 py-3 text-xs text-zinc-700">{endpoint}</code>
               </article>
@@ -63,9 +64,9 @@ export default function Home() {
             <p className="mt-1 text-sm leading-6 text-zinc-600">The primary endpoint uses three EU HaGeZi resolvers. The proxy rotates the primary server and falls back sequentially without exposing the upstream URL.</p>
           </div>
           <div className="grid gap-4 sm:grid-cols-3">
-            <FeatureCard title="Falkenstein, Germany" description="root.hagezi.org · balanced protection with Multi Pro + Threat Intelligence Feed." />
-            <FeatureCard title="Nuremberg, Germany" description="wurzn.hagezi.org · balanced protection with Multi Pro + Threat Intelligence Feed." />
-            <FeatureCard title="Helsinki, Finland" description="juuri.hagezi.org · balanced protection with Multi Pro + Threat Intelligence Feed." />
+            {HAGEZI_UPSTREAMS.map(({ hostname, location, description }) => (
+              <FeatureCard key={hostname} title={location} description={`${hostname} · ${description}`} />
+            ))}
           </div>
         </section>
 

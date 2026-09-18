@@ -1,8 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import { getSiteUrl, REPOSITORY_URL } from "@/lib/site";
 
-const SITE_URL = "https://freedns-six.vercel.app";
-const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
+const SITE_URL = getSiteUrl();
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
