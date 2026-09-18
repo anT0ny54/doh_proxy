@@ -212,6 +212,30 @@ Runtime behavior should additionally be checked after deployment with:
 ✓ No intentional DNS response caching
 ```
 
+## Endpoint examples
+
+Use the domain where you deployed this project:
+
+```text
+https://<your-domain>/api/doh/dns-query
+```
+
+Provider-specific routes follow the same pattern, for example:
+
+```text
+https://<your-domain>/api/doh/cloudflare/dns-query
+```
+
+No deployment-specific hostname is hardcoded in the project documentation.
+
+## License
+
+AGPL-3.0
+
+## Repository
+
+https://github.com/anT0ny54/doh_proxy
+
 ## Related services
 
 | Service | DNS-over-HTTPS URL |
@@ -233,11 +257,3 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 If you'd like to support development, donations are accepted at:
 
 **Bitcoin:** `1HntwKxyGCfnSGvGLMUTRAqLnTvLarAQP`
-
-## License
-
-AGPL-3.0
-
-## Repository
-
-https://github.com/anT0ny54/doh_proxy

@@ -1,0 +1,17 @@
+# Dependencies / build output
+node_modules
+.next
+out
+
+# Local / VCS files
+.git
+.github
+.gitignore
+.gitattributes
+
+# Tooling caches / local environment
+*.log
+.env
+.env.*
+!.env.example
+coverage
