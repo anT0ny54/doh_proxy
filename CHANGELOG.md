@@ -5,6 +5,10 @@ All notable changes to this project are documented here.
 ## Unreleased
 
 ### Fixed
+- Upstream responses larger than 4 KiB (DNSSEC, big TXT/DNSKEY sets) were rejected, retried against every upstream and finally returned as `502`. Responses now have their own 64 KiB cap (`MAX_DNS_RESPONSE_SIZE`); queries stay at 4 KiB.
+- Failover stopped at the first non-retryable upstream status (e.g. a `403` from an egress-IP block), even when the next upstream was healthy. It now continues and relays the last rejection status only if no upstream answers. Still not counted against the circuit breaker.
+- A slow POST body could leave only a few milliseconds for the upstream, causing an abort that was recorded as an upstream failure. Attempts with less than 100 ms of budget are now skipped.
+- The published Docker image inlined `http://localhost:3000` into the homepage because the workflow never passed `NEXT_PUBLIC_SITE_URL`; it now passes the `NEXT_PUBLIC_SITE_URL` repository variable as a build argument.
 - A non-retryable upstream status outside 400–599 (204/205/304, unfollowed 3xx) made the `Response` constructor throw inside the relay path; it was then miscounted as an upstream failure. Such statuses are now returned as `502`.
 - Circuit breaker now has a real half-open state: after the cooldown a single failed probe re-opens it immediately instead of requiring three more failures.
 - `HAGEZI_ROTATION_SECONDS=""` (blank) previously parsed as `0` and clamped to 60 s; it now falls back to the 1800 s default.

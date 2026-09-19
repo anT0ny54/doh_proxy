@@ -61,19 +61,20 @@ The proxy implements the RFC 8484 DoH request format:
 
 Request handling is bounded:
 
-- DNS messages are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`).
+- Client queries are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`); upstream responses at **64 KiB** (`MAX_DNS_RESPONSE_SIZE = 65535`, the RFC 8484 maximum).
 - GET query strings are capped at **8192 characters**.
 - POST bodies are read as a stream with a running 4 KiB cap; the read is aborted as soon as the cap or the request deadline is exceeded.
-- Upstream response bodies are read the same way (4 KiB cap plus the upstream deadline).
+- Upstream response bodies are read the same way (64 KiB cap plus the upstream deadline).
 - The primary HaGeZi path uses a **2.5 second** application deadline, inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
-- Retryable upstream failures fall through to the next fixed upstream; the proxy never launches the full failover set concurrently.
+- On the primary endpoint, any failed attempt (timeout, network error, 4xx/5xx, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream; if none answers, the last upstream rejection status (or `502`) is returned. The proxy never launches the full failover set concurrently.
+- An attempt is skipped when less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
 
 DNS validation checks message size, header flags/opcode, exactly one Question, section boundaries, name encoding, backward compression pointers, and the complete message structure. Upstream responses must be `200 application/dns-message`, structurally valid, and match the original query transaction ID and Question section before they are relayed.
 
-### 4 KiB compatibility limit
+### Size limits
 
-The 4 KiB cap is deliberate for predictable memory and bandwidth usage on small deployments. Very large DNS/DNSSEC responses can exceed this limit and will be rejected instead of being buffered without a bound.
+Queries are limited to 4 KiB and responses to 64 KiB so memory and bandwidth stay bounded while DNSSEC and large TXT answers (which routinely exceed 4 KiB) still work. Anything larger is rejected instead of being buffered without a bound.
 
 ## Primary upstreams
 
