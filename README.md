@@ -65,7 +65,7 @@ Request handling is bounded:
 - GET query strings are capped at **8192 characters**.
 - POST bodies are streamed into a fixed 4 KiB buffer rather than being accumulated without a limit.
 - Upstream response bodies are also streamed into a fixed 4 KiB buffer.
-- The primary HaGeZi path uses a **3.5 second** total request budget, leaving a small margin below the platform route limit.
+- The primary HaGeZi path uses a **3 second** total request budget.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
 - Retryable upstream failures fall through to the next fixed upstream; the proxy never launches the full failover set concurrently.
 
