@@ -9,7 +9,7 @@ const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
 const DEFAULT_TIMEOUT_MS = 2_500;
 const MIN_TIMEOUT_MS = 250;
-const HAGEZI_TIMEOUT_MS = 3_000;
+const HAGEZI_TIMEOUT_MS = 3_500;
 const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
 const MIN_HAGEZI_ROTATION_SECONDS = 60;
 const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
@@ -238,6 +238,7 @@ async function fetchUpstream(
       body: body === undefined ? undefined : toArrayBuffer(body),
       signal: controller.signal,
       cache: "no-store",
+      redirect: "error",
     });
 
     // Keep the deadline active until the response body has been consumed.
@@ -341,10 +342,7 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
 export async function handleDoH(
   request: NextRequest,
   providerId: string,
-  formatSegment?: string,
 ): Promise<NextResponse> {
-  if (formatSegment !== "dns-query") return textResponse("Not Found", 404);
-
   const upstream = getProviderUpstream(providerId);
   if (!upstream) return textResponse("Not Found", 404);
 
