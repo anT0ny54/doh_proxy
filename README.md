@@ -128,7 +128,7 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 - Request and response sizes are explicitly bounded to keep memory use predictable.
 - Response validation rejects malformed or mismatched DNS answers before relay.
 - All DoH responses use `Cache-Control: no-store` and do not implement an application DNS cache.
-- API responses use a restrictive CSP (`default-src 'none'`); the homepage has a separate document CSP.
+- The strict document CSP is applied only to the homepage; API responses carry `nosniff` and the other global security headers (a CSP has no effect on `application/dns-message` bodies).
 - A public DoH service can still consume significant bandwidth under abuse, so platform or gateway traffic controls remain important.
 
 ## Deployment
