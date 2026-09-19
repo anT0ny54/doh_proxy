@@ -324,6 +324,66 @@ try {
     const site = await readFile(new URL("../src/lib/site.ts", import.meta.url), "utf8");
     assert.match(site, /export const COPYRIGHT_YEAR = 2026;/);
   });
+  await test("Non-error upstream statuses are never relayed as-is", async () => {
+    globalThis.fetch = async () => new Response(null, { status: 204 });
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://status-204.test/dns-query" }],
+      timeoutMs: 100,
+      failover: false,
+    });
+    assert.equal(response.status, 502);
+  });
+
+  await test("Circuit breaker re-opens after a single failed half-open probe", async () => {
+    const hits = { a: 0, b: 0 };
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("half-open-a.test")) {
+        hits.a += 1;
+        return new Response(null, { status: 503 });
+      }
+      hits.b += 1;
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const options = {
+      upstreams: [{ endpoint: "https://half-open-a.test/dns-query" }, { endpoint: "https://half-open-b.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: true,
+    };
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200); // opens A
+      assert.equal(hits.a, 3);
+      await doh.proxyRequest(getRequest(), options); // still open: A skipped
+      assert.equal(hits.a, 3);
+      now += 31_000; // cooldown elapsed -> half-open probe
+      await doh.proxyRequest(getRequest(), options);
+      assert.equal(hits.a, 4, "half-open state must probe A once");
+      await doh.proxyRequest(getRequest(), options);
+      assert.equal(hits.a, 4, "one failed probe must re-open the breaker immediately");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test("Blank HAGEZI_ROTATION_SECONDS falls back to the default interval", async () => {
+    const saved = process.env.HAGEZI_ROTATION_SECONDS;
+    const realNow = Date.now;
+    try {
+      // Pick a time where the 60 s slot and the 1800 s slot map to different upstreams.
+      Date.now = () => 1_800_000 * 7 + 60_000 * 2; // 1800 s slot = 7 % 3 = 1; 60 s slot = 212 % 3 = 2
+      process.env.HAGEZI_ROTATION_SECONDS = "";
+      const blank = doh.getHageziUpstreams()[0].endpoint;
+      delete process.env.HAGEZI_ROTATION_SECONDS;
+      const unset = doh.getHageziUpstreams()[0].endpoint;
+      assert.equal(blank, unset);
+    } finally {
+      Date.now = realNow;
+      if (saved === undefined) delete process.env.HAGEZI_ROTATION_SECONDS;
+      else process.env.HAGEZI_ROTATION_SECONDS = saved;
+    }
+  });
 } finally {
   globalThis.fetch = originalFetch;
 }
