@@ -1,6 +1,6 @@
 import CopyButton from "@/components/CopyButton";
 import { DOH_PROVIDERS } from "@/lib/providers";
-import { getSiteUrl, REPOSITORY_URL } from "@/lib/site";
+import { COPYRIGHT_YEAR, getSiteUrl, REPOSITORY_URL } from "@/lib/site";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
 const SITE_URL = getSiteUrl();
@@ -85,7 +85,7 @@ export default function Home() {
         </section>
 
         <footer className="mt-12 pb-4 text-center text-sm text-zinc-400">
-          <p>© {new Date().getFullYear()} <a href={REPOSITORY_URL} target="_blank" rel="noopener noreferrer" className="underline decoration-zinc-300 underline-offset-4 hover:text-zinc-700">FreeDNS / DoH Proxy</a> · Open source under AGPL-3.0</p>
+          <p>© {COPYRIGHT_YEAR} <a href={REPOSITORY_URL} target="_blank" rel="noopener noreferrer" className="underline decoration-zinc-300 underline-offset-4 hover:text-zinc-700">FreeDNS / DoH Proxy</a> · Open source under AGPL-3.0</p>
         </footer>
       </div>
     </main>
