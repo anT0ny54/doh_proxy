@@ -11,6 +11,11 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json* ./
 COPY src ./src
 COPY next.config.ts tsconfig.json eslint.config.mjs postcss.config.mjs ./
+# The homepage is statically generated and NEXT_PUBLIC_* values are inlined at
+# build time, so the public origin must be supplied as a build argument:
+#   docker build --build-arg NEXT_PUBLIC_SITE_URL=https://dns.example.com .
+ARG NEXT_PUBLIC_SITE_URL=""
+ENV NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL
 RUN npm run build
 
 FROM node:22-alpine AS runner

@@ -63,9 +63,9 @@ Request handling is bounded:
 
 - DNS messages are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`).
 - GET query strings are capped at **8192 characters**.
-- POST bodies are streamed into a fixed 4 KiB buffer rather than being accumulated without a limit.
-- Upstream response bodies are also streamed into a fixed 4 KiB buffer.
-- The primary HaGeZi path uses a **3 second** total request budget.
+- POST bodies are read as a stream with a running 4 KiB cap; the read is aborted as soon as the cap or the request deadline is exceeded.
+- Upstream response bodies are read the same way (4 KiB cap plus the upstream deadline).
+- The primary HaGeZi path uses a **2.5 second** application deadline, inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
 - Retryable upstream failures fall through to the next fixed upstream; the proxy never launches the full failover set concurrently.
 
@@ -99,7 +99,7 @@ The application does not keep a local IP rate-limit map. Rate limiting is expect
 /api/doh/*
 ```
 
-The configured rule is **100 requests per 60 seconds**, aggregated by **IP + domain**. The edge function itself calls `context.next()`; the rate-limit configuration is the platform-enforced control.
+The configured rule is **100 requests per 60 seconds**, aggregated by **IP + domain**. Note that a busy household/office behind one NAT address, or a router that does not cache, can exceed 100 DNS queries per minute and receive `429` responses; raise `windowLimit` in that file if that matches your traffic. The edge function itself calls `context.next()`; the rate-limit configuration is the platform-enforced control.
 
 This rate-limit layer is an Edge Function. The Next.js DoH Route Handler is still a Next.js/Netlify-managed application route; the presence of the edge limiter should not be interpreted as meaning that the route handler is a separately deployed custom Edge Function.
 
@@ -116,7 +116,7 @@ Put the container behind a reverse proxy, firewall, API gateway, or load balance
 | Variable | Description | Default |
 |---|---|---|
 | `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds. | `1800` |
-| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. | platform-derived or `http://localhost:3000` |
+| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | platform-derived or `http://localhost:3000` |
 
 The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/lib/providers.ts` and `src/lib/upstreams.ts`; they are not configurable through request parameters.
 
@@ -151,7 +151,7 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 ### Docker (self-hosted)
 
 ```bash
-docker build -t doh-proxy .
+docker build --build-arg NEXT_PUBLIC_SITE_URL=https://dns.example.com -t doh-proxy .
 docker run --rm -p 8367:8367 doh-proxy
 ```
 
@@ -178,7 +178,7 @@ npm run lint
 npm run build
 ```
 
-`npm test` executes the focused DNS parser/response-validation tests in `scripts/test-dns.mjs`.
+`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`) and the DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation).
 
 The project currently stays on the TypeScript 6.x line because the configured `typescript-eslint` / Next.js ESLint integration still has a peer-range constraint below TypeScript 7. Revisit that pin when the linting toolchain supports TypeScript 7 cleanly.
 

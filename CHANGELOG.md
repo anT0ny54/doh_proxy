@@ -1,3 +1,29 @@
+# FreeDNS DoH Proxy — Changelog
+
+All notable changes to this project are documented here.
+
+## Unreleased
+
+### Fixed
+- A non-retryable upstream status outside 400–599 (204/205/304, unfollowed 3xx) made the `Response` constructor throw inside the relay path; it was then miscounted as an upstream failure. Such statuses are now returned as `502`.
+- Circuit breaker now has a real half-open state: after the cooldown a single failed probe re-opens it immediately instead of requiring three more failures.
+- `HAGEZI_ROTATION_SECONDS=""` (blank) previously parsed as `0` and clamped to 60 s; it now falls back to the 1800 s default.
+- `HEAD` responses no longer send `Content-Length` on a `204`.
+- Docker: `NEXT_PUBLIC_SITE_URL` is now a build argument. It is inlined into the statically generated homepage at build time, so setting it only at `docker run` had no effect.
+- `cancelResponseBody` no longer leaves a pending timer per cancelled body.
+
+### Removed
+- Unused `getProvider()` / `PROVIDER_MAP` in `src/lib/providers.ts` (the runtime uses its own pre-normalized map); redundant `as const` on already-annotated arrays.
+
+### Changed
+- Renamed the private `DoHUpstream` interface in `doh.ts` to `UpstreamInput` so it no longer shares a name with the exported type in `upstreams.ts`.
+- Package-lock workflow: Node 22 (matches the Dockerfile) and a real validation step (`npm ci --dry-run`) instead of repeating the generate command.
+- Added `.github/workflows/ci.yml` (tests, lint, build).
+- README: corrected the request-budget, buffering and `npm test` descriptions; documented the build-time nature of `NEXT_PUBLIC_SITE_URL` and the Netlify rate-limit caveat.
+- Tests: regression tests for the three runtime fixes above.
+
+---
+
 
 ## [2.7.3] - 2026-09-19 Extended (audit corrections)
 
@@ -20,9 +46,7 @@
 
 ---
 
-# FreeDNS DoH Proxy — Changelog
-
-All notable changes to this project are documented here.
+---
 
 ## v2.7.3 — Static footer and upstream URL normalization
 
