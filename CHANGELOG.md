@@ -1,3 +1,34 @@
+
+## [2.7.3] - 2026-09-19 Extended
+
+### Fixed
+- Removed duplicate `getEarlyMethodResponse` call in `handleHageziDoH` (redundant with `proxyRequest`)
+- Resolved `maxDuration = 3` vs `HAGEZI_TIMEOUT_MS = 2500` conflict by increasing `maxDuration` to 5 seconds
+- Fixed potential O(n²) attack via DNS compression pointers by adding hard cap on total bytes walked
+
+### Removed
+- Removed dead `url` property from `DoHUpstream` interface (was never populated by callers)
+- Removed unnecessary export of `HAGEZI_TIMEOUT_MS` (now internal constant)
+- Removed redundant `apiCsp` header from API routes (CSP is ignored by browsers on non-HTML responses)
+
+### Added
+- Added timing-safe comparison for DNS question keys using `crypto.subtle.timingSafeEqual` with constant-time fallback
+- Added circuit breaker pattern for upstream health tracking (3 failures → 30s cooldown)
+- Added in-memory rate limiting middleware for non-Netlify deployments (`src/middleware.ts`)
+- Added `X-RateLimit-*` headers to rate-limited responses
+
+### Changed
+- Optimized `readPostBody` and `readResponseBody` to use dynamic chunk allocation instead of upfront 4KB buffer
+- Updated Netlify edge function documentation to reference Next.js middleware for non-Netlify deployments
+- Improved compression pointer validation with `totalBytesWalked` counter
+
+### Security
+- Added timing-safe comparison to prevent timing attacks on DNS response validation
+- Added circuit breaker to prevent cascading failures to unhealthy upstreams
+- Added rate limiting for Vercel and self-hosted Docker deployments (previously only Netlify had rate limiting)
+
+---
+
 # FreeDNS DoH Proxy — Changelog
 
 All notable changes to this project are documented here.
