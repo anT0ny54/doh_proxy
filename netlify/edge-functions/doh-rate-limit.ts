@@ -3,9 +3,10 @@
  *
  * The rateLimit rule is enforced by Netlify before the request reaches the
  * Next.js route. context.next() then continues the normal request chain.
- * 
- * For non-Netlify deployments (Vercel, self-hosted Docker), the Next.js
- * middleware in src/middleware.ts provides equivalent rate limiting.
+ *
+ * Non-Netlify deployments (Vercel, self-hosted Docker) have no application
+ * level limiter by design: use the platform WAF or a reverse proxy so the limit
+ * is shared across instances and cannot be bypassed with spoofed headers.
  */
 export default async (_request: Request, context: { next: () => Promise<Response> }) => {
   return context.next();
