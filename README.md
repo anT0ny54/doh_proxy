@@ -1,18 +1,22 @@
 # FreeDNS DoH Proxy
 
-A lightweight public DNS-over-HTTPS (DoH) proxy built on Next.js, tuned for low-latency Edge execution on **Vercel** and **Netlify**.
+A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover, and deployment-platform rate limiting.
 
-## Public DoH endpoint
+## What this project provides
+
+The project exposes a public DoH service and a small homepage. The proxy never accepts a user-supplied upstream URL: every upstream is compiled into the application configuration.
+
+### Primary DoH endpoint
 
 ```text
-https://freedns-six.vercel.app/api/doh/dns-query
+https://<your-domain>/api/doh/dns-query
 ```
 
-This is the primary, recommended endpoint. It proxies requests to a rotating set of HaGeZi resolvers (balanced protection: Multi Pro + Threat Intelligence Feed) with sequential failover, and never exposes which upstream served the request.
+The primary endpoint uses a rotating set of three server-owned HaGeZi DoH resolvers. Requests are attempted sequentially, with a bounded timeout and failover inside the request deadline.
 
-## Built-in provider endpoints
+### Fixed provider endpoints
 
-Fixed, wire-format-only endpoints for testing against a specific upstream through the same proxy. No arbitrary/custom upstream URL is ever accepted — the provider list is a compiled-in allowlist (see `src/lib/providers.ts`).
+These routes are for testing or using a specific compiled-in upstream through the same proxy code:
 
 | Provider | Endpoint |
 |---|---|
@@ -21,68 +25,143 @@ Fixed, wire-format-only endpoints for testing against a specific upstream throug
 | AdGuard | `/api/doh/adguard/dns-query` |
 | DNS.SB | `/api/doh/dnssb/dns-query` |
 
+Provider routes do **not** accept arbitrary upstream URLs and do not use the HaGeZi failover list.
+
+## Runtime architecture
+
+```text
+Client
+  |
+  +--> GET/POST /api/doh/dns-query
+  |      |
+  |      +--> validate DNS wire message
+  |      +--> select rotated HaGeZi order
+  |      +--> sequential upstream fetch
+  |      +--> validate response + match ID/Question
+  |      +--> return application/dns-message
+  |
+  +--> GET/POST /api/doh/<provider>/dns-query
+         |
+         +--> validate DNS wire message
+         +--> use one fixed provider upstream
+         +--> validate response + match ID/Question
+         +--> return application/dns-message
+```
+
+The implementation is intentionally small: there is no local DNS cache, no arbitrary proxy target, and no per-instance in-memory rate limiter.
+
 ## API behavior
 
-Both the primary endpoint and the provider endpoints implement [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484):
+The proxy implements the RFC 8484 DoH request format:
 
-- **GET** — the DNS wire message is base64url-encoded in the `dns` query parameter.
-- **POST** — the DNS wire message is the raw request body with `Content-Type: application/dns-message`.
-- **HEAD** / **OPTIONS** — return `204` for health checks and CORS preflight.
-- Any other method returns `405` with an `Allow` header.
+- **GET** uses the `dns` query parameter containing a base64url-encoded DNS wire message.
+- **POST** uses the raw DNS wire message with `Content-Type: application/dns-message`.
+- **HEAD** and **OPTIONS** return `204` for health checks and CORS preflight.
+- Unsupported methods are handled by the Next.js route and return `405`.
 
-The proxy:
+Request handling is bounded:
 
-- rotates the primary HaGeZi upstream every 30 minutes by default (`HAGEZI_ROTATION_SECONDS`);
-- tries one upstream at a time and falls through to the next on failure or timeout, within a 3-second global budget for the primary endpoint;
-- validates GET message encoding/size and POST content type/size before forwarding anything upstream;
-- sets `Cache-Control: no-store` on every response — no intentional DNS response caching;
-- returns CORS headers (`Access-Control-Allow-Origin: *`) so browser-based DoH clients can call it directly.
+- DNS messages are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`).
+- GET query strings are capped at **8192 characters**.
+- POST bodies are streamed into a fixed 4 KiB buffer rather than being accumulated without a limit.
+- Upstream response bodies are also streamed into a fixed 4 KiB buffer.
+- The primary HaGeZi path uses a **3.5 second** total request budget, leaving a small margin below the platform route limit.
+- Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
+- Retryable upstream failures fall through to the next fixed upstream; the proxy never launches the full failover set concurrently.
+
+DNS validation checks message size, header flags/opcode, exactly one Question, section boundaries, name encoding, backward compression pointers, and the complete message structure. Upstream responses must be `200 application/dns-message`, structurally valid, and match the original query transaction ID and Question section before they are relayed.
+
+### 4 KiB compatibility limit
+
+The 4 KiB cap is deliberate for predictable memory and bandwidth usage on small deployments. Very large DNS/DNSSEC responses can exceed this limit and will be rejected instead of being buffered without a bound.
+
+## Primary upstreams
+
+The server-owned HaGeZi list is compiled in under `src/lib/upstreams.ts`:
+
+| Host | Location in source configuration | Purpose |
+|---|---|---|
+| `root.hagezi.org` | Falkenstein, Germany | Balanced protection with Multi Pro + Threat Intelligence Feed |
+| `wurzn.hagezi.org` | Nuremberg, Germany | Balanced protection with Multi Pro + Threat Intelligence Feed |
+| `juuri.hagezi.org` | Helsinki, Finland | Balanced protection with Multi Pro + Threat Intelligence Feed |
+
+The starting position rotates periodically, but each request still has a deterministic sequential failover order. The default rotation interval is 30 minutes.
 
 ## Rate limiting
 
-Two independent layers are provided; use whichever fit your deployment target, or both:
+The application does not keep a local IP rate-limit map. Rate limiting is expected to be enforced by the deployment platform or an external gateway so the control is shared across instances.
 
-1. **Application-level (`src/middleware.ts`)** — an in-memory per-IP limiter (120 requests/minute) applied to every `/api/doh/*` route, on any platform. Because serverless/edge instances don't share memory, this is a best-effort per-instance safety net, not a global limiter.
-2. **Netlify Edge Function (`netlify/edge-functions/doh-rate-limit.ts`)** — uses Netlify's platform-level `rateLimit` config (100 requests/minute, aggregated by IP + domain) for all `/api/doh/*` routes.
+### Netlify
 
-For a public deployment on either platform, also add a platform firewall/WAF rule (e.g. Vercel Firewall) on `/api/doh/*` as the primary line of defense — the application limiter is a second safety layer, not a replacement for it.
+`netlify/edge-functions/doh-rate-limit.ts` defines a Netlify edge rate-limit rule for:
+
+```text
+/api/doh/*
+```
+
+The configured rule is **100 requests per 60 seconds**, aggregated by **IP + domain**. The edge function itself calls `context.next()`; the rate-limit configuration is the platform-enforced control.
+
+This rate-limit layer is an Edge Function. The Next.js DoH Route Handler is still a Next.js/Netlify-managed application route; the presence of the edge limiter should not be interpreted as meaning that the route handler is a separately deployed custom Edge Function.
+
+### Vercel
+
+The repository does not contain an application-level Vercel limiter. Configure an appropriate Vercel Firewall/WAF rate-limit rule for `/api/doh/*`.
+
+### Docker / self-hosted
+
+Put the container behind a reverse proxy, firewall, API gateway, or load balancer that provides shared rate limiting and traffic controls.
 
 ## Configuration
 
 | Variable | Description | Default |
 |---|---|---|
-| `HAGEZI_ROTATION_SECONDS` | How often the primary HaGeZi upstream rotates. Clamped to 60–86400 seconds. | `1800` |
+| `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds. | `1800` |
+| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. | platform-derived or `http://localhost:3000` |
 
-## Security notes
+The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/lib/providers.ts` and `src/lib/upstreams.ts`; they are not configurable through request parameters.
 
-- DNS query bodies are never logged.
-- The public endpoints only ever forward to the fixed, compiled-in upstream set — no arbitrary upstream URL is accepted at any layer.
-- `Content-Security-Policy: default-src 'none'` and standard hardening headers are set on every response (see `next.config.ts` and `src/lib/doh.ts`).
-- A public DoH service can still consume significant bandwidth under abuse; keep a platform-level traffic control in place regardless of the application-level limiter.
+## Security and privacy
+
+- The application does not contain query-content logging code.
+- GET requests place the encoded DNS message in the URL. Hosting, reverse-proxy, or access logs outside the application can therefore potentially record the URL. Use POST when avoiding DNS data in URL paths matters.
+- Only fixed, compiled-in upstream URLs are forwarded; arbitrary/custom upstream targets are not supported.
+- Request and response sizes are explicitly bounded to keep memory use predictable.
+- Response validation rejects malformed or mismatched DNS answers before relay.
+- All DoH responses use `Cache-Control: no-store` and do not implement an application DNS cache.
+- API responses use a restrictive CSP (`default-src 'none'`); the homepage has a separate document CSP.
+- A public DoH service can still consume significant bandwidth under abuse, so platform or gateway traffic controls remain important.
 
 ## Deployment
 
 ### Vercel
 
-1. Push the repository to GitHub.
-2. Import it into Vercel and deploy with the default Next.js settings.
-3. Add a Vercel Firewall rate-limit rule for `/api/doh/*`.
-4. Verify with `HEAD /api/doh/dns-query` → expect `204`.
+1. Import the repository into Vercel and deploy with the normal Next.js build settings.
+2. Add a Vercel Firewall/WAF rate-limit rule covering `/api/doh/*`.
+3. Set `NEXT_PUBLIC_SITE_URL` when you want an explicit canonical public origin in generated metadata.
+4. Verify `HEAD /api/doh/dns-query` returns `204`.
 
 ### Netlify
 
 1. Import the repository into Netlify.
-2. Netlify picks up `netlify.toml` and `netlify/edge-functions/doh-rate-limit.ts` automatically; the edge function's `rateLimit` config is validated at deploy time.
-3. Verify with `HEAD /api/doh/dns-query` → expect `204`.
+2. Netlify uses `netlify.toml` for the build command and deploys the Next.js application through its Next.js integration.
+3. `netlify/edge-functions/doh-rate-limit.ts` supplies the platform rate-limit configuration for `/api/doh/*`.
+4. Set `NEXT_PUBLIC_SITE_URL` when you want an explicit canonical public origin in generated metadata.
+5. Verify `HEAD /api/doh/dns-query` returns `204`.
 
 ### Docker (self-hosted)
 
 ```bash
 docker build -t doh-proxy .
-docker run -p 8367:8367 doh-proxy
+docker run --rm -p 8367:8367 doh-proxy
 ```
 
-`next.config.ts` only emits the standalone server bundle the `Dockerfile` copies (`.next/standalone`) when neither `VERCEL` nor `NETLIFY` is set in the build environment — both platforms run their own build-output tracing and fail if `output: "standalone"` is on, so this keeps the same `next.config.ts` correct for all three targets.
+The Docker image uses Next.js standalone output and starts the generated server with:
+
+```text
+node server.js
+```
+
+`next.config.ts` enables `output: "standalone"` for self-hosted builds while leaving managed Vercel/Netlify builds on their platform-specific output handling.
 
 ## Development
 
@@ -91,38 +170,77 @@ npm install
 npm run dev
 ```
 
-`package-lock.json` is regenerated automatically by the "Generate package-lock.json" GitHub Actions workflow whenever `package.json` changes (also runs weekly), so it doesn't need to be hand-maintained.
-
-Before shipping:
+Useful commands:
 
 ```bash
+npm test
 npm run lint
 npm run build
 ```
 
-`typescript` is pinned to the 6.x line rather than 7.x: TypeScript 7's package no longer ships the classic JS compiler API, and `typescript-eslint` (pulled in by `eslint-config-next`'s `next/typescript` preset, used in `eslint.config.mjs`) still requires it, so `npm run lint` fails on TypeScript 7 today. `next build`'s own type-checking is unaffected either way. Revisit this pin once `typescript-eslint` supports TypeScript 7 (tracking: their `>=4.8.4 <6.1.0` peer range).
+`npm test` executes the focused DNS parser/response-validation tests in `scripts/test-dns.mjs`.
+
+The project currently stays on the TypeScript 6.x line because the configured `typescript-eslint` / Next.js ESLint integration still has a peer-range constraint below TypeScript 7. Revisit that pin when the linting toolchain supports TypeScript 7 cleanly.
 
 ## Validation checklist
 
+The repository includes checks for:
+
+```text
+✓ Normal DNS query structure
+✓ Query/response message-type validation
+✓ First-question compression rejection
+✓ Backward compression handling
+✓ Forward / invalid compression rejection
+✓ DNS name length bounds
+✓ Response transaction-ID matching
+✓ Response Question matching
+✓ Case-insensitive DNS Question-name matching
+```
+
+Runtime behavior should additionally be checked after deployment with:
+
 ```text
 ✓ HEAD /api/doh/dns-query              → 204
-✓ Valid GET  ?dns=<b64url>             → 200
-✓ Valid POST application/dns-message   → 200
-✓ Missing GET dns                      → 400
-✓ Malformed dns                        → 400
-✓ Oversized body                       → 413
+✓ Valid GET ?dns=<base64url>           → 200 application/dns-message
+✓ Valid POST application/dns-message   → 200 application/dns-message
+✓ Invalid or missing GET dns           → 400
+✓ Oversized request                    → 413 / bounded rejection
 ✓ Unsupported POST content type        → 415
-✓ Over the application rate limit      → 429 + Retry-After
-✓ Upstream failure                     → sequential HaGeZi fallback
-✓ Global timeout                       → bounded failure response
+✓ Deployment-edge rate limiting        → platform/WAF enforced
+✓ Upstream failure                     → bounded sequential failover
 ✓ No intentional DNS response caching
 ```
+
+## Endpoint examples
+
+Use the domain where you deployed this project:
+
+```text
+https://<your-domain>/api/doh/dns-query
+```
+
+Provider-specific routes follow the same pattern, for example:
+
+```text
+https://<your-domain>/api/doh/cloudflare/dns-query
+```
+
+No deployment-specific hostname is hardcoded in the project documentation.
+
+## License
+
+AGPL-3.0
+
+## Repository
+
+https://github.com/anT0ny54/doh_proxy
 
 ## Related services
 
 | Service | DNS-over-HTTPS URL |
 | --- | --- |
-| HaGeZi Multi Pro + TIF (this project, Vercel) | `https://freedns-six.vercel.app/api/doh/dns-query` |
+| HaGeZi Multi Pro + TIF (this project, Vercel) | `https://dns-pi.vercel.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (this project, Netlify) | `https://dnssix.netlify.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (alternate host) | `https://freedns.koyeb.app/dns-query` |
 
@@ -139,11 +257,3 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 If you'd like to support development, donations are accepted at:
 
 **Bitcoin:** `1HntwKxyGCfnSGvGLMUTRAqLnTvLarAQP`
-
-## License
-
-AGPL-3.0
-
-## Repository
-
-https://github.com/anT0ny54/doh_proxy
