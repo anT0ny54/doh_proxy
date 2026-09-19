@@ -206,5 +206,4 @@ await test("DNS question name matching is case-insensitive", () => {
   response[qnameStart + 2] = 87;
   assert.equal(dns.isValidDnsResponse(response, validQuery), true);
 });
-
-  
+    
