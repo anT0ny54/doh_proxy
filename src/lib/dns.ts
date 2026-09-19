@@ -166,22 +166,13 @@ function questionKey(message: Uint8Array, range: QuestionRange): Uint8Array {
 }
 
 /**
- * Timing-safe comparison of two Uint8Arrays using crypto.subtle.timingSafeEqual
- * when available (Node.js 15+), with fallback to constant-time manual comparison.
+ * Constant-time comparison of two Uint8Arrays to prevent timing attacks.
+ * This implementation avoids early exit and ensures equal comparison time
+ * regardless of where the first difference occurs.
  */
 function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
 
-  // Use crypto.subtle.timingSafeEqual if available (Node.js 15+, modern edge runtimes)
-  if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.timingSafeEqual === 'function') {
-    try {
-      return crypto.subtle.timingSafeEqual(a, b);
-    } catch {
-      // Fall through to manual comparison if crypto.subtle fails
-    }
-  }
-
-  // Fallback: constant-time manual comparison
   let diff = 0;
   for (let i = 0; i < a.byteLength; i += 1) {
     diff |= a[i] ^ b[i];
