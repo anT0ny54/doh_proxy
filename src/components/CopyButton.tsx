@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-export default function CopyButton({ value, label }: { value: string; label: string }) {
+export default function CopyButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
 
   async function copy() {
@@ -20,7 +20,7 @@ export default function CopyButton({ value, label }: { value: string; label: str
       type="button"
       onClick={copy}
       className="min-h-11 shrink-0 rounded-xl border border-zinc-300 bg-zinc-900 px-4 text-sm font-medium text-white transition hover:bg-zinc-800 active:scale-[0.99]"
-      aria-label={label}
+      aria-label="Copy public DoH endpoint"
     >
       {copied ? "Copied" : "Copy"}
     </button>
