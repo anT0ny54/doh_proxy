@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { handleHageziDoH } from "@/lib/doh";
 
 export const runtime = "edge";
+export const dynamic = "force-dynamic";
 export const maxDuration = 4;
 
 export const GET = (request: NextRequest) => handleHageziDoH(request);
