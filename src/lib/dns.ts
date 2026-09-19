@@ -38,10 +38,15 @@ function skipName(
   let jumped = false;
   let jumps = 0;
   let nameLength = 0;
+  let totalBytesWalked = 0;
+  const maxBytesWalked = message.byteLength * 4;
 
   if (nameStarts) nameStarts.add(start);
 
   while (offset < message.byteLength) {
+    // Hard cap on total bytes walked to prevent O(n²) attacks via compression pointers
+    if (++totalBytesWalked > maxBytesWalked) return null;
+
     const lengthOffset = offset;
     const length = message[offset];
 
@@ -160,6 +165,30 @@ function questionKey(message: Uint8Array, range: QuestionRange): Uint8Array {
   return key;
 }
 
+/**
+ * Timing-safe comparison of two Uint8Arrays using crypto.subtle.timingSafeEqual
+ * when available (Node.js 15+), with fallback to constant-time manual comparison.
+ */
+function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+
+  // Use crypto.subtle.timingSafeEqual if available (Node.js 15+, modern edge runtimes)
+  if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.timingSafeEqual === 'function') {
+    try {
+      return crypto.subtle.timingSafeEqual(a, b);
+    } catch {
+      // Fall through to manual comparison if crypto.subtle fails
+    }
+  }
+
+  // Fallback: constant-time manual comparison
+  let diff = 0;
+  for (let i = 0; i < a.byteLength; i += 1) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
 export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array): boolean {
   const responseQuestion = validateStructure(message, true);
   if (responseQuestion === null) return false;
@@ -171,11 +200,6 @@ export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array): boo
 
   const responseKey = questionKey(message, responseQuestion);
   const queryKey = questionKey(query, queryQuestion);
-  if (responseKey.byteLength !== queryKey.byteLength) return false;
 
-  for (let i = 0; i < queryKey.byteLength; i += 1) {
-    if (responseKey[i] !== queryKey[i]) return false;
-  }
-
-  return true;
+  return timingSafeEqual(responseKey, queryKey);
 }

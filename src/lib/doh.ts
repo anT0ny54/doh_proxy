@@ -9,7 +9,7 @@ const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
 const DEFAULT_TIMEOUT_MS = 2_500;
 const MIN_TIMEOUT_MS = 250;
-export const HAGEZI_TIMEOUT_MS = 2_500;
+const HAGEZI_TIMEOUT_MS = 2_500;
 const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
 const MIN_HAGEZI_ROTATION_SECONDS = 60;
 const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
@@ -17,9 +17,12 @@ const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const STREAM_CANCEL_TIMEOUT_MS = 25;
 
+// Circuit breaker configuration
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
+
 interface DoHUpstream {
   readonly endpoint: string;
-  readonly url?: URL;
 }
 
 interface NormalizedDoHUpstream {
@@ -33,6 +36,54 @@ interface DoHOptions {
   readonly failover?: boolean;
 }
 
+// Circuit breaker state (Node.js runtime only, not available in edge)
+interface CircuitBreakerState {
+  failures: number;
+  lastFailureTime: number;
+  open: boolean;
+}
+
+const circuitBreakers = new Map<string, CircuitBreakerState>();
+
+function getCircuitBreaker(endpoint: string): CircuitBreakerState {
+  let cb = circuitBreakers.get(endpoint);
+  if (!cb) {
+    cb = { failures: 0, lastFailureTime: 0, open: false };
+    circuitBreakers.set(endpoint, cb);
+  }
+  return cb;
+}
+
+function isCircuitBreakerOpen(endpoint: string): boolean {
+  const cb = getCircuitBreaker(endpoint);
+  if (!cb.open) return false;
+
+  // Check if cooldown has elapsed
+  if (Date.now() - cb.lastFailureTime >= CIRCUIT_BREAKER_COOLDOWN_MS) {
+    cb.open = false;
+    cb.failures = 0;
+    return false;
+  }
+  return true;
+}
+
+function recordFailure(endpoint: string): void {
+  const cb = getCircuitBreaker(endpoint);
+  cb.failures += 1;
+  cb.lastFailureTime = Date.now();
+  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+    cb.open = true;
+  }
+}
+
+function recordSuccess(endpoint: string): void {
+  const cb = circuitBreakers.get(endpoint);
+  if (cb) {
+    cb.failures = 0;
+    cb.open = false;
+  }
+}
+
 const NORMALIZED_PROVIDER_UPSTREAMS = new Map(
   DOH_PROVIDERS.map((provider) => [
     provider.id,
@@ -41,14 +92,12 @@ const NORMALIZED_PROVIDER_UPSTREAMS = new Map(
 );
 
 const NORMALIZED_HAGEZI_UPSTREAMS: readonly NormalizedDoHUpstream[] = HAGEZI_UPSTREAMS.map((upstream) => ({
-  ...upstream,
+  endpoint: upstream.endpoint,
   url: new URL(upstream.endpoint),
 }));
 
 function normalizeUpstream(upstream: DoHUpstream): NormalizedDoHUpstream {
-  return upstream.url
-    ? { endpoint: upstream.endpoint, url: upstream.url }
-    : { endpoint: upstream.endpoint, url: new URL(upstream.endpoint) };
+  return { endpoint: upstream.endpoint, url: new URL(upstream.endpoint) };
 }
 
 export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
@@ -171,7 +220,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
   if (!request.body) return textResponse("Invalid DNS message", 400);
 
   const reader = request.body.getReader();
-  const buffer = new Uint8Array(MAX_DNS_MESSAGE_SIZE);
+  const chunks: Uint8Array[] = [];
   let total = 0;
 
   try {
@@ -200,7 +249,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
           return textResponse("Payload too large", 413);
         }
 
-        buffer.set(result.value, total);
+        chunks.push(result.value);
         total = nextTotal;
       } catch (error) {
         await cancelReaderBestEffort(reader);
@@ -218,7 +267,14 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
     }
   }
 
-  const body = buffer.subarray(0, total);
+  // Concatenate chunks into final buffer
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
   if (!isValidDnsQuery(body)) return textResponse("Invalid DNS message", 400);
   return body;
 }
@@ -233,7 +289,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
   if (!response.body) return new Uint8Array(0);
 
   const reader = response.body.getReader();
-  const buffer = new Uint8Array(MAX_DNS_MESSAGE_SIZE);
+  const chunks: Uint8Array[] = [];
   let total = 0;
 
   try {
@@ -247,7 +303,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
         return null;
       }
 
-      buffer.set(value, total);
+      chunks.push(value);
       total = nextTotal;
     }
   } finally {
@@ -258,7 +314,14 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
     }
   }
 
-  return buffer.subarray(0, total);
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return body;
 }
 
 function cancelResponseBody(response: Response): void {
@@ -357,6 +420,11 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
 
+    // Skip upstream if circuit breaker is open
+    if (isCircuitBreakerOpen(upstream.endpoint)) {
+      continue;
+    }
+
     try {
       const upstreamFetch = await fetchUpstream(
         request,
@@ -371,21 +439,29 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
         if (result.status !== 200) {
           const retryable = RETRYABLE_UPSTREAM_STATUSES.has(result.status);
           cancelResponseBody(result);
-          if (retryable) continue;
+          if (retryable) {
+            recordFailure(upstream.endpoint);
+            continue;
+          }
+          recordFailure(upstream.endpoint);
           return textResponse("DNS upstream rejected request", result.status);
         }
 
         const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
         if (contentType !== DNS_MESSAGE) {
           cancelResponseBody(result);
+          recordFailure(upstream.endpoint);
           continue;
         }
 
         const responseBody = await readResponseBody(result);
         if (responseBody === null || queryBody === undefined || !isValidDnsResponse(responseBody, queryBody)) {
           cancelResponseBody(result);
+          recordFailure(upstream.endpoint);
           continue;
         }
+
+        recordSuccess(upstream.endpoint);
 
         const headers = baseHeaders();
         headers.set("Content-Type", DNS_MESSAGE);
@@ -396,6 +472,7 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
       }
     } catch {
       // Network errors and timeouts are retryable; try the next fixed upstream.
+      recordFailure(upstream.endpoint);
     }
   }
 
@@ -413,9 +490,6 @@ export async function handleDoH(
 }
 
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
-  const earlyResponse = getEarlyMethodResponse(request);
-  if (earlyResponse) return earlyResponse;
-
   return proxyRequest(request, {
     upstreams: getHageziUpstreams(),
     timeoutMs: HAGEZI_TIMEOUT_MS,
