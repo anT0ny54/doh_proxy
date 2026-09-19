@@ -1,5 +1,13 @@
 export const DNS_MESSAGE = "application/dns-message";
+/** Cap for client queries. Real queries are tiny; 4 KiB is generous. */
 export const MAX_DNS_MESSAGE_SIZE = 4_096;
+/**
+ * Cap for upstream responses. RFC 8484 allows up to 65535 bytes, and DNSSEC
+ * (DO bit) answers, large TXT sets and DNSKEY/RRSIG chains routinely exceed
+ * 4 KiB. Rejecting them made otherwise valid lookups fail with a 502 after
+ * burning every upstream in the failover list.
+ */
+export const MAX_DNS_RESPONSE_SIZE = 65_535;
 
 interface DnsCounts {
   readonly questions: number;
@@ -119,7 +127,8 @@ function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8A
 
 function validateStructure(message: Uint8Array, expectedResponse: boolean): QuestionRange | null {
   const counts = readCounts(message);
-  if (!counts || message.byteLength > MAX_DNS_MESSAGE_SIZE) return null;
+  const maxSize = expectedResponse ? MAX_DNS_RESPONSE_SIZE : MAX_DNS_MESSAGE_SIZE;
+  if (!counts || message.byteLength > maxSize) return null;
 
   const flags = readUint16(message, 2);
   const isResponse = (flags & 0x8000) !== 0;

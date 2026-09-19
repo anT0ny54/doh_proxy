@@ -1,6 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { DOH_PROVIDERS } from "@/lib/providers";
-import { DNS_MESSAGE, isValidDnsQuery, isValidDnsResponse, MAX_DNS_MESSAGE_SIZE } from "@/lib/dns";
+import {
+  DNS_MESSAGE,
+  isValidDnsQuery,
+  isValidDnsResponse,
+  MAX_DNS_MESSAGE_SIZE,
+  MAX_DNS_RESPONSE_SIZE,
+} from "@/lib/dns";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
 export const PROXY_VERSION = "2.7.3";
@@ -9,6 +15,10 @@ const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
 const DEFAULT_TIMEOUT_MS = 2_500;
 const MIN_TIMEOUT_MS = 250;
+// An attempt with less budget than this cannot realistically finish (TLS + RTT)
+// and would only be recorded as a bogus upstream failure, e.g. when a slow
+// client consumed most of the request deadline while sending its POST body.
+const MIN_ATTEMPT_TIMEOUT_MS = 100;
 const HAGEZI_TIMEOUT_MS = 2_500;
 const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
 const MIN_HAGEZI_ROTATION_SECONDS = 60;
@@ -287,7 +297,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     const size = Number(contentLength);
-    if (!Number.isInteger(size) || size > MAX_DNS_MESSAGE_SIZE) return null;
+    if (!Number.isInteger(size) || size > MAX_DNS_RESPONSE_SIZE) return null;
   }
 
   if (!response.body) return new Uint8Array(0);
@@ -302,7 +312,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
       if (done) break;
 
       const nextTotal = total + value.byteLength;
-      if (nextTotal > MAX_DNS_MESSAGE_SIZE) {
+      if (nextTotal > MAX_DNS_RESPONSE_SIZE) {
         await cancelReaderBestEffort(reader);
         return null;
       }
@@ -361,10 +371,10 @@ async function fetchUpstream(
   body: Uint8Array | undefined,
   timeoutMs: number,
 ): Promise<UpstreamFetch> {
-  const url = request.method === "GET" && dnsParam !== undefined
-    ? new URL(upstream.url)
-    : upstream.url;
-  if (request.method === "GET" && dnsParam !== undefined) url.searchParams.set("dns", dnsParam);
+  const isGet = request.method === "GET" && dnsParam !== undefined;
+  // Copy the pre-parsed URL only when it must be mutated.
+  const url = isGet ? new URL(upstream.url) : upstream.url;
+  if (isGet) url.searchParams.set("dns", dnsParam);
 
   const headers = new Headers({
     Accept: DNS_MESSAGE,
@@ -430,9 +440,14 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
     ? Math.max(750, Math.floor(timeout / Math.max(upstreams.length, 1)))
     : timeout;
 
+  // Last non-200 status seen from the most recent attempt, if that attempt was a
+  // definite upstream rejection (as opposed to a timeout/invalid body).
+  let lastRejectedStatus: number | undefined;
+
   for (const upstream of upstreams) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
+    const attemptTimeout = Math.min(deadline - Date.now(), perAttemptTimeout);
+    if (attemptTimeout < MIN_ATTEMPT_TIMEOUT_MS) break;
+    lastRejectedStatus = undefined;
 
     try {
       const upstreamFetch = await fetchUpstream(
@@ -440,7 +455,7 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
         dnsParam,
         upstream,
         request.method === "POST" ? queryBody : undefined,
-        Math.min(remaining, perAttemptTimeout),
+        attemptTimeout,
       );
       const result = upstreamFetch.response;
 
@@ -455,11 +470,15 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
             recordFailure(upstream.endpoint);
             continue;
           }
-          // Only relay real error statuses. 1xx/2xx/3xx (204, 304, unfollowed
-          // redirects, ...) are invalid for a text body and would make the
-          // Response constructor throw and be miscounted as an upstream failure.
-          const relayed = result.status >= 400 && result.status <= 599 ? result.status : 502;
-          return textResponse("DNS upstream rejected request", relayed);
+          // A non-retryable status (403 from an egress-IP block, 404 from a
+          // misconfigured node, ...) says nothing about the *next* upstream, so
+          // keep failing over and only relay the status if nothing else answers.
+          // It does not count against the breaker: it may be client-influenced.
+          // Only real error statuses are relayed: 1xx/2xx/3xx (204, 304,
+          // unfollowed redirects, ...) are invalid for a text body and would make
+          // the Response constructor throw and be miscounted as a failure.
+          lastRejectedStatus = result.status >= 400 && result.status <= 599 ? result.status : 502;
+          continue;
         }
 
         const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
@@ -489,6 +508,7 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
     }
   }
 
+  if (lastRejectedStatus !== undefined) return textResponse("DNS upstream rejected request", lastRejectedStatus);
   return textResponse("DNS upstream unavailable", 502);
 }
 
