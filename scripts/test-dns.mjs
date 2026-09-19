@@ -127,6 +127,15 @@ await test("rejects forward compression pointers", () => {
   assert.equal(dns.isValidDnsResponse(response), false);
 });
 
+await test("rejects compression pointers into unrelated question fields", () => {
+  const response = validResponse();
+  const answerNameOffset = validQuery.length;
+  // Offset 26 is the first byte of QTYPE, not the start of a domain name.
+  response[answerNameOffset] = 0xc0;
+  response[answerNameOffset + 1] = 26;
+  assert.equal(dns.isValidDnsResponse(response, validQuery), false);
+});
+
 await test("rejects compression pointers that point before the DNS message", () => {
   const response = Uint8Array.from([
     0,
