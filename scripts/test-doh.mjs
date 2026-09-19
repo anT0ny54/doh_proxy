@@ -235,7 +235,7 @@ try {
     }
   });
 
-  await test("Non-retryable upstream status is returned directly", async () => {
+  await test("Non-retryable upstream status is returned directly without failover", async () => {
     let calls = 0;
     globalThis.fetch = async () => {
       calls += 1;
@@ -243,15 +243,109 @@ try {
     };
 
     const response = await doh.proxyRequest(getRequest(), {
-      upstreams: [
-        { endpoint: "https://first.test/dns-query" },
-        { endpoint: "https://second.test/dns-query" },
-      ],
+      upstreams: [{ endpoint: "https://only.test/dns-query" }],
       timeoutMs: 100,
-      failover: true,
+      failover: false,
     });
 
     assert.equal(response.status, 403);
+    assert.equal(calls, 1);
+  });
+
+  await test("Failover continues past a non-retryable status and relays it only if nothing answers", async () => {
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      if (String(url).includes("blocked.test")) return new Response(null, { status: 403 });
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+
+    const recovered = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://blocked.test/dns-query" }, { endpoint: "https://good.test/dns-query" }],
+      timeoutMs: 100,
+      failover: true,
+    });
+    assert.equal(recovered.status, 200);
+    assert.equal(seen.length, 2);
+
+    seen.length = 0;
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      return new Response(null, { status: 403 });
+    };
+    const rejected = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://all-403-a.test/dns-query" }, { endpoint: "https://all-403-b.test/dns-query" }],
+      timeoutMs: 100,
+      failover: true,
+    });
+    assert.equal(rejected.status, 403);
+    assert.equal(seen.length, 2);
+  });
+
+  await test("Upstream responses larger than 4 KiB (DNSSEC/TXT) are relayed", async () => {
+    const query = validQuery();
+    const question = query.slice(12);
+    const records = [];
+    for (let i = 0; i < 17; i += 1) {
+      const rdata = [255, ...new Uint8Array(255).fill(97)];
+      records.push(0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, rdata.length >> 8, rdata.length & 0xff, ...rdata);
+    }
+    const big = Uint8Array.from([query[0], query[1], 0x81, 0x80, 0, 1, 0, 17, 0, 0, 0, 0, ...question, ...records]);
+    assert.ok(big.byteLength > 4_096);
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(big, { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://big.test/dns-query" }, { endpoint: "https://big2.test/dns-query" }],
+      timeoutMs: 100,
+      failover: true,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(calls, 1);
+    assert.equal((await response.arrayBuffer()).byteLength, big.byteLength);
+  });
+
+  await test("A slow POST body that leaves no upstream budget neither fetches nor trips the breaker", async () => {
+    const query = validQuery();
+    const slowBody = {
+      getReader() {
+        let step = 0;
+        return {
+          read() {
+            step += 1;
+            if (step === 1) {
+              // Leaves ~50 ms of the 250 ms minimum deadline for the upstream.
+              return new Promise((resolve) => setTimeout(() => resolve({ done: false, value: query }), 200));
+            }
+            return Promise.resolve({ done: true, value: undefined });
+          },
+          cancel() {
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
+    };
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(validResponse(query), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const options = { upstreams: [{ endpoint: "https://slow-client.test/dns-query" }], timeoutMs: 250, failover: false };
+
+    for (let i = 0; i < 4; i += 1) {
+      const slow = await doh.proxyRequest(postRequest(slowBody), options);
+      assert.equal(slow.status, 502);
+    }
+    assert.equal(calls, 0, "no upstream attempt should be made with a sub-100 ms budget");
+
+    // A normal follow-up request must still be served normally.
+    const ok = await doh.proxyRequest(getRequest(query), options);
+    assert.equal(ok.status, 200);
     assert.equal(calls, 1);
   });
 

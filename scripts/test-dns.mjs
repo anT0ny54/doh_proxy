@@ -228,3 +228,24 @@ test("accepts a CNAME chain whose next owner name points into earlier RDATA", ()
   const response = Uint8Array.from([0, 1, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0, ...question, ...cname, ...a]);
   assert.equal(dns.isValidDnsResponse(response, query), true);
 });
+
+test("responses may exceed 4 KiB but queries may not", () => {
+  const question = validQuery.slice(12);
+  const records = [];
+  for (let i = 0; i < 17; i += 1) {
+    const rdata = [255, ...new Uint8Array(255).fill(97)];
+    records.push(0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, rdata.length >> 8, rdata.length & 0xff, ...rdata);
+  }
+  const big = Uint8Array.from([validQuery[0], validQuery[1], 0x81, 0x80, 0, 1, 0, 17, 0, 0, 0, 0, ...question, ...records]);
+  assert.ok(big.byteLength > 4_096);
+  assert.equal(dns.isValidDnsResponse(big, validQuery), true);
+
+  // Structurally valid query (EDNS0 padding option) that only violates the size cap.
+  const padded = (padLength) => {
+    const rdata = [0, 12, padLength >> 8, padLength & 0xff, ...new Uint8Array(padLength)];
+    const opt = [0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, rdata.length >> 8, rdata.length & 0xff, ...rdata];
+    return Uint8Array.from([...validQuery.slice(0, 10), 0, 1, ...validQuery.slice(12), ...opt]);
+  };
+  assert.equal(dns.isValidDnsQuery(padded(100)), true);
+  assert.equal(dns.isValidDnsQuery(padded(4_100)), false);
+});
