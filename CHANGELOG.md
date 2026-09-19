@@ -1,102 +1,11 @@
 # FreeDNS DoH Proxy — Changelog
 
-All notable changes to this project are documented here.
-
-## v2.7.1 — Runtime hardening and documentation alignment
-
-### Runtime
-
-- Kept the intentionally strict single-question DNS model.
-- Resource-record owner names may use backward DNS compression pointers; the first Question QNAME is not compressed.
-- Removed the per-name `Set` allocation because pointers are restricted to earlier offsets; the existing jump cap remains as defense-in-depth.
-- Added response-to-query correlation: the relayed DNS response must match the original transaction ID and Question section, with case-insensitive ASCII DNS-name matching.
-- Kept the fixed-upstream model: no arbitrary/custom upstream URL is accepted.
-- Kept three server-owned HaGeZi upstreams with deterministic rotation and sequential failover.
-- Kept fixed provider routes for Google, Cloudflare, AdGuard, and DNS.SB without provider failover.
-
-### Bounds and timeouts
-
-- Kept the 4 KiB maximum DNS message size for both requests and upstream responses.
-- Kept the 8192-character GET query-string limit.
-- Kept streaming reads into fixed-size buffers for POST requests and upstream responses.
-- Kept the 3-second global budget for the primary HaGeZi path.
-- Kept bounded sequential failover and retryable-upstream handling.
-
-### HTTP / DoH behavior
-
-- Kept RFC 8484 GET and POST handling.
-- Kept `HEAD` and `OPTIONS` handling for health checks and CORS preflight.
-- Kept `200 application/dns-message` as the only upstream response accepted for relay.
-- Kept `Cache-Control: no-store`; there is no application DNS response cache.
-- Kept wildcard CORS and security headers.
-
-### Deployment
-
-- `next.config.ts` enables `output: "standalone"` for self-hosted builds when neither `VERCEL` nor `NETLIFY` is present at build time.
-- Managed Vercel and Netlify builds use their platform-specific Next.js build handling rather than the Docker standalone bundle.
-- Docker starts the generated standalone server with `node server.js` on port `8367` as a non-root user.
-- Netlify rate limiting is defined as a platform rule in `netlify/edge-functions/doh-rate-limit.ts` for `/api/doh/*`, configured for 100 requests per 60 seconds aggregated by IP + domain.
-- Vercel and self-hosted deployments do not contain an application-level shared rate limiter; use platform/WAF/gateway controls instead.
-
-### Documentation
-
-- Updated `README.md` to describe the actual route structure, fixed upstream model, request/response limits, failover behavior, deployment modes, and rate-limiting responsibilities.
-- Documented the 4 KiB DNS message limit as an intentional resource/compatibility trade-off; unusually large DNS/DNSSEC responses may be rejected.
-- Clarified that the application contains no DNS query-content logging code, while GET requests still carry the encoded DNS message in the URL and may therefore be visible to infrastructure access logging.
-- Clarified the distinction between Netlify's edge rate-limit function and the Next.js application route.
-- Removed unrelated Bandwidth Hero marketing content from the project README.
-
-### Validation coverage
-
-- Added regression coverage for accepted backward compression and rejected forward/out-of-message compression pointers.
-- Added regression coverage for response transaction-ID matching, Question matching, and case-insensitive DNS names.
-- Kept structural validation coverage for message type, one-question enforcement, section bounds, and DNS name size.
-
-## v2.7.0 — DoH runtime hardening and low-allocation optimization
-
-- Added response-to-query correlation: the relayed DNS response must match the original transaction ID and Question section (case-insensitive DNS name matching).
-- Reworked bounded request and upstream response reads to use a single fixed 4 KiB buffer instead of accumulating chunk arrays and copying them into a second buffer.
-- Reused the already-validated GET DNS wire message instead of decoding the Base64URL query twice.
-- Added an explicit 3-second Next.js route execution budget to match the primary HaGeZi failover budget.
-- Removed unnecessary `Vary: Accept` from non-cacheable DoH responses.
-- Centralized HaGeZi endpoint metadata in `src/lib/upstreams.ts` so runtime routing and the homepage use one source of truth.
-- Kept the fixed-upstream model, strict 4 KiB bounds, streaming reads, bounded sequential failover, Next.js Edge runtime where used, and deployment-edge rate limiting unchanged.
-- Expanded DNS regression tests for valid responses, transaction/question matching, mismatched IDs/questions, and DNS case-insensitive names.
-- Bumped the application/proxy version to 2.7.0.
-
-## v2.6.2 — Runtime correctness and security fixes
-
-- Scoped the strict API Content Security Policy to `/api/doh/*` so the interactive homepage can load its required scripts and styles.
-- Kept the upstream abort deadline active through the complete response-body read, preventing slow/trickling upstream responses from escaping the request budget.
-- Applied the same bounded request deadline to streaming POST-body reads, preventing slow client uploads from holding an execution open indefinitely.
-- Tightened DNS name validation with the 255-octet name limit and backward-only compression pointers for resource-record names.
-- Centralized the repository URL and removed duplicate configuration.
-- Removed redundant `force-dynamic` Route Handler configuration and unused DNS re-exports.
-- Synchronized package/proxy/changelog version metadata at 2.6.2.
-- Removed redundant `Vary: Origin` from wildcard-CORS responses.
-
-## v2.6.1 — Runtime hardening and deployment cleanup
-
-- Replaced the per-instance in-memory rate limiter with deployment-edge rate limiting; removed client-IP header trust from application code.
-- Added a strict shared DNS wire-message validator for GET and POST requests, including DNS header, question, compressed owner-name, and resource-record structure checks.
-- Enforced `200` + `application/dns-message` for upstream success responses and validated the returned DNS response before relaying it.
-- Added bounded upstream response reads and cancelled failed/oversized upstream bodies.
-- Limited automatic failover to retryable HTTP statuses plus network/timeouts instead of every non-2xx response.
-- Added bounded per-attempt timeouts inside the global HaGeZi request budget.
-- Fixed the GET base64url validator to reject padded encodings and duplicate `dns` parameters.
-- Centralized the public site origin and removed hardcoded Vercel URLs from the homepage and metadata.
-- Switched Docker dependency installation back to reproducible `npm ci`.
-- Fixed the package-lock workflow path trigger and npm cache dependency path.
-- Replaced the ESLint compatibility shim with the native flat-config setup supported by Next.js 16.
-- Removed unused `DoHUpstream.name` data.
-- Added contextual labels to the endpoint copy buttons and CORS preflight caching.
-
 ## v2.6.0 — Build/tooling conflict fixes
 
 - Fixed a regression from v2.5.0: removing the standalone Next.js output (to stop it breaking the Vercel/Netlify build) had left `Dockerfile` still copying `.next/standalone`, so `docker build` no longer produced a working image. `next.config.ts` now emits `output: "standalone"` only when neither `VERCEL` nor `NETLIFY` is set in the build environment, so Docker gets its standalone bundle back without reintroducing the managed-platform build failure.
-- Pinned `typescript` to `^6.0.3` instead of `^7`. The current linting toolchain has a peer-range constraint below TypeScript 7, so the project remains on the 6.x line until that toolchain can support TypeScript 7 cleanly.
-- Kept the dependency workflow responsible for regenerating `package-lock.json` from `package.json`.
-- Documented the Docker self-host path in `README.md`.
+- Pinned `typescript` to `^6.0.3` instead of `^7`. TypeScript 7's npm package dropped the classic JS compiler API that `typescript-eslint` needs (it's pulled in by `eslint-config-next`'s `next/typescript` preset in `eslint.config.mjs`), so `npm run lint` would fail under TypeScript 7 as installed. `next build`'s own type-checking is unaffected by this change either way.
+- Removed the now-stale `package-lock.json` rather than leave it out of sync with the `typescript` version change; the repo's existing "Generate package-lock.json" workflow regenerates it. `Dockerfile`'s dependency stage now uses `npm install` instead of `npm ci` so a regenerating/absent lockfile doesn't hard-fail the build; `README.md` updated to match.
+- Documented the previously-undocumented Docker self-host path in `README.md`.
 - Bumped the application/proxy version to 2.6.0.
 - No public API, route, or wire-format behavior changed.
 
@@ -116,10 +25,10 @@ All notable changes to this project are documented here.
 - Removed a dead, unused `DoHProvider` type import in `src/lib/doh.ts`.
 - Removed duplicated provider data: the homepage (`src/app/page.tsx`) now derives its provider endpoint list from `src/lib/providers.ts` instead of maintaining a second hardcoded copy.
 - Avoided redundant URL re-parsing on every upstream failover attempt in `src/lib/doh.ts` (the request URL is now parsed once and passed through).
-- Removed `wrangler.toml`: it had no CI workflow wiring it up, and its `pages_build_output_dir` setting was inconsistent with this project's actual Vercel/Netlify-focused build output. Not needed for the stated Vercel/Netlify deployment targets.
-- Rewrote `README.md` to remove contradictory statements left over from prior edits, merged duplicate deployment documentation, and removed documentation for a `DEBUG_LOG` variable that was never implemented.
-- Rewrote this changelog: the previous "Changes v1" and "Changes v2" sections were duplicate leftover content.
-- No public API, route, or wire-format behavior changed.
+- Removed `wrangler.toml`: it had no CI workflow wiring it up, and its `pages_build_output_dir` setting was inconsistent with this project's actual (Vercel/Netlify-focused) build output. Not needed for the stated Vercel/Netlify deployment targets.
+- Rewrote `README.md` to remove contradictory statements left over from prior edits (it simultaneously claimed Netlify/Wrangler/Docker artifacts were both "removed" and "retained"), merged two duplicate `## Deployment` sections, and removed documentation for a `DEBUG_LOG` variable that was never actually implemented anywhere in the code.
+- Rewrote this changelog: the previous "Changes v1" and "Changes v2" sections were byte-for-byte identical, which was itself a leftover duplication bug.
+- No public API, route, or wire-format behavior changed. `/api/doh/dns-query` and the four provider routes (`google`, `cloudflare`, `adguard`, `dnssb`) behave exactly as before.
 
 ## v2.3.0 and earlier
 
