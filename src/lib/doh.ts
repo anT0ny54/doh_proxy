@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { DOH_PROVIDERS, getProvider } from "@/lib/providers";
+import { DOH_PROVIDERS } from "@/lib/providers";
 import { DNS_MESSAGE, isValidDnsQuery, isValidDnsResponse, MAX_DNS_MESSAGE_SIZE } from "@/lib/dns";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
@@ -17,7 +17,8 @@ const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const STREAM_CANCEL_TIMEOUT_MS = 25;
 
-// Circuit breaker configuration
+// Circuit breaker configuration. State is per runtime instance/isolate (best
+// effort), which is enough to avoid hammering an upstream that is clearly down.
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
 
@@ -25,18 +26,18 @@ interface DoHUpstream {
   readonly endpoint: string;
 }
 
-interface NormalizedDoHUpstream {
-  readonly endpoint: string;
+interface NormalizedDoHUpstream extends DoHUpstream {
   readonly url: URL;
 }
 
 interface DoHOptions {
-  readonly upstreams: readonly DoHUpstream[];
+  /** Resolved lazily so HEAD/OPTIONS/validation failures never pay for rotation. */
+  readonly upstreams: readonly DoHUpstream[] | (() => readonly DoHUpstream[]);
   readonly timeoutMs?: number;
   readonly failover?: boolean;
 }
 
-// Circuit breaker state (Node.js runtime only, not available in edge)
+// Circuit breaker state
 interface CircuitBreakerState {
   failures: number;
   lastFailureTime: number;
@@ -97,6 +98,8 @@ const NORMALIZED_HAGEZI_UPSTREAMS: readonly NormalizedDoHUpstream[] = HAGEZI_UPS
 }));
 
 function normalizeUpstream(upstream: DoHUpstream): NormalizedDoHUpstream {
+  // Fixed upstreams are pre-parsed at module load; only parse injected ones.
+  if ("url" in upstream && upstream.url instanceof URL) return upstream as NormalizedDoHUpstream;
   return { endpoint: upstream.endpoint, url: new URL(upstream.endpoint) };
 }
 
@@ -114,7 +117,6 @@ export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
 }
 
 function getProviderUpstream(providerId: string): NormalizedDoHUpstream | undefined {
-  if (!getProvider(providerId)) return undefined;
   return NORMALIZED_PROVIDER_UPSTREAMS.get(providerId);
 }
 
@@ -206,6 +208,16 @@ function validateGet(url: URL): { readonly dnsParam: string; readonly queryBody:
   return { dnsParam: dnsValues[0], queryBody: decoded };
 }
 
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 async function readPostBody(request: NextRequest, deadline: number): Promise<Uint8Array | NextResponse> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== DNS_MESSAGE) return textResponse("Unsupported Content-Type", 415);
@@ -267,14 +279,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
     }
   }
 
-  // Concatenate chunks into final buffer
-  const body = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-
+  const body = concatChunks(chunks, total);
   if (!isValidDnsQuery(body)) return textResponse("Invalid DNS message", 400);
   return body;
 }
@@ -314,14 +319,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
     }
   }
 
-  const body = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-
-  return body;
+  return concatChunks(chunks, total);
 }
 
 function cancelResponseBody(response: Response): void {
@@ -393,7 +391,7 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
   const earlyResponse = getEarlyMethodResponse(request);
   if (earlyResponse) return earlyResponse;
 
-  let queryBody: Uint8Array | undefined;
+  let queryBody: Uint8Array;
   let dnsParam: string | undefined;
   const timeout = Math.max(MIN_TIMEOUT_MS, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const deadline = Date.now() + timeout;
@@ -410,8 +408,16 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
   }
 
   const failover = options.failover !== false;
-  const normalizedUpstreams = options.upstreams.map(normalizeUpstream);
-  const upstreams = failover ? normalizedUpstreams : normalizedUpstreams.slice(0, 1);
+  const configured = typeof options.upstreams === "function" ? options.upstreams() : options.upstreams;
+  const normalizedUpstreams = configured.map(normalizeUpstream);
+  let upstreams = failover ? normalizedUpstreams : normalizedUpstreams.slice(0, 1);
+
+  // Skip upstreams whose breaker is open, but never fail fast when *all* of
+  // them are open: a probe request is what lets a recovered upstream close its
+  // breaker sooner, and a dead-looking upstream may still answer.
+  const healthy = upstreams.filter((upstream) => !isCircuitBreakerOpen(upstream.endpoint));
+  if (healthy.length > 0) upstreams = healthy;
+
   const perAttemptTimeout = failover
     ? Math.max(750, Math.floor(timeout / Math.max(upstreams.length, 1)))
     : timeout;
@@ -419,11 +425,6 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
   for (const upstream of upstreams) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
-
-    // Skip upstream if circuit breaker is open
-    if (isCircuitBreakerOpen(upstream.endpoint)) {
-      continue;
-    }
 
     try {
       const upstreamFetch = await fetchUpstream(
@@ -436,28 +437,28 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
       const result = upstreamFetch.response;
 
       try {
+        // Only genuine availability problems (timeouts, network errors, 5xx/429)
+        // count toward the breaker. Client-influenced outcomes — upstream 4xx,
+        // oversized or otherwise rejected responses — must not let one caller
+        // take an upstream offline for everybody.
         if (result.status !== 200) {
-          const retryable = RETRYABLE_UPSTREAM_STATUSES.has(result.status);
           cancelResponseBody(result);
-          if (retryable) {
+          if (RETRYABLE_UPSTREAM_STATUSES.has(result.status)) {
             recordFailure(upstream.endpoint);
             continue;
           }
-          recordFailure(upstream.endpoint);
           return textResponse("DNS upstream rejected request", result.status);
         }
 
         const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
         if (contentType !== DNS_MESSAGE) {
           cancelResponseBody(result);
-          recordFailure(upstream.endpoint);
           continue;
         }
 
         const responseBody = await readResponseBody(result);
-        if (responseBody === null || queryBody === undefined || !isValidDnsResponse(responseBody, queryBody)) {
+        if (responseBody === null || !isValidDnsResponse(responseBody, queryBody)) {
           cancelResponseBody(result);
-          recordFailure(upstream.endpoint);
           continue;
         }
 
@@ -491,7 +492,7 @@ export async function handleDoH(
 
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
   return proxyRequest(request, {
-    upstreams: getHageziUpstreams(),
+    upstreams: getHageziUpstreams,
     timeoutMs: HAGEZI_TIMEOUT_MS,
     failover: true,
   });

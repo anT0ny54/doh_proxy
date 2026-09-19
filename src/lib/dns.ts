@@ -26,12 +26,18 @@ function readCounts(message: Uint8Array): DnsCounts | null {
 /**
  * Advances over a DNS name. Compression pointers may reference only earlier
  * bytes in the same DNS message, matching DNS backward-pointer semantics.
+ *
+ * `targets` is a per-message bitmap of offsets a pointer may legally land on:
+ * label starts of names already parsed, plus RDATA bytes of earlier records.
+ * RDATA must be included because servers routinely compress a later owner
+ * name against a name embedded in earlier RDATA (e.g. the next link of a CNAME
+ * chain, or NS glue records).
  */
 function skipName(
   message: Uint8Array,
   start: number,
   allowCompression: boolean,
-  nameStarts?: Set<number>,
+  targets?: Uint8Array,
 ): number | null {
   let offset = start;
   let nextOffset = start;
@@ -41,7 +47,7 @@ function skipName(
   let totalBytesWalked = 0;
   const maxBytesWalked = message.byteLength * 4;
 
-  if (nameStarts) nameStarts.add(start);
+  if (targets) targets[start] = 1;
 
   while (offset < message.byteLength) {
     // Hard cap on total bytes walked to prevent O(n²) attacks via compression pointers
@@ -52,7 +58,7 @@ function skipName(
 
     if (length === 0) {
       if (nameLength + 1 > 255) return null;
-      if (nameStarts) nameStarts.add(offset);
+      if (targets) targets[offset] = 1;
       return jumped ? nextOffset : offset + 1;
     }
 
@@ -67,7 +73,7 @@ function skipName(
         pointer < 12 ||
         pointer >= message.byteLength ||
         pointer >= offset ||
-        (nameStarts && !nameStarts.has(pointer)) ||
+        (targets && targets[pointer] === 0) ||
         ++jumps > 16
       ) {
         return null;
@@ -81,7 +87,7 @@ function skipName(
     }
 
     if ((length & 0xc0) !== 0 || length > 63 || offset + 1 + length > message.byteLength) return null;
-    if (nameStarts) nameStarts.add(lengthOffset);
+    if (targets) targets[lengthOffset] = 1;
     nameLength += 1 + length;
     if (nameLength > 255) return null;
     offset += 1 + length;
@@ -95,16 +101,20 @@ interface QuestionRange {
   readonly typeOffset: number;
 }
 
-function parseResourceRecord(message: Uint8Array, start: number, nameStarts: Set<number>): number | null {
-  let offset = skipName(message, start, true, nameStarts);
+function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8Array): number | null {
+  let offset = skipName(message, start, true, targets);
   if (offset === null || offset + 10 > message.byteLength) return null;
 
   offset += 8;
   const rdLength = readUint16(message, offset);
   offset += 2;
 
-  if (offset + rdLength > message.byteLength) return null;
-  return offset + rdLength;
+  const end = offset + rdLength;
+  if (end > message.byteLength) return null;
+
+  // Names embedded in RDATA are valid compression targets for later records.
+  targets.fill(1, offset, end);
+  return end;
 }
 
 function validateStructure(message: Uint8Array, expectedResponse: boolean): QuestionRange | null {
@@ -118,28 +128,17 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
   if (isResponse !== expectedResponse || opcode !== 0) return null;
   if (counts.questions !== 1) return null;
 
-  const nameStarts = new Set<number>();
+  const targets = new Uint8Array(message.byteLength);
   const questionNameStart = 12;
-  const questionNameEnd = skipName(message, questionNameStart, false, nameStarts);
+  const questionNameEnd = skipName(message, questionNameStart, false, targets);
   if (questionNameEnd === null || questionNameEnd + 4 > message.byteLength) return null;
   const question = { end: questionNameEnd + 4, typeOffset: questionNameEnd };
 
   let offset = question.end;
 
-  for (let i = 0; i < counts.answers; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset, nameStarts);
-    if (nextOffset === null) return null;
-    offset = nextOffset;
-  }
-
-  for (let i = 0; i < counts.authorities; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset, nameStarts);
-    if (nextOffset === null) return null;
-    offset = nextOffset;
-  }
-
-  for (let i = 0; i < counts.additionals; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset, nameStarts);
+  const recordCount = counts.answers + counts.authorities + counts.additionals;
+  for (let i = 0; i < recordCount; i += 1) {
+    const nextOffset = parseResourceRecord(message, offset, targets);
     if (nextOffset === null) return null;
     offset = nextOffset;
   }
@@ -165,19 +164,12 @@ function questionKey(message: Uint8Array, range: QuestionRange): Uint8Array {
   return key;
 }
 
-/**
- * Constant-time comparison of two Uint8Arrays to prevent timing attacks.
- * This implementation avoids early exit and ensures equal comparison time
- * regardless of where the first difference occurs.
- */
-function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
-
-  let diff = 0;
   for (let i = 0; i < a.byteLength; i += 1) {
-    diff |= a[i] ^ b[i];
+    if (a[i] !== b[i]) return false;
   }
-  return diff === 0;
+  return true;
 }
 
 export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array): boolean {
@@ -192,5 +184,5 @@ export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array): boo
   const responseKey = questionKey(message, responseQuestion);
   const queryKey = questionKey(query, queryQuestion);
 
-  return timingSafeEqual(responseKey, queryKey);
+  return bytesEqual(responseKey, queryKey);
 }
