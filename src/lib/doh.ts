@@ -37,11 +37,6 @@ export function getHageziUpstreams(): readonly DoHUpstream[] {
   );
 }
 
-function getProviderUpstream(providerId: string): DoHUpstream | undefined {
-  const provider = getProvider(providerId);
-  return provider ? { endpoint: provider.endpoint } : undefined;
-}
-
 function baseHeaders(): Headers {
   return new Headers({
     "Access-Control-Allow-Origin": "*",
@@ -343,10 +338,13 @@ export async function handleDoH(
   request: NextRequest,
   providerId: string,
 ): Promise<NextResponse> {
-  const upstream = getProviderUpstream(providerId);
-  if (!upstream) return textResponse("Not Found", 404);
+  const provider = getProvider(providerId);
+  if (!provider) return textResponse("Not Found", 404);
 
-  return proxyRequest(request, { upstreams: [upstream], failover: false });
+  return proxyRequest(request, {
+    upstreams: [{ endpoint: provider.endpoint }],
+    failover: false,
+  });
 }
 
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
