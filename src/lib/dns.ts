@@ -27,18 +27,27 @@ function readCounts(message: Uint8Array): DnsCounts | null {
  * Advances over a DNS name. Compression pointers may reference only earlier
  * bytes in the same DNS message, matching DNS backward-pointer semantics.
  */
-function skipName(message: Uint8Array, start: number, allowCompression: boolean): number | null {
+function skipName(
+  message: Uint8Array,
+  start: number,
+  allowCompression: boolean,
+  nameStarts?: Set<number>,
+): number | null {
   let offset = start;
   let nextOffset = start;
   let jumped = false;
   let jumps = 0;
   let nameLength = 0;
 
+  if (nameStarts) nameStarts.add(start);
+
   while (offset < message.byteLength) {
+    const lengthOffset = offset;
     const length = message[offset];
 
     if (length === 0) {
       if (nameLength + 1 > 255) return null;
+      if (nameStarts) nameStarts.add(offset);
       return jumped ? nextOffset : offset + 1;
     }
 
@@ -46,11 +55,16 @@ function skipName(message: Uint8Array, start: number, allowCompression: boolean)
       if (!allowCompression || offset + 1 >= message.byteLength) return null;
 
       const pointer = ((length & 0x3f) << 8) | message[offset + 1];
-      // Pointers must reference an earlier byte in this DNS message. Because
-      // offsets strictly decrease after every pointer jump, a separate visited
-      // set is unnecessary for cycle detection; the jump cap still protects
-      // against pathological compression chains.
-      if (pointer < 12 || pointer >= message.byteLength || pointer >= offset || ++jumps > 16) {
+      // A pointer must target an earlier byte that has already been parsed as
+      // part of a DNS domain name. This prevents pointers into unrelated
+      // header/type/class/RDATA bytes that merely happen to look name-like.
+      if (
+        pointer < 12 ||
+        pointer >= message.byteLength ||
+        pointer >= offset ||
+        (nameStarts && !nameStarts.has(pointer)) ||
+        ++jumps > 16
+      ) {
         return null;
       }
       if (!jumped) {
@@ -62,6 +76,7 @@ function skipName(message: Uint8Array, start: number, allowCompression: boolean)
     }
 
     if ((length & 0xc0) !== 0 || length > 63 || offset + 1 + length > message.byteLength) return null;
+    if (nameStarts) nameStarts.add(lengthOffset);
     nameLength += 1 + length;
     if (nameLength > 255) return null;
     offset += 1 + length;
@@ -75,17 +90,8 @@ interface QuestionRange {
   readonly typeOffset: number;
 }
 
-function parseQuestion(message: Uint8Array, start: number): QuestionRange | null {
-  // This proxy intentionally accepts exactly one Question. Because the Question
-  // section starts at offset 12, there is no earlier domain-name occurrence for
-  // its QNAME to reference. Resource-record owner names can use compression.
-  const endOfName = skipName(message, start, false);
-  if (endOfName === null || endOfName + 4 > message.byteLength) return null;
-  return { end: endOfName + 4, typeOffset: endOfName };
-}
-
-function parseResourceRecord(message: Uint8Array, start: number): number | null {
-  let offset = skipName(message, start, true);
+function parseResourceRecord(message: Uint8Array, start: number, nameStarts: Set<number>): number | null {
+  let offset = skipName(message, start, true, nameStarts);
   if (offset === null || offset + 10 > message.byteLength) return null;
 
   offset += 8;
@@ -107,25 +113,28 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
   if (isResponse !== expectedResponse || opcode !== 0) return null;
   if (counts.questions !== 1) return null;
 
-  const question = parseQuestion(message, 12);
-  if (question === null) return null;
+  const nameStarts = new Set<number>();
+  const questionNameStart = 12;
+  const questionNameEnd = skipName(message, questionNameStart, false, nameStarts);
+  if (questionNameEnd === null || questionNameEnd + 4 > message.byteLength) return null;
+  const question = { end: questionNameEnd + 4, typeOffset: questionNameEnd };
 
   let offset = question.end;
 
   for (let i = 0; i < counts.answers; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset);
+    const nextOffset = parseResourceRecord(message, offset, nameStarts);
     if (nextOffset === null) return null;
     offset = nextOffset;
   }
 
   for (let i = 0; i < counts.authorities; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset);
+    const nextOffset = parseResourceRecord(message, offset, nameStarts);
     if (nextOffset === null) return null;
     offset = nextOffset;
   }
 
   for (let i = 0; i < counts.additionals; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset);
+    const nextOffset = parseResourceRecord(message, offset, nameStarts);
     if (nextOffset === null) return null;
     offset = nextOffset;
   }

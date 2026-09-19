@@ -1,22 +1,31 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getProvider } from "@/lib/providers";
+import { NextResponse, type NextRequest } from "next/server";
+import { DOH_PROVIDERS, getProvider } from "@/lib/providers";
 import { DNS_MESSAGE, isValidDnsQuery, isValidDnsResponse, MAX_DNS_MESSAGE_SIZE } from "@/lib/dns";
-import { HAGEZI_UPSTREAMS, type DoHUpstream as ConfiguredUpstream } from "@/lib/upstreams";
+import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-export const PROXY_VERSION = "2.7.1";
+export const PROXY_VERSION = "2.7.3";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
 const DEFAULT_TIMEOUT_MS = 2_500;
 const MIN_TIMEOUT_MS = 250;
-const HAGEZI_TIMEOUT_MS = 3_000;
+export const HAGEZI_TIMEOUT_MS = 2_500;
 const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
 const MIN_HAGEZI_ROTATION_SECONDS = 60;
 const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const STREAM_CANCEL_TIMEOUT_MS = 25;
 
-type DoHUpstream = Pick<ConfiguredUpstream, "endpoint">;
+interface DoHUpstream {
+  readonly endpoint: string;
+  readonly url?: URL;
+}
+
+interface NormalizedDoHUpstream {
+  readonly endpoint: string;
+  readonly url: URL;
+}
 
 interface DoHOptions {
   readonly upstreams: readonly DoHUpstream[];
@@ -24,7 +33,25 @@ interface DoHOptions {
   readonly failover?: boolean;
 }
 
-export function getHageziUpstreams(): readonly DoHUpstream[] {
+const NORMALIZED_PROVIDER_UPSTREAMS = new Map(
+  DOH_PROVIDERS.map((provider) => [
+    provider.id,
+    { endpoint: provider.endpoint, url: new URL(provider.endpoint) } satisfies NormalizedDoHUpstream,
+  ]),
+);
+
+const NORMALIZED_HAGEZI_UPSTREAMS: readonly NormalizedDoHUpstream[] = HAGEZI_UPSTREAMS.map((upstream) => ({
+  ...upstream,
+  url: new URL(upstream.endpoint),
+}));
+
+function normalizeUpstream(upstream: DoHUpstream): NormalizedDoHUpstream {
+  return upstream.url
+    ? { endpoint: upstream.endpoint, url: upstream.url }
+    : { endpoint: upstream.endpoint, url: new URL(upstream.endpoint) };
+}
+
+export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
   const configured = Number(process.env.HAGEZI_ROTATION_SECONDS ?? DEFAULT_HAGEZI_ROTATION_SECONDS);
   const seconds = Number.isFinite(configured)
     ? Math.min(Math.max(Math.floor(configured), MIN_HAGEZI_ROTATION_SECONDS), MAX_HAGEZI_ROTATION_SECONDS)
@@ -33,13 +60,13 @@ export function getHageziUpstreams(): readonly DoHUpstream[] {
 
   return Array.from(
     { length: HAGEZI_UPSTREAMS.length },
-    (_, offset) => HAGEZI_UPSTREAMS[(slot + offset) % HAGEZI_UPSTREAMS.length],
+    (_, offset) => NORMALIZED_HAGEZI_UPSTREAMS[(slot + offset) % NORMALIZED_HAGEZI_UPSTREAMS.length],
   );
 }
 
-function getProviderUpstream(providerId: string): DoHUpstream | undefined {
-  const provider = getProvider(providerId);
-  return provider ? { endpoint: provider.endpoint } : undefined;
+function getProviderUpstream(providerId: string): NormalizedDoHUpstream | undefined {
+  if (!getProvider(providerId)) return undefined;
+  return NORMALIZED_PROVIDER_UPSTREAMS.get(providerId);
 }
 
 function baseHeaders(): Headers {
@@ -64,6 +91,41 @@ function textResponse(message: string, status: number): NextResponse {
 
 function emptyResponse(status = 204): NextResponse {
   return new NextResponse(null, { status, headers: baseHeaders() });
+}
+
+function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
+  if (request.method === "OPTIONS") return emptyResponse();
+
+  if (request.method === "HEAD") {
+    const result = emptyResponse();
+    result.headers.set("Content-Length", "0");
+    return result;
+  }
+
+  if (request.method !== "GET" && request.method !== "POST") {
+    const result = textResponse("Method Not Allowed", 405);
+    result.headers.set("Allow", "GET, POST, HEAD, OPTIONS");
+    return result;
+  }
+
+  return null;
+}
+
+async function cancelReaderBestEffort<T>(reader: ReadableStreamDefaultReader<T>): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.cancel().then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), STREAM_CANCEL_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function decodeBase64Url(value: string): Uint8Array | null {
@@ -116,7 +178,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
     for (;;) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        await reader.cancel().catch(() => undefined);
+        await cancelReaderBestEffort(reader);
         return textResponse("Request body timeout", 408);
       }
 
@@ -134,14 +196,14 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
 
         const nextTotal = total + result.value.byteLength;
         if (nextTotal > MAX_DNS_MESSAGE_SIZE) {
-          await reader.cancel().catch(() => undefined);
+          await cancelReaderBestEffort(reader);
           return textResponse("Payload too large", 413);
         }
 
         buffer.set(result.value, total);
         total = nextTotal;
       } catch (error) {
-        await reader.cancel().catch(() => undefined);
+        await cancelReaderBestEffort(reader);
         if (error === timeoutToken) return textResponse("Request body timeout", 408);
         throw error;
       } finally {
@@ -149,7 +211,11 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
       }
     }
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // A best-effort cancellation may still be settling a pending read.
+    }
   }
 
   const body = buffer.subarray(0, total);
@@ -177,7 +243,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
 
       const nextTotal = total + value.byteLength;
       if (nextTotal > MAX_DNS_MESSAGE_SIZE) {
-        await reader.cancel().catch(() => undefined);
+        await cancelReaderBestEffort(reader);
         return null;
       }
 
@@ -185,14 +251,21 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
       total = nextTotal;
     }
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // A best-effort cancellation may still be settling a pending read.
+    }
   }
 
   return buffer.subarray(0, total);
 }
 
 function cancelResponseBody(response: Response): void {
-  response.body?.cancel().catch(() => undefined);
+  void Promise.race([
+    response.body?.cancel() ?? Promise.resolve(),
+    new Promise<void>((resolve) => setTimeout(resolve, STREAM_CANCEL_TIMEOUT_MS)),
+  ]).catch(() => undefined);
 }
 
 /**
@@ -215,11 +288,13 @@ interface UpstreamFetch {
 async function fetchUpstream(
   request: NextRequest,
   dnsParam: string | undefined,
-  upstream: DoHUpstream,
+  upstream: NormalizedDoHUpstream,
   body: Uint8Array | undefined,
   timeoutMs: number,
 ): Promise<UpstreamFetch> {
-  const url = new URL(upstream.endpoint);
+  const url = request.method === "GET" && dnsParam !== undefined
+    ? new URL(upstream.url)
+    : upstream.url;
   if (request.method === "GET" && dnsParam !== undefined) url.searchParams.set("dns", dnsParam);
 
   const headers = new Headers({
@@ -251,29 +326,17 @@ async function fetchUpstream(
   }
 }
 
-async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
-  if (request.method === "OPTIONS") return emptyResponse();
+export async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
+  const earlyResponse = getEarlyMethodResponse(request);
+  if (earlyResponse) return earlyResponse;
 
-  if (request.method === "HEAD") {
-    const result = emptyResponse();
-    result.headers.set("Content-Length", "0");
-    return result;
-  }
-
-  if (request.method !== "GET" && request.method !== "POST") {
-    const result = textResponse("Method Not Allowed", 405);
-    result.headers.set("Allow", "GET, POST, HEAD, OPTIONS");
-    return result;
-  }
-
-  const url = new URL(request.url);
   let queryBody: Uint8Array | undefined;
   let dnsParam: string | undefined;
   const timeout = Math.max(MIN_TIMEOUT_MS, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const deadline = Date.now() + timeout;
 
   if (request.method === "GET") {
-    const validation = validateGet(url);
+    const validation = validateGet(new URL(request.url));
     if (validation instanceof NextResponse) return validation;
     dnsParam = validation.dnsParam;
     queryBody = validation.queryBody;
@@ -284,7 +347,8 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
   }
 
   const failover = options.failover !== false;
-  const upstreams = failover ? options.upstreams : options.upstreams.slice(0, 1);
+  const normalizedUpstreams = options.upstreams.map(normalizeUpstream);
+  const upstreams = failover ? normalizedUpstreams : normalizedUpstreams.slice(0, 1);
   const perAttemptTimeout = failover
     ? Math.max(750, Math.floor(timeout / Math.max(upstreams.length, 1)))
     : timeout;
@@ -341,10 +405,7 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
 export async function handleDoH(
   request: NextRequest,
   providerId: string,
-  formatSegment?: string,
 ): Promise<NextResponse> {
-  if (formatSegment !== "dns-query") return textResponse("Not Found", 404);
-
   const upstream = getProviderUpstream(providerId);
   if (!upstream) return textResponse("Not Found", 404);
 
@@ -352,6 +413,9 @@ export async function handleDoH(
 }
 
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
+  const earlyResponse = getEarlyMethodResponse(request);
+  if (earlyResponse) return earlyResponse;
+
   return proxyRequest(request, {
     upstreams: getHageziUpstreams(),
     timeoutMs: HAGEZI_TIMEOUT_MS,

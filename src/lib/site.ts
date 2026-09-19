@@ -24,3 +24,5 @@ export function getSiteUrl(): string {
 }
 
 export const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
+
+export const COPYRIGHT_YEAR = 2026;
