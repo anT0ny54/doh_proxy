@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## v2.7.3 — Static footer and upstream URL normalization
+
+### Runtime / maintenance
+
+- Pre-normalized all fixed provider and HaGeZi upstream URLs at module load, avoiding repeated URL parsing for fixed destinations.
+- Kept compatibility for custom test/injected upstream descriptors by normalizing them once per proxy request.
+- Replaced the render-time footer year with an explicit static copyright year for the statically generated homepage.
+
+## v2.7.2 — Deadline separation and DoH runtime hardening
+
+### Runtime
+
+- Reduced the HaGeZi application deadline from 3,000 ms to 2,500 ms while retaining the 3-second route execution ceiling, leaving platform overhead headroom.
+- Added focused DoH runtime tests for failover, upstream timeout, GET validation, and upstream rejection.
+- Tightened DNS compression-pointer validation so pointers must target previously parsed domain-name positions.
+- Simplified provider routes from `/api/doh/[provider]/[format]` to `/api/doh/[provider]/dns-query`.
+- Short-circuited `HEAD`/`OPTIONS` before upstream rotation and moved GET-only URL parsing into the GET branch.
+- Made request/response stream cancellation best-effort and bounded.
+
 ## v2.7.1 — Runtime hardening and documentation alignment
 
 ### Runtime
