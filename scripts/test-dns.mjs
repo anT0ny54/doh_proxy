@@ -216,3 +216,15 @@ await test("DNS question name matching is case-insensitive", () => {
   assert.equal(dns.isValidDnsResponse(response, validQuery), true);
 });
     
+
+test("accepts a CNAME chain whose next owner name points into earlier RDATA", () => {
+  const name = (...labels) => [...labels.flatMap((l) => [l.length, ...Buffer.from(l)]), 0];
+  const question = [...name("www", "example", "com"), 0, 1, 0, 1];
+  const query = Uint8Array.from([0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...question]);
+  const rdata = name("edge", "example", "net");
+  const rdataOffset = 12 + question.length + 12;
+  const cname = [0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, rdata.length, ...rdata];
+  const a = [0xc0 | (rdataOffset >> 8), rdataOffset & 0xff, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4];
+  const response = Uint8Array.from([0, 1, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0, ...question, ...cname, ...a]);
+  assert.equal(dns.isValidDnsResponse(response, query), true);
+});

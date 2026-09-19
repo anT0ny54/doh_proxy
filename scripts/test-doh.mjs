@@ -255,16 +255,65 @@ try {
     assert.equal(calls, 1);
   });
 
-  await test("Application timeout is below the 3-second route execution ceiling", async () => {
-    assert.equal(doh.HAGEZI_TIMEOUT_MS, 2500);
+  await test("Client-influenced failures never open the circuit breaker", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(null, { status: 400 });
+    };
+
+    const options = { upstreams: [{ endpoint: "https://reject-400.test/dns-query" }], timeoutMs: 100, failover: false };
+    for (let i = 0; i < 5; i += 1) {
+      const response = await doh.proxyRequest(getRequest(), options);
+      assert.equal(response.status, 400);
+    }
+    assert.equal(calls, 5, "every request must still reach the upstream");
+  });
+
+  await test("Open circuit breaker is bypassed when every upstream is open", async () => {
+    let calls = 0;
+    let healthy = false;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (!healthy) return new Response(null, { status: 503 });
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+
+    const options = { upstreams: [{ endpoint: "https://flaky.test/dns-query" }], timeoutMs: 100, failover: false };
+    for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 502);
+
+    healthy = true;
+    const probe = await doh.proxyRequest(getRequest(), options);
+    assert.equal(probe.status, 200, "sole upstream must still be probed while its breaker is open");
+    assert.equal(calls, 4);
+  });
+
+  await test("Lazy upstream resolver is not invoked for HEAD/OPTIONS or invalid queries", async () => {
+    let resolved = 0;
+    const options = { upstreams: () => { resolved += 1; return [{ endpoint: "https://lazy.test/dns-query" }]; } };
+    await doh.proxyRequest(getLikeRequest("HEAD"), options);
+    await doh.proxyRequest(getLikeRequest("OPTIONS"), options);
+    const bad = await doh.proxyRequest(new Request("https://proxy.test/api/doh/dns-query?dns=!!!"), options);
+    assert.equal(bad.status, 400);
+    assert.equal(resolved, 0);
+  });
+
+  await test("Application timeout stays below the route execution ceiling", async () => {
     const hageziUpstreams = doh.getHageziUpstreams();
     assert.equal(hageziUpstreams.length, 3);
     assert.ok(hageziUpstreams.every((upstream) => upstream.url instanceof URL));
 
     const primaryRoute = await readFile(new URL("../src/app/api/doh/dns-query/route.ts", import.meta.url), "utf8");
     const providerRoute = await readFile(new URL("../src/app/api/doh/[provider]/dns-query/route.ts", import.meta.url), "utf8");
-    assert.match(primaryRoute, /export const maxDuration = 3;/);
-    assert.match(providerRoute, /export const maxDuration = 3;/);
+    const dohSourceText = await readFile(new URL("../src/lib/doh.ts", import.meta.url), "utf8");
+    const timeoutMs = Number(/const HAGEZI_TIMEOUT_MS = ([\d_]+);/.exec(dohSourceText)?.[1].replaceAll("_", ""));
+    for (const route of [primaryRoute, providerRoute]) {
+      const maxDuration = Number(/export const maxDuration = (\d+);/.exec(route)?.[1]);
+      assert.ok(Number.isFinite(maxDuration) && timeoutMs < maxDuration * 1_000, "app deadline must fit inside maxDuration");
+    }
+
+    const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+    assert.equal(doh.PROXY_VERSION, pkg.version, "PROXY_VERSION must match package.json");
 
     const oldRoute = new URL("../src/app/api/doh/[provider]/[format]/route.ts", import.meta.url);
     await assert.rejects(readFile(oldRoute));
