@@ -11,7 +11,6 @@ export default async (_request: Request, context: { next: () => Promise<Response
 export const config = {
   path: "/api/doh/*",
   rateLimit: {
-    action: "rate_limit",
     windowLimit: 100,
     windowSize: 60,
     aggregateBy: ["ip", "domain"],
