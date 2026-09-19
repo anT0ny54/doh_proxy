@@ -25,4 +25,4 @@ export const HAGEZI_UPSTREAMS: readonly DoHUpstream[] = [
     location: "Helsinki, Finland",
     description: "Balanced protection with Multi Pro + Threat Intelligence Feed.",
   },
-] as const;
+];

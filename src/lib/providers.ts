@@ -31,10 +31,4 @@ export const DOH_PROVIDERS: readonly DoHProvider[] = [
     description: "DNS.SB Public DNS",
     endpoint: "https://dns.sb/dns-query",
   },
-] as const;
-
-const PROVIDER_MAP = new Map(DOH_PROVIDERS.map((provider) => [provider.id, provider]));
-
-export function getProvider(id: string): DoHProvider | undefined {
-  return PROVIDER_MAP.get(id);
-}
+];

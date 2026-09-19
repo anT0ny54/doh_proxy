@@ -22,17 +22,17 @@ const STREAM_CANCEL_TIMEOUT_MS = 25;
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
 
-interface DoHUpstream {
+interface UpstreamInput {
   readonly endpoint: string;
 }
 
-interface NormalizedDoHUpstream extends DoHUpstream {
+interface NormalizedDoHUpstream extends UpstreamInput {
   readonly url: URL;
 }
 
 interface DoHOptions {
   /** Resolved lazily so HEAD/OPTIONS/validation failures never pay for rotation. */
-  readonly upstreams: readonly DoHUpstream[] | (() => readonly DoHUpstream[]);
+  readonly upstreams: readonly UpstreamInput[] | (() => readonly UpstreamInput[]);
   readonly timeoutMs?: number;
   readonly failover?: boolean;
 }
@@ -59,10 +59,11 @@ function isCircuitBreakerOpen(endpoint: string): boolean {
   const cb = getCircuitBreaker(endpoint);
   if (!cb.open) return false;
 
-  // Check if cooldown has elapsed
+  // Cooldown elapsed: go half-open. One more failure re-opens the breaker
+  // immediately instead of burning THRESHOLD slow attempts again.
   if (Date.now() - cb.lastFailureTime >= CIRCUIT_BREAKER_COOLDOWN_MS) {
     cb.open = false;
-    cb.failures = 0;
+    cb.failures = CIRCUIT_BREAKER_THRESHOLD - 1;
     return false;
   }
   return true;
@@ -97,14 +98,15 @@ const NORMALIZED_HAGEZI_UPSTREAMS: readonly NormalizedDoHUpstream[] = HAGEZI_UPS
   url: new URL(upstream.endpoint),
 }));
 
-function normalizeUpstream(upstream: DoHUpstream): NormalizedDoHUpstream {
+function normalizeUpstream(upstream: UpstreamInput): NormalizedDoHUpstream {
   // Fixed upstreams are pre-parsed at module load; only parse injected ones.
   if ("url" in upstream && upstream.url instanceof URL) return upstream as NormalizedDoHUpstream;
   return { endpoint: upstream.endpoint, url: new URL(upstream.endpoint) };
 }
 
 export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
-  const configured = Number(process.env.HAGEZI_ROTATION_SECONDS ?? DEFAULT_HAGEZI_ROTATION_SECONDS);
+  const raw = process.env.HAGEZI_ROTATION_SECONDS?.trim();
+  const configured = raw ? Number(raw) : DEFAULT_HAGEZI_ROTATION_SECONDS;
   const seconds = Number.isFinite(configured)
     ? Math.min(Math.max(Math.floor(configured), MIN_HAGEZI_ROTATION_SECONDS), MAX_HAGEZI_ROTATION_SECONDS)
     : DEFAULT_HAGEZI_ROTATION_SECONDS;
@@ -147,11 +149,8 @@ function emptyResponse(status = 204): NextResponse {
 function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
   if (request.method === "OPTIONS") return emptyResponse();
 
-  if (request.method === "HEAD") {
-    const result = emptyResponse();
-    result.headers.set("Content-Length", "0");
-    return result;
-  }
+  // RFC 9110: a 204 response must not include Content-Length.
+  if (request.method === "HEAD") return emptyResponse();
 
   if (request.method !== "GET" && request.method !== "POST") {
     const result = textResponse("Method Not Allowed", 405);
@@ -323,10 +322,19 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
 }
 
 function cancelResponseBody(response: Response): void {
+  const body = response.body;
+  if (!body) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   void Promise.race([
-    response.body?.cancel() ?? Promise.resolve(),
-    new Promise<void>((resolve) => setTimeout(resolve, STREAM_CANCEL_TIMEOUT_MS)),
-  ]).catch(() => undefined);
+    body.cancel(),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, STREAM_CANCEL_TIMEOUT_MS);
+    }),
+  ])
+    .catch(() => undefined)
+    .finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
 }
 
 /**
@@ -447,7 +455,11 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
             recordFailure(upstream.endpoint);
             continue;
           }
-          return textResponse("DNS upstream rejected request", result.status);
+          // Only relay real error statuses. 1xx/2xx/3xx (204, 304, unfollowed
+          // redirects, ...) are invalid for a text body and would make the
+          // Response constructor throw and be miscounted as an upstream failure.
+          const relayed = result.status >= 400 && result.status <= 599 ? result.status : 502;
+          return textResponse("DNS upstream rejected request", relayed);
         }
 
         const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
