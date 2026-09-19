@@ -9,7 +9,7 @@ const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
 const DEFAULT_TIMEOUT_MS = 2_500;
 const MIN_TIMEOUT_MS = 250;
-const HAGEZI_TIMEOUT_MS = 3_500;
+const HAGEZI_TIMEOUT_MS = 3_000;
 const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
 const MIN_HAGEZI_ROTATION_SECONDS = 60;
 const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
@@ -35,6 +35,11 @@ export function getHageziUpstreams(): readonly DoHUpstream[] {
     { length: HAGEZI_UPSTREAMS.length },
     (_, offset) => HAGEZI_UPSTREAMS[(slot + offset) % HAGEZI_UPSTREAMS.length],
   );
+}
+
+function getProviderUpstream(providerId: string): DoHUpstream | undefined {
+  const provider = getProvider(providerId);
+  return provider ? { endpoint: provider.endpoint } : undefined;
 }
 
 function baseHeaders(): Headers {
@@ -232,7 +237,6 @@ async function fetchUpstream(
       headers,
       body: body === undefined ? undefined : toArrayBuffer(body),
       signal: controller.signal,
-      redirect: "error",
       cache: "no-store",
     });
 
@@ -334,14 +338,17 @@ async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<
   return textResponse("DNS upstream unavailable", 502);
 }
 
-export async function handleDoH(request: NextRequest, providerId: string): Promise<NextResponse> {
-  const provider = getProvider(providerId);
-  if (!provider) return textResponse("Not Found", 404);
+export async function handleDoH(
+  request: NextRequest,
+  providerId: string,
+  formatSegment?: string,
+): Promise<NextResponse> {
+  if (formatSegment !== "dns-query") return textResponse("Not Found", 404);
 
-  return proxyRequest(request, {
-    upstreams: [{ endpoint: provider.endpoint }],
-    failover: false,
-  });
+  const upstream = getProviderUpstream(providerId);
+  if (!upstream) return textResponse("Not Found", 404);
+
+  return proxyRequest(request, { upstreams: [upstream], failover: false });
 }
 
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
