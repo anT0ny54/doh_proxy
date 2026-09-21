@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { handleDoH } from "@/lib/doh";
 
-export const runtime = "edge";
+export const runtime = "nodejs";
 export const maxDuration = 5;
 
 interface RouteContext {
