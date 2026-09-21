@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover, and deployment-platform rate limiting.
+A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js and the Node.js runtime. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover, and request-path rate limiting in Next.js Proxy.
 
 ## What this project provides
 
@@ -32,6 +32,14 @@ Provider routes do **not** accept arbitrary upstream URLs and do not use the HaG
 ```text
 Client
   |
+  +--> Node.js `proxy.ts`
+  |      |
+  |      +--> match `/api/doh/*`
+  |      +--> enforce 100 requests / 60 seconds per IP + host
+  |      +--> return 429 when the process-local limit is exceeded
+  |      |
+  |      +--> continue to the Next.js Route Handler
+  |
   +--> GET/POST /api/doh/dns-query
   |      |
   |      +--> validate DNS wire message
@@ -48,7 +56,7 @@ Client
          +--> return application/dns-message
 ```
 
-The implementation is intentionally small: there is no local DNS cache, no arbitrary proxy target, and no per-instance in-memory rate limiter.
+The implementation is intentionally small: there is no local DNS cache and no arbitrary proxy target. All public DoH requests pass through the Node.js `proxy.ts` rate limiter before the route handler.
 
 ## API behavior
 
@@ -90,34 +98,30 @@ The starting position rotates periodically, but each request still has a determi
 
 ## Rate limiting
 
-The application does not keep a local IP rate-limit map. Rate limiting is expected to be enforced by the deployment platform or an external gateway so the control is shared across instances.
+The application enforces an **in-process Node.js rate limit** in the root `proxy.ts` file before requests reach the DoH route handlers.
 
-### Netlify
-
-`netlify/edge-functions/doh-rate-limit.ts` defines a Netlify edge rate-limit rule for:
+The rule applies to:
 
 ```text
 /api/doh/*
 ```
 
-The configured rule is **100 requests per 60 seconds**, aggregated by **IP + domain**. Note that a busy household/office behind one NAT address, or a router that does not cache, can exceed 100 DNS queries per minute and receive `429` responses; raise `windowLimit` in that file if that matches your traffic. The edge function itself calls `context.next()`; the rate-limit configuration is the platform-enforced control.
+The configured limit is **100 requests per 60 seconds**, aggregated by **client IP + host**. Requests over the limit receive `429 Too Many Requests` with a `Retry-After` header holding the seconds left in the current window, plus `Access-Control-Allow-Origin: *` so browser clients can read it.
 
-This rate-limit layer is an Edge Function. The Next.js DoH Route Handler is still a Next.js/Netlify-managed application route; the presence of the edge limiter should not be interpreted as meaning that the route handler is a separately deployed custom Edge Function.
+The limiter lives in `src/lib/rate-limit.ts`. Expired buckets are dropped in amortised O(1) per request and the table is hard-capped at 10,000 entries (oldest evicted first), so memory stays bounded even if a client rotates spoofed `X-Forwarded-For` values. Identifier lengths are truncated before they become bucket keys.
 
-### Vercel
+**No client IP, no limit.** The client address comes only from `X-Real-IP` / `X-Forwarded-For`. When neither header is present (for example the Docker image exposed directly on port 8367 with no reverse proxy) the request is not rate limited by the application, because a single shared bucket would cap the whole service at 100 requests/minute. Put a reverse proxy or WAF in front for per-client limiting in that setup.
 
-The repository does not contain an application-level Vercel limiter. Configure an appropriate Vercel Firewall/WAF rate-limit rule for `/api/doh/*`.
+The limiter is intentionally local to each Node.js process. On a multi-instance deployment, each instance has its own counter, so put the service behind a shared reverse proxy, API gateway, load balancer, or WAF when a global cross-instance limit is required.
 
-### Docker / self-hosted
-
-Put the container behind a reverse proxy, firewall, API gateway, or load balancer that provides shared rate limiting and traffic controls.
+When deployed behind a reverse proxy, configure that proxy to sanitize `X-Forwarded-For` / `X-Real-IP`; otherwise client-supplied forwarding headers can affect the IP key used by the application limiter.
 
 ## Configuration
 
 | Variable | Description | Default |
 |---|---|---|
 | `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds. | `1800` |
-| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | platform-derived or `http://localhost:3000` |
+| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | platform-derived or `http://localhost:3000`; Docker image: `http://localhost:8367` |
 
 The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/lib/providers.ts` and `src/lib/upstreams.ts`; they are not configurable through request parameters.
 
@@ -134,20 +138,15 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 
 ## Deployment
 
-### Vercel
+### Managed Next.js hosting
 
-1. Import the repository into Vercel and deploy with the normal Next.js build settings.
-2. Add a Vercel Firewall/WAF rate-limit rule covering `/api/doh/*`.
-3. Set `NEXT_PUBLIC_SITE_URL` when you want an explicit canonical public origin in generated metadata.
-4. Verify `HEAD /api/doh/dns-query` returns `204`.
+The DoH route handlers and `proxy.ts` run on the **Node.js runtime**. Deploy the repository using the platform's normal Next.js integration and configure any platform-level WAF/rate limiting as an additional outer layer when needed.
 
-### Netlify
+Verify:
 
-1. Import the repository into Netlify.
-2. Netlify uses `netlify.toml` for the build command and deploys the Next.js application through its Next.js integration.
-3. `netlify/edge-functions/doh-rate-limit.ts` supplies the platform rate-limit configuration for `/api/doh/*`.
-4. Set `NEXT_PUBLIC_SITE_URL` when you want an explicit canonical public origin in generated metadata.
-5. Verify `HEAD /api/doh/dns-query` returns `204`.
+```text
+HEAD /api/doh/dns-query -> 204
+```
 
 ### Docker (self-hosted)
 
@@ -162,7 +161,7 @@ The Docker image uses Next.js standalone output and starts the generated server 
 node server.js
 ```
 
-`next.config.ts` enables `output: "standalone"` for self-hosted builds while leaving managed Vercel/Netlify builds on their platform-specific output handling.
+`next.config.ts` uses standalone output for self-hosted Node.js builds while allowing managed Vercel/Netlify builds to use their native Next.js output handling.
 
 ## Development
 
@@ -179,7 +178,7 @@ npm run lint
 npm run build
 ```
 
-`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`) and the DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation).
+`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), the DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation) and the rate-limiter tests (`scripts/test-rate-limit.mjs`).
 
 The project currently stays on the TypeScript 6.x line because the configured `typescript-eslint` / Next.js ESLint integration still has a peer-range constraint below TypeScript 7. Revisit that pin when the linting toolchain supports TypeScript 7 cleanly.
 
@@ -208,7 +207,7 @@ Runtime behavior should additionally be checked after deployment with:
 ✓ Invalid or missing GET dns           → 400
 ✓ Oversized request                    → 413 / bounded rejection
 ✓ Unsupported POST content type        → 415
-✓ Deployment-edge rate limiting        → platform/WAF enforced
+✓ Node.js Proxy rate limiting          → 100 req / 60 s per IP + host (needs X-Real-IP / X-Forwarded-For)
 ✓ Upstream failure                     → bounded sequential failover
 ✓ No intentional DNS response caching
 ```

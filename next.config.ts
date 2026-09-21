@@ -8,9 +8,9 @@ const securityHeaders = [
   { key: "Cross-Origin-Resource-Policy", value: "cross-origin" },
 ];
 
-// The interactive homepage needs scripts/styles, while the DoH API can use
-// a much stricter policy. Keep the API CSP scoped to /api/doh/* instead of
-// applying `default-src 'none'` to the entire application.
+// The homepage needs scripts/styles, so its document CSP is applied to "/" only.
+// DoH API responses (application/dns-message) are never rendered as documents,
+// so they get the global security headers above but no CSP.
 const documentCsp =
   "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
 
@@ -29,8 +29,6 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       { source: "/(.*)", headers: securityHeaders },
-      // Keep the document policy scoped to the web UI. API responses must not
-      // receive the document CSP header.
       { source: "/", headers: [{ key: "Content-Security-Policy", value: documentCsp }] },
     ];
   },

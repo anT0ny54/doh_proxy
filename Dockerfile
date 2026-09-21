@@ -10,11 +10,13 @@ FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json* ./
 COPY src ./src
-COPY next.config.ts tsconfig.json eslint.config.mjs postcss.config.mjs ./
+COPY next.config.ts proxy.ts tsconfig.json eslint.config.mjs postcss.config.mjs ./
 # The homepage is statically generated and NEXT_PUBLIC_* values are inlined at
 # build time, so the public origin must be supplied as a build argument:
 #   docker build --build-arg NEXT_PUBLIC_SITE_URL=https://dns.example.com .
-ARG NEXT_PUBLIC_SITE_URL=""
+# The default matches the container port so the homepage shows a working URL
+# for a local `docker run -p 8367:8367`.
+ARG NEXT_PUBLIC_SITE_URL="http://localhost:8367"
 ENV NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL
 RUN npm run build
 
