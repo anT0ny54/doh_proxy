@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { handleHageziDoH } from "@/lib/doh";
 
-export const runtime = "edge";
+export const runtime = "nodejs";
 export const maxDuration = 5;
 
 export const GET = (request: NextRequest) => handleHageziDoH(request);
