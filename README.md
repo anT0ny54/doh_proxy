@@ -243,6 +243,8 @@ https://github.com/anT0ny54/doh_proxy
 | HaGeZi Multi Pro + TIF (this project, Vercel) | `https://dns-pi.vercel.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (this project, Netlify) | `https://dnssix.netlify.app/api/doh/dns-query` |
 | HaGeZi Multi Pro + TIF (alternate host) | `https://freedns.koyeb.app/dns-query` |
+| HaGeZi Multi Pro + TIF (alternate host) | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| HaGeZi Multi Pro + TIF (alternate host) | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
 ## 🚀 Bandwidth Hero Server
 
