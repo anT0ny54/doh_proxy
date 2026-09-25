@@ -1,7 +1,7 @@
 /**
  * Fixed-window, in-process rate limiter used by the root `proxy.ts`.
  *
- * Buckets live in a `Map`, whose iteration order is insertion order. Every
+ * Buckets are keyed by source IP and live in a `Map`, whose iteration order is insertion order. Every
  * bucket is (re)inserted at the moment its window starts, so the Map is ordered
  * by `resetAt` while the effective clock is monotonic. That lets expired
  * buckets be dropped from the front in amortised O(1) per request (no full

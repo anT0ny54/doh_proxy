@@ -26,6 +26,12 @@ const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const STREAM_CANCEL_TIMEOUT_MS = 25;
+// A small public instance can be overwhelmed by many simultaneous POST bodies
+// or slow upstream connections. Refuse excess work rather than queueing it in
+// memory and consuming the entire Node.js process.
+export const MAX_IN_FLIGHT_REQUESTS = 32;
+const BUSY_RETRY_AFTER_SECONDS = 1;
+let inFlightRequests = 0;
 
 // Circuit breaker configuration. State is per runtime instance/isolate (best
 // effort), which is enough to avoid hammering an upstream that is clearly down.
@@ -154,6 +160,22 @@ function textResponse(message: string, status: number): NextResponse {
 
 function emptyResponse(status = 204): NextResponse {
   return new NextResponse(null, { status, headers: baseHeaders() });
+}
+
+function busyResponse(): NextResponse {
+  const response = textResponse("DNS proxy busy", 503);
+  response.headers.set("Retry-After", String(BUSY_RETRY_AFTER_SECONDS));
+  return response;
+}
+
+function tryAcquireInFlight(): boolean {
+  if (inFlightRequests >= MAX_IN_FLIGHT_REQUESTS) return false;
+  inFlightRequests += 1;
+  return true;
+}
+
+function releaseInFlight(): void {
+  inFlightRequests = Math.max(0, inFlightRequests - 1);
 }
 
 function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
@@ -328,6 +350,8 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
     }
   }
 
+  if (chunks.length === 0) return new Uint8Array(0);
+  if (chunks.length === 1) return chunks[0];
   return concatChunks(chunks, total);
 }
 
@@ -354,6 +378,10 @@ function cancelResponseBody(response: Response): void {
  * server-side fetch/Response body types.
  */
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;
@@ -392,6 +420,7 @@ async function fetchUpstream(
       body: body === undefined ? undefined : toArrayBuffer(body),
       signal: controller.signal,
       cache: "no-store",
+      redirect: "error",
     });
 
     // Keep the deadline active until the response body has been consumed.
@@ -408,7 +437,16 @@ async function fetchUpstream(
 export async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
   const earlyResponse = getEarlyMethodResponse(request);
   if (earlyResponse) return earlyResponse;
+  if (!tryAcquireInFlight()) return busyResponse();
 
+  try {
+    return await proxyRequestInternal(request, options);
+  } finally {
+    releaseInFlight();
+  }
+}
+
+async function proxyRequestInternal(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
   let queryBody: Uint8Array;
   let dnsParam: string | undefined;
   const timeout = Math.max(MIN_TIMEOUT_MS, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
@@ -460,8 +498,8 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
       const result = upstreamFetch.response;
 
       try {
-        // Only genuine availability problems (timeouts, network errors, 5xx/429)
-        // count toward the breaker. Client-influenced outcomes — upstream 4xx,
+        // Only retryable availability problems (timeouts, network errors, and
+        // retryable upstream statuses) count toward the breaker. Client-influenced outcomes — upstream 4xx,
         // oversized or otherwise rejected responses — must not let one caller
         // take an upstream offline for everybody.
         if (result.status !== 200) {
@@ -474,9 +512,8 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
           // misconfigured node, ...) says nothing about the *next* upstream, so
           // keep failing over and only relay the status if nothing else answers.
           // It does not count against the breaker: it may be client-influenced.
-          // Only real error statuses are relayed: 1xx/2xx/3xx (204, 304,
-          // unfollowed redirects, ...) are invalid for a text body and would make
-          // the Response constructor throw and be miscounted as a failure.
+          // Only 4xx/5xx statuses are retained for a final relay; other non-200
+          // statuses are invalid for DoH and fall back to a generic 502.
           lastRejectedStatus = result.status >= 400 && result.status <= 599 ? result.status : 502;
           continue;
         }

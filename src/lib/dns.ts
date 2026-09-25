@@ -35,11 +35,10 @@ function readCounts(message: Uint8Array): DnsCounts | null {
  * Advances over a DNS name. Compression pointers may reference only earlier
  * bytes in the same DNS message, matching DNS backward-pointer semantics.
  *
- * `targets` is a per-message bitmap of offsets a pointer may legally land on:
- * label starts of names already parsed, plus RDATA bytes of earlier records.
- * RDATA must be included because servers routinely compress a later owner
- * name against a name embedded in earlier RDATA (e.g. the next link of a CNAME
- * chain, or NS glue records).
+ * `targets` is a per-message bitmap of offsets that this structural parser
+ * permits as compression targets. RDATA regions are conservatively marked in
+ * full because the parser does not decode every RR-specific RDATA format, while
+ * still requiring the target to be in already-parsed bytes.
  */
 function skipName(
   message: Uint8Array,
@@ -51,7 +50,7 @@ function skipName(
   let nextOffset = start;
   let jumped = false;
   let jumps = 0;
-  let nameLength = 0;
+  let expandedNameLength = 0;
   let totalBytesWalked = 0;
   const maxBytesWalked = message.byteLength * 4;
 
@@ -65,7 +64,8 @@ function skipName(
     const length = message[offset];
 
     if (length === 0) {
-      if (nameLength + 1 > 255) return null;
+      expandedNameLength += 1;
+      if (expandedNameLength > 255) return null;
       if (targets) targets[offset] = 1;
       return jumped ? nextOffset : offset + 1;
     }
@@ -96,8 +96,8 @@ function skipName(
 
     if ((length & 0xc0) !== 0 || length > 63 || offset + 1 + length > message.byteLength) return null;
     if (targets) targets[lengthOffset] = 1;
-    nameLength += 1 + length;
-    if (nameLength > 255) return null;
+    expandedNameLength += 1 + length;
+    if (expandedNameLength > 255) return null;
     offset += 1 + length;
   }
 
