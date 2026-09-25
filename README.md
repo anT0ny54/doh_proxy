@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js and the Node.js runtime. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover, and request-path rate limiting in Next.js Proxy.
+A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js and the Node.js runtime. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover, and bounded request handling in the Next.js Node.js runtime.
 
 ## What this project provides
 
@@ -35,13 +35,15 @@ Client
   +--> Node.js `proxy.ts`
   |      |
   |      +--> match `/api/doh/*`
-  |      +--> enforce 100 requests / 60 seconds per IP + host
-  |      +--> return 429 when the process-local limit is exceeded
+  |      +--> enforce 100 requests / 60 seconds per source IP
+  |      +--> return 429 when the process-local rate window is exceeded
   |      |
   |      +--> continue to the Next.js Route Handler
   |
   +--> GET/POST /api/doh/dns-query
   |      |
+  |      +--> enforce 32-request in-flight ceiling
+  |      |      +--> return 503 when 32 requests are active
   |      +--> validate DNS wire message
   |      +--> select rotated HaGeZi order
   |      +--> sequential upstream fetch
@@ -50,13 +52,15 @@ Client
   |
   +--> GET/POST /api/doh/<provider>/dns-query
          |
+         +--> enforce 32-request in-flight ceiling
+         |      +--> return 503 when 32 requests are active
          +--> validate DNS wire message
          +--> use one fixed provider upstream
          +--> validate response + match ID/Question
          +--> return application/dns-message
 ```
 
-The implementation is intentionally small: there is no local DNS cache and no arbitrary proxy target. All public DoH requests pass through the Node.js `proxy.ts` rate limiter before the route handler.
+The implementation is intentionally small: there is no local DNS cache and no arbitrary proxy target. Public DoH requests use fixed upstreams, bounded message handling, sequential failover, a process-local request-rate limit, and a process-local in-flight ceiling.
 
 ## API behavior
 
@@ -96,25 +100,15 @@ The server-owned HaGeZi list is compiled in under `src/lib/upstreams.ts`:
 
 The starting position rotates periodically, but each request still has a deterministic sequential failover order. The default rotation interval is 30 minutes.
 
-## Rate limiting
+## Request protection
 
-The application enforces an **in-process Node.js rate limit** in the root `proxy.ts` file before requests reach the DoH route handlers.
+The application uses two process-local protections before expensive upstream work begins.
 
-The rule applies to:
+The first is a **100 requests per 60 seconds per source IP** fixed window in `proxy.ts`. It applies to `/api/doh/*`; requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
 
-```text
-/api/doh/*
-```
+The second is a **32-request in-flight ceiling** in the DoH handler. This includes slow POST-body reads and upstream waits, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
 
-The configured limit is **100 requests per 60 seconds**, aggregated by **client IP + host**. Requests over the limit receive `429 Too Many Requests` with a `Retry-After` header holding the seconds left in the current window, plus `Access-Control-Allow-Origin: *` so browser clients can read it.
-
-The limiter lives in `src/lib/rate-limit.ts`. Expired buckets are dropped in amortised O(1) per request and the table is hard-capped at 10,000 entries (oldest evicted first), so memory stays bounded even if a client rotates spoofed `X-Forwarded-For` values. Identifier lengths are truncated before they become bucket keys.
-
-**No client IP, no limit.** The client address comes only from `X-Real-IP` / `X-Forwarded-For`. When neither header is present (for example the Docker image exposed directly on port 8367 with no reverse proxy) the request is not rate limited by the application, because a single shared bucket would cap the whole service at 100 requests/minute. Put a reverse proxy or WAF in front for per-client limiting in that setup.
-
-The limiter is intentionally local to each Node.js process. On a multi-instance deployment, each instance has its own counter, so put the service behind a shared reverse proxy, API gateway, load balancer, or WAF when a global cross-instance limit is required.
-
-When deployed behind a reverse proxy, configure that proxy to sanitize `X-Forwarded-For` / `X-Real-IP`; otherwise client-supplied forwarding headers can affect the IP key used by the application limiter.
+The in-flight ceiling and request-rate limiter are process-local. Platform-level WAF, firewall, connection, or traffic controls can still provide cross-instance protection when required.
 
 ## Configuration
 
@@ -129,7 +123,7 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 
 - The application does not contain query-content logging code.
 - GET requests place the encoded DNS message in the URL. Hosting, reverse-proxy, or access logs outside the application can therefore potentially record the URL. Use POST when avoiding DNS data in URL paths matters.
-- Only fixed, compiled-in upstream URLs are forwarded; arbitrary/custom upstream targets are not supported.
+- Only fixed, compiled-in upstream URLs are forwarded; arbitrary/custom upstream targets and redirects are not supported.
 - Request and response sizes are explicitly bounded to keep memory use predictable.
 - Response validation rejects malformed or mismatched DNS answers before relay.
 - All DoH responses use `Cache-Control: no-store` and do not implement an application DNS cache.
@@ -178,9 +172,9 @@ npm run lint
 npm run build
 ```
 
-`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), the DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation) and the rate-limiter tests (`scripts/test-rate-limit.mjs`).
+`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation, redirect blocking), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP rate-limit tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`).
 
-The project currently stays on the TypeScript 6.x line because the configured `typescript-eslint` / Next.js ESLint integration still has a peer-range constraint below TypeScript 7. Revisit that pin when the linting toolchain supports TypeScript 7 cleanly.
+The project currently stays on the TypeScript 6.x line through the `package.json` dependency range; move to a newer major only alongside compatible Next.js ESLint tooling.
 
 ## Validation checklist
 
@@ -207,7 +201,8 @@ Runtime behavior should additionally be checked after deployment with:
 ✓ Invalid or missing GET dns           → 400
 ✓ Oversized request                    → 413 / bounded rejection
 ✓ Unsupported POST content type        → 415
-✓ Node.js Proxy rate limiting          → 100 req / 60 s per IP + host (needs X-Real-IP / X-Forwarded-For)
+✓ In-flight overload protection         → 503 once 32 requests are active
+✓ Request rate limiting                  → 100 req / 60 s per source IP
 ✓ Upstream failure                     → bounded sequential failover
 ✓ No intentional DNS response caching
 ```
@@ -226,7 +221,7 @@ Provider-specific routes follow the same pattern, for example:
 https://<your-domain>/api/doh/cloudflare/dns-query
 ```
 
-No deployment-specific hostname is hardcoded in the project documentation.
+The examples above use a placeholder deployment hostname; service-specific live endpoints may be listed separately when intentionally maintained.
 
 ## License
 

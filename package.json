@@ -11,7 +11,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test scripts/test-dns.mjs scripts/test-doh.mjs scripts/test-rate-limit.mjs"
+    "test": "node --test scripts/test-dns.mjs scripts/test-doh.mjs scripts/test-capacity.mjs scripts/test-proxy.mjs scripts/test-rate-limit.mjs"
   },
   "dependencies": {
     "next": "^16.3.5",

@@ -5,7 +5,7 @@
  * Next.js route. For multi-instance deployments, use a shared reverse-proxy
  * or WAF rate limiter so the limit is shared across instances.
  *
- * Limit: 100 requests per 60 seconds per IP + host.
+ * Limit: 100 requests per 60 seconds per source IP.
  *
  * IMPORTANT: When running behind a reverse proxy, configure that proxy to
  * sanitize X-Forwarded-For/X-Real-IP. Otherwise clients may spoof the IP.
@@ -24,7 +24,6 @@ import { RateLimiter } from "./src/lib/rate-limit";
 // Header values are attacker-controlled; bound them so the bucket keys (and
 // therefore memory) stay small. 64 covers the longest textual IPv6 address.
 const MAX_IP_LENGTH = 64;
-const MAX_HOST_LENGTH = 255;
 
 const limiter = new RateLimiter();
 
@@ -40,15 +39,12 @@ function getClientIp(request: NextRequest): string | undefined {
 }
 
 export default function proxy(request: NextRequest) {
-  if (!request.nextUrl.pathname.startsWith("/api/doh/")) {
-    return NextResponse.next();
-  }
-
   const ip = getClientIp(request);
   if (ip === undefined) return NextResponse.next();
 
-  const host = (request.headers.get("host") ?? request.nextUrl.host).slice(0, MAX_HOST_LENGTH);
-  const result = limiter.check(`${ip}\u0000${host}`, Date.now());
+  // Rate-limit strictly by source IP. Including Host lets one client fragment
+  // its quota across arbitrary Host values while adding no protection value.
+  const result = limiter.check(ip, Date.now());
 
   if (result.limited) {
     return new NextResponse("Too Many Requests", {
