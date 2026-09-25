@@ -1,3 +1,9 @@
 [build]
   command = "npm run build"
 
+[build.environment]
+  # Match the Dockerfile (node:22-alpine) and package.json "engines" so the
+  # Node.js `proxy.ts` rate limiter and DoH route handlers behave identically
+  # across every deploy target.
+  NODE_VERSION = "22"
+
