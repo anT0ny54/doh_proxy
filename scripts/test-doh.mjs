@@ -130,6 +130,26 @@ try {
     assert.match(calls[0].url, /upstream\.test/);
   });
 
+  await test("DoH upstream redirects are rejected", async () => {
+    let redirectMode;
+    globalThis.fetch = async (_url, init) => {
+      redirectMode = init.redirect;
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://attacker.test/dns-query" },
+      });
+    };
+
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://redirect.test/dns-query" }],
+      timeoutMs: 100,
+      failover: false,
+    });
+
+    assert.equal(redirectMode, "error");
+    assert.equal(response.status, 502);
+  });
+
   await test("DoH failover retries a retryable upstream status", async () => {
     const calls = [];
     globalThis.fetch = async (url) => {

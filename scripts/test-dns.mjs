@@ -229,6 +229,43 @@ test("accepts a CNAME chain whose next owner name points into earlier RDATA", ()
   assert.equal(dns.isValidDnsResponse(response, query), true);
 });
 
+
+test("rejects a compressed name whose expanded form exceeds 255 octets", () => {
+  const label = (length, value = 97) => [length, ...new Uint8Array(length).fill(value)];
+  const longName = [...label(62), ...label(62), ...label(62), ...label(62), 0];
+  const query = Uint8Array.from([
+    0x12, 0x34,
+    0x01, 0x00,
+    0, 1,
+    0, 0,
+    0, 0,
+    0, 0,
+    ...longName,
+    0, 1, 0, 1,
+  ]);
+  const question = query.slice(12);
+  const answerName = [3, 101, 100, 103, 0xc0, 0x0c];
+  const answer = [
+    ...answerName,
+    0, 1,
+    0, 1,
+    0, 0, 0, 60,
+    0, 4,
+    1, 2, 3, 4,
+  ];
+  const response = Uint8Array.from([
+    query[0], query[1],
+    0x81, 0x80,
+    0, 1,
+    0, 1,
+    0, 0,
+    0, 0,
+    ...question,
+    ...answer,
+  ]);
+  assert.equal(dns.isValidDnsResponse(response, query), false);
+});
+
 test("responses may exceed 4 KiB but queries may not", () => {
   const question = validQuery.slice(12);
   const records = [];
