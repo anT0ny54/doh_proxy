@@ -1,42 +1,56 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { getClientIp } from "@/lib/client-ip";
 import { DOH_PROVIDERS } from "@/lib/providers";
 import {
   DNS_MESSAGE,
-  isValidDnsQuery,
   isValidDnsResponse,
   MAX_DNS_MESSAGE_SIZE,
   MAX_DNS_RESPONSE_SIZE,
+  parseQuery,
+  type ParsedQuery,
 } from "@/lib/dns";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-export const PROXY_VERSION = "2.7.3";
+export const PROXY_VERSION = "2.8.0";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
+// Longest base64url string that can encode a maximum-size query.
+const MAX_ENCODED_QUERY_LENGTH = Math.ceil((MAX_DNS_MESSAGE_SIZE * 4) / 3);
 const DEFAULT_TIMEOUT_MS = 2_500;
+// A client must deliver its POST body within this window (or the overall
+// request deadline, if shorter), so slow senders cannot pin in-flight slots.
+const MAX_BODY_READ_MS = 1_000;
+// Smallest slice of the budget a failover attempt is given.
+const MIN_FAILOVER_SLICE_MS = 750;
 const MIN_TIMEOUT_MS = 250;
 // An attempt with less budget than this cannot realistically finish (TLS + RTT)
 // and would only be recorded as a bogus upstream failure, e.g. when a slow
 // client consumed most of the request deadline while sending its POST body.
 const MIN_ATTEMPT_TIMEOUT_MS = 100;
-const HAGEZI_TIMEOUT_MS = 2_500;
 const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
 const MIN_HAGEZI_ROTATION_SECONDS = 60;
 const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
-const BASE64URL = /^[A-Za-z0-9_-]+$/;
+const BASE64URL = /^[A-Za-z0-9_-]+={0,2}$/;
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const STREAM_CANCEL_TIMEOUT_MS = 25;
 // A small public instance can be overwhelmed by many simultaneous POST bodies
 // or slow upstream connections. Refuse excess work rather than queueing it in
 // memory and consuming the entire Node.js process.
 export const MAX_IN_FLIGHT_REQUESTS = 32;
+// One identified client may hold at most this many of those slots.
+export const MAX_IN_FLIGHT_PER_IP = 8;
 const BUSY_RETRY_AFTER_SECONDS = 1;
-let inFlightRequests = 0;
+// Upstream Cache-Control max-age is relayed for GET (capped) so clients can
+// cache answers; the proxy itself keeps no DNS cache.
+const MAX_RELAYED_MAX_AGE_SECONDS = 300;
 
 // Circuit breaker configuration. State is per runtime instance/isolate (best
 // effort), which is enough to avoid hammering an upstream that is clearly down.
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
+// A half-open probe that never reports back frees the slot after this long.
+const CIRCUIT_BREAKER_PROBE_TTL_MS = 5_000;
 
 interface UpstreamInput {
   readonly endpoint: string;
@@ -53,53 +67,61 @@ interface DoHOptions {
   readonly failover?: boolean;
 }
 
-// Circuit breaker state
 interface CircuitBreakerState {
   failures: number;
   lastFailureTime: number;
-  open: boolean;
+  /** Start of the in-flight half-open probe, or 0 when none is active. */
+  probeStartedAt: number;
 }
 
-const circuitBreakers = new Map<string, CircuitBreakerState>();
-
-function getCircuitBreaker(endpoint: string): CircuitBreakerState {
-  let cb = circuitBreakers.get(endpoint);
-  if (!cb) {
-    cb = { failures: 0, lastFailureTime: 0, open: false };
-    circuitBreakers.set(endpoint, cb);
-  }
-  return cb;
+interface ProxyState {
+  inFlight: number;
+  inFlightByIp: Map<string, number>;
+  circuitBreakers: Map<string, CircuitBreakerState>;
+  rotationCounter: number;
 }
 
+// Kept on globalThis so that if the bundler instantiates this module more than
+// once in a process (e.g. one copy per route), the counters and breakers are
+// still shared instead of silently split.
+const globalStore = globalThis as typeof globalThis & { __dohProxyState?: ProxyState };
+const state: ProxyState = (globalStore.__dohProxyState ??= {
+  inFlight: 0,
+  inFlightByIp: new Map(),
+  circuitBreakers: new Map(),
+  rotationCounter: 0,
+});
+
+/**
+ * Open = THRESHOLD consecutive failures. After the cooldown exactly one caller
+ * is let through as a half-open probe; its failure re-opens the breaker
+ * immediately and its success resets it.
+ */
 function isCircuitBreakerOpen(endpoint: string): boolean {
-  const cb = getCircuitBreaker(endpoint);
-  if (!cb.open) return false;
+  const cb = state.circuitBreakers.get(endpoint);
+  if (!cb || cb.failures < CIRCUIT_BREAKER_THRESHOLD) return false;
 
-  // Cooldown elapsed: go half-open. One more failure re-opens the breaker
-  // immediately instead of burning THRESHOLD slow attempts again.
-  if (Date.now() - cb.lastFailureTime >= CIRCUIT_BREAKER_COOLDOWN_MS) {
-    cb.open = false;
-    cb.failures = CIRCUIT_BREAKER_THRESHOLD - 1;
-    return false;
-  }
-  return true;
+  const now = Date.now();
+  if (now - cb.lastFailureTime < CIRCUIT_BREAKER_COOLDOWN_MS) return true;
+  if (cb.probeStartedAt !== 0 && now - cb.probeStartedAt < CIRCUIT_BREAKER_PROBE_TTL_MS) return true;
+
+  cb.probeStartedAt = now;
+  return false;
 }
 
 function recordFailure(endpoint: string): void {
-  const cb = getCircuitBreaker(endpoint);
+  let cb = state.circuitBreakers.get(endpoint);
+  if (!cb) {
+    cb = { failures: 0, lastFailureTime: 0, probeStartedAt: 0 };
+    state.circuitBreakers.set(endpoint, cb);
+  }
   cb.failures += 1;
   cb.lastFailureTime = Date.now();
-  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD) {
-    cb.open = true;
-  }
+  cb.probeStartedAt = 0;
 }
 
 function recordSuccess(endpoint: string): void {
-  const cb = circuitBreakers.get(endpoint);
-  if (cb) {
-    cb.failures = 0;
-    cb.open = false;
-  }
+  state.circuitBreakers.delete(endpoint);
 }
 
 const NORMALIZED_PROVIDER_UPSTREAMS = new Map(
@@ -120,18 +142,47 @@ function normalizeUpstream(upstream: UpstreamInput): NormalizedDoHUpstream {
   return { endpoint: upstream.endpoint, url: new URL(upstream.endpoint) };
 }
 
-export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
-  const raw = process.env.HAGEZI_ROTATION_SECONDS?.trim();
-  const configured = raw ? Number(raw) : DEFAULT_HAGEZI_ROTATION_SECONDS;
+const ROTATED_HAGEZI_UPSTREAMS: readonly (readonly NormalizedDoHUpstream[])[] = NORMALIZED_HAGEZI_UPSTREAMS.map(
+  (_, slot) =>
+    NORMALIZED_HAGEZI_UPSTREAMS.map(
+      (__, offset) => NORMALIZED_HAGEZI_UPSTREAMS[(slot + offset) % NORMALIZED_HAGEZI_UPSTREAMS.length],
+    ),
+);
+
+interface RotationConfig {
+  readonly seconds: number;
+  readonly perRequest: boolean;
+}
+
+let rotationConfigCache: { readonly key: string; readonly config: RotationConfig } | undefined;
+
+function getRotationConfig(): RotationConfig {
+  const rawSeconds = process.env.HAGEZI_ROTATION_SECONDS?.trim() ?? "";
+  const rawMode = process.env.HAGEZI_ROTATION_MODE?.trim().toLowerCase() ?? "";
+  const key = `${rawSeconds}|${rawMode}`;
+  if (rotationConfigCache?.key === key) return rotationConfigCache.config;
+
+  const configured = rawSeconds ? Number(rawSeconds) : DEFAULT_HAGEZI_ROTATION_SECONDS;
   const seconds = Number.isFinite(configured)
     ? Math.min(Math.max(Math.floor(configured), MIN_HAGEZI_ROTATION_SECONDS), MAX_HAGEZI_ROTATION_SECONDS)
     : DEFAULT_HAGEZI_ROTATION_SECONDS;
-  const slot = Math.floor(Date.now() / (seconds * 1_000)) % HAGEZI_UPSTREAMS.length;
+  const config = { seconds, perRequest: rawMode === "request" };
+  rotationConfigCache = { key, config };
+  return config;
+}
 
-  return Array.from(
-    { length: HAGEZI_UPSTREAMS.length },
-    (_, offset) => NORMALIZED_HAGEZI_UPSTREAMS[(slot + offset) % NORMALIZED_HAGEZI_UPSTREAMS.length],
-  );
+/**
+ * Failover order for the primary endpoint. By default the first choice changes
+ * on a time slot (consistent across instances); with
+ * HAGEZI_ROTATION_MODE=request it round-robins per request to spread load.
+ */
+export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
+  const { seconds, perRequest } = getRotationConfig();
+  const count = ROTATED_HAGEZI_UPSTREAMS.length;
+  const slot = perRequest
+    ? state.rotationCounter++ % count
+    : Math.floor(Date.now() / (seconds * 1_000)) % count;
+  return ROTATED_HAGEZI_UPSTREAMS[slot];
 }
 
 function getProviderUpstream(providerId: string): NormalizedDoHUpstream | undefined {
@@ -143,12 +194,9 @@ function baseHeaders(): Headers {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Accept, Content-Type, Cache-Control",
+    "Access-Control-Expose-Headers": "Retry-After",
     "Access-Control-Max-Age": "86400",
     "Cache-Control": "no-store, max-age=0",
-    Expires: "0",
-    Pragma: "no-cache",
-    "X-Content-Type-Options": "nosniff",
-    "X-DoH-Proxy-Version": PROXY_VERSION,
   });
 }
 
@@ -158,8 +206,8 @@ function textResponse(message: string, status: number): NextResponse {
   return new NextResponse(message, { status, headers });
 }
 
-function emptyResponse(status = 204): NextResponse {
-  return new NextResponse(null, { status, headers: baseHeaders() });
+function emptyResponse(): NextResponse {
+  return new NextResponse(null, { status: 204, headers: baseHeaders() });
 }
 
 function busyResponse(): NextResponse {
@@ -168,14 +216,23 @@ function busyResponse(): NextResponse {
   return response;
 }
 
-function tryAcquireInFlight(): boolean {
-  if (inFlightRequests >= MAX_IN_FLIGHT_REQUESTS) return false;
-  inFlightRequests += 1;
+function tryAcquireInFlight(ip: string | undefined): boolean {
+  if (state.inFlight >= MAX_IN_FLIGHT_REQUESTS) return false;
+  if (ip !== undefined) {
+    const current = state.inFlightByIp.get(ip) ?? 0;
+    if (current >= MAX_IN_FLIGHT_PER_IP) return false;
+    state.inFlightByIp.set(ip, current + 1);
+  }
+  state.inFlight += 1;
   return true;
 }
 
-function releaseInFlight(): void {
-  inFlightRequests = Math.max(0, inFlightRequests - 1);
+function releaseInFlight(ip: string | undefined): void {
+  state.inFlight = Math.max(0, state.inFlight - 1);
+  if (ip === undefined) return;
+  const current = state.inFlightByIp.get(ip) ?? 0;
+  if (current <= 1) state.inFlightByIp.delete(ip);
+  else state.inFlightByIp.set(ip, current - 1);
 }
 
 function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
@@ -210,33 +267,41 @@ async function cancelReaderBestEffort<T>(reader: ReadableStreamDefaultReader<T>)
   }
 }
 
-function decodeBase64Url(value: string): Uint8Array | null {
-  if (!value || value.length > MAX_QUERY_STRING_LENGTH || value.length % 4 === 1 || !BASE64URL.test(value)) {
-    return null;
-  }
-
-  try {
-    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-    const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
-    if (binary.length > MAX_DNS_MESSAGE_SIZE) return null;
-
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    return isValidDnsQuery(bytes) ? bytes : null;
-  } catch {
-    return null;
-  }
+interface ValidatedQuery {
+  readonly body: Uint8Array;
+  readonly parsed: ParsedQuery;
 }
 
-function validateGet(url: URL): { readonly dnsParam: string; readonly queryBody: Uint8Array } | NextResponse {
+/** Strips optional trailing `=` padding (RFC 8484 omits it, but clients send it). */
+function stripPadding(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 0x3d && value.length - end < 2) end -= 1;
+  return value.slice(0, end);
+}
+
+function decodeBase64Url(value: string): ValidatedQuery | null {
+  if (!value || value.length > MAX_ENCODED_QUERY_LENGTH + 2 || !BASE64URL.test(value)) return null;
+  const unpadded = stripPadding(value);
+  if (!unpadded || unpadded.length > MAX_ENCODED_QUERY_LENGTH || unpadded.length % 4 === 1) return null;
+
+  const body = Buffer.from(unpadded, "base64url");
+  if (body.byteLength > MAX_DNS_MESSAGE_SIZE) return null;
+
+  const parsed = parseQuery(body);
+  return parsed === null ? null : { body, parsed };
+}
+
+function validateGet(url: URL): { readonly dnsParam: string; readonly query: ValidatedQuery } | NextResponse {
   if (url.search.length > MAX_QUERY_STRING_LENGTH) return textResponse("Query string too long", 414);
 
   const dnsValues = url.searchParams.getAll("dns");
   if (dnsValues.length !== 1) return textResponse("Invalid DNS message", 400);
 
-  const decoded = decodeBase64Url(dnsValues[0]);
-  if (decoded === null) return textResponse("Invalid DNS message", 400);
+  const query = decodeBase64Url(dnsValues[0]);
+  if (query === null) return textResponse("Invalid DNS message", 400);
 
-  return { dnsParam: dnsValues[0], queryBody: decoded };
+  // Forward the canonical unpadded form to the upstream.
+  return { dnsParam: stripPadding(dnsValues[0]), query };
 }
 
 function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
@@ -249,7 +314,7 @@ function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array 
   return body;
 }
 
-async function readPostBody(request: NextRequest, deadline: number): Promise<Uint8Array | NextResponse> {
+async function readPostBody(request: NextRequest, deadline: number): Promise<ValidatedQuery | NextResponse> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== DNS_MESSAGE) return textResponse("Unsupported Content-Type", 415);
 
@@ -311,15 +376,19 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Uin
   }
 
   const body = concatChunks(chunks, total);
-  if (!isValidDnsQuery(body)) return textResponse("Invalid DNS message", 400);
-  return body;
+  const parsed = parseQuery(body);
+  if (parsed === null) return textResponse("Invalid DNS message", 400);
+  return { body, parsed };
 }
 
 async function readResponseBody(response: Response): Promise<Uint8Array | null> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     const size = Number(contentLength);
-    if (!Number.isInteger(size) || size > MAX_DNS_RESPONSE_SIZE) return null;
+    if (!Number.isInteger(size) || size > MAX_DNS_RESPONSE_SIZE) {
+      cancelResponseBody(response);
+      return null;
+    }
   }
 
   if (!response.body) return new Uint8Array(0);
@@ -327,15 +396,21 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  // Keep the lock while a best-effort cancel may still be settling (see
+  // readPostBody); only a fully settled stream may have its lock released.
+  let settled = false;
 
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        settled = true;
+        break;
+      }
 
       const nextTotal = total + value.byteLength;
       if (nextTotal > MAX_DNS_RESPONSE_SIZE) {
-        await cancelReaderBestEffort(reader);
+        settled = await cancelReaderBestEffort(reader);
         return null;
       }
 
@@ -343,10 +418,12 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
       total = nextTotal;
     }
   } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // A best-effort cancellation may still be settling a pending read.
+    if (settled) {
+      try {
+        reader.releaseLock();
+      } catch {
+        // A best-effort cancellation may still be settling a pending read.
+      }
     }
   }
 
@@ -400,9 +477,8 @@ async function fetchUpstream(
   timeoutMs: number,
 ): Promise<UpstreamFetch> {
   const isGet = request.method === "GET" && dnsParam !== undefined;
-  // Copy the pre-parsed URL only when it must be mutated.
-  const url = isGet ? new URL(upstream.url) : upstream.url;
-  if (isGet) url.searchParams.set("dns", dnsParam);
+  // `dnsParam` already passed the base64url check, so it needs no encoding.
+  const url = isGet ? `${upstream.endpoint}?dns=${dnsParam}` : upstream.url;
 
   const headers = new Headers({
     Accept: DNS_MESSAGE,
@@ -434,33 +510,42 @@ async function fetchUpstream(
   }
 }
 
+/** Max-age (seconds, capped) to relay from an upstream Cache-Control, or 0. */
+function relayedMaxAge(cacheControl: string | null): number {
+  if (!cacheControl || /(?:^|[\s,])(?:no-store|no-cache)(?:$|[\s,=])/i.test(cacheControl)) return 0;
+  const match = /(?:^|[\s,])max-age=(\d{1,9})(?:$|[\s,])/i.exec(cacheControl);
+  return match ? Math.min(Number(match[1]), MAX_RELAYED_MAX_AGE_SECONDS) : 0;
+}
+
 export async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
   const earlyResponse = getEarlyMethodResponse(request);
   if (earlyResponse) return earlyResponse;
-  if (!tryAcquireInFlight()) return busyResponse();
+  const clientIp = getClientIp(request.headers);
+  if (!tryAcquireInFlight(clientIp)) return busyResponse();
 
   try {
     return await proxyRequestInternal(request, options);
   } finally {
-    releaseInFlight();
+    releaseInFlight(clientIp);
   }
 }
 
 async function proxyRequestInternal(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
-  let queryBody: Uint8Array;
+  let query: ValidatedQuery;
   let dnsParam: string | undefined;
   const timeout = Math.max(MIN_TIMEOUT_MS, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const deadline = Date.now() + timeout;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeout;
 
   if (request.method === "GET") {
     const validation = validateGet(new URL(request.url));
     if (validation instanceof NextResponse) return validation;
     dnsParam = validation.dnsParam;
-    queryBody = validation.queryBody;
+    query = validation.query;
   } else {
-    const bodyResult = await readPostBody(request, deadline);
+    const bodyResult = await readPostBody(request, Math.min(deadline, startedAt + MAX_BODY_READ_MS));
     if (bodyResult instanceof NextResponse) return bodyResult;
-    queryBody = bodyResult;
+    query = bodyResult;
   }
 
   const failover = options.failover !== false;
@@ -474,25 +559,29 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
   const healthy = upstreams.filter((upstream) => !isCircuitBreakerOpen(upstream.endpoint));
   if (healthy.length > 0) upstreams = healthy;
 
-  const perAttemptTimeout = failover
-    ? Math.max(750, Math.floor(timeout / Math.max(upstreams.length, 1)))
-    : timeout;
-
-  // Last non-200 status seen from the most recent attempt, if that attempt was a
-  // definite upstream rejection (as opposed to a timeout/invalid body).
+  // Last definite upstream rejection (non-200 status) seen across attempts. A
+  // later timeout or invalid body does not erase it; it is relayed only if no
+  // upstream ends up answering.
   let lastRejectedStatus: number | undefined;
 
-  for (const upstream of upstreams) {
-    const attemptTimeout = Math.min(deadline - Date.now(), perAttemptTimeout);
+  for (let index = 0; index < upstreams.length; index += 1) {
+    const upstream = upstreams[index];
+    // Share what is left of the budget across the attempts still to come, so
+    // time saved by fast failures flows to later upstreams (the last one gets
+    // everything that remains).
+    const remaining = deadline - Date.now();
+    const share = failover
+      ? Math.max(MIN_FAILOVER_SLICE_MS, Math.floor(remaining / (upstreams.length - index)))
+      : remaining;
+    const attemptTimeout = Math.min(remaining, share);
     if (attemptTimeout < MIN_ATTEMPT_TIMEOUT_MS) break;
-    lastRejectedStatus = undefined;
 
     try {
       const upstreamFetch = await fetchUpstream(
         request,
         dnsParam,
         upstream,
-        request.method === "POST" ? queryBody : undefined,
+        request.method === "POST" ? query.body : undefined,
         attemptTimeout,
       );
       const result = upstreamFetch.response;
@@ -524,17 +613,19 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
           continue;
         }
 
+        // readResponseBody cancels the stream itself on its early-exit paths.
         const responseBody = await readResponseBody(result);
-        if (responseBody === null || !isValidDnsResponse(responseBody, queryBody)) {
-          cancelResponseBody(result);
-          continue;
-        }
+        if (responseBody === null || !isValidDnsResponse(responseBody, query.parsed)) continue;
 
         recordSuccess(upstream.endpoint);
 
         const headers = baseHeaders();
         headers.set("Content-Type", DNS_MESSAGE);
         headers.set("Content-Length", String(responseBody.byteLength));
+        if (request.method === "GET") {
+          const maxAge = relayedMaxAge(result.headers.get("cache-control"));
+          if (maxAge > 0) headers.set("Cache-Control", `private, max-age=${maxAge}`);
+        }
         return new NextResponse(toArrayBuffer(responseBody), { status: 200, headers });
       } finally {
         upstreamFetch.cleanup();
@@ -562,7 +653,6 @@ export async function handleDoH(
 export async function handleHageziDoH(request: NextRequest): Promise<NextResponse> {
   return proxyRequest(request, {
     upstreams: getHageziUpstreams,
-    timeoutMs: HAGEZI_TIMEOUT_MS,
     failover: true,
   });
 }

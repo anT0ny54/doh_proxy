@@ -14,7 +14,10 @@
  */
 
 export const WINDOW_SIZE_MS = 60_000;
-export const WINDOW_LIMIT = 100;
+// Generous default: one browser page load or household easily issues dozens of
+// DNS lookups per minute, and CGNAT/office clients share an IP. Override with
+// RATE_LIMIT_PER_MINUTE in proxy.ts.
+export const WINDOW_LIMIT = 600;
 export const MAX_BUCKETS = 10_000;
 
 interface Bucket {

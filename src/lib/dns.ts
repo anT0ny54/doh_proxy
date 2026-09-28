@@ -51,15 +51,12 @@ function skipName(
   let jumped = false;
   let jumps = 0;
   let expandedNameLength = 0;
-  let totalBytesWalked = 0;
-  const maxBytesWalked = message.byteLength * 4;
 
   if (targets) targets[start] = 1;
 
+  // Work is bounded without a separate step counter: an expanded name is capped
+  // at 255 bytes (at most ~127 labels) and pointer jumps are capped at 16.
   while (offset < message.byteLength) {
-    // Hard cap on total bytes walked to prevent O(n²) attacks via compression pointers
-    if (++totalBytesWalked > maxBytesWalked) return null;
-
     const lengthOffset = offset;
     const length = message[offset];
 
@@ -77,9 +74,9 @@ function skipName(
       // A pointer must target an earlier byte that has already been parsed as
       // part of a DNS domain name. This prevents pointers into unrelated
       // header/type/class/RDATA bytes that merely happen to look name-like.
+      // `pointer < offset < byteLength`, so no separate upper-bound check is needed.
       if (
         pointer < 12 ||
-        pointer >= message.byteLength ||
         pointer >= offset ||
         (targets && targets[pointer] === 0) ||
         ++jumps > 16
@@ -126,9 +123,11 @@ function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8A
 }
 
 function validateStructure(message: Uint8Array, expectedResponse: boolean): QuestionRange | null {
-  const counts = readCounts(message);
   const maxSize = expectedResponse ? MAX_DNS_RESPONSE_SIZE : MAX_DNS_MESSAGE_SIZE;
-  if (!counts || message.byteLength > maxSize) return null;
+  if (message.byteLength > maxSize) return null;
+
+  const counts = readCounts(message);
+  if (!counts) return null;
 
   const flags = readUint16(message, 2);
   const isResponse = (flags & 0x8000) !== 0;
@@ -159,39 +158,56 @@ export function isValidDnsQuery(message: Uint8Array): boolean {
   return validateStructure(message, false) !== null;
 }
 
-function questionKey(message: Uint8Array, range: QuestionRange): Uint8Array {
-  const key = message.slice(12, range.end);
-  const qnameEnd = range.typeOffset - 12;
+/**
+ * A validated query reduced to what response matching needs. Build it once per
+ * request with {@link parseQuery} and reuse it for every upstream attempt
+ * instead of re-parsing the query each time.
+ */
+export interface ParsedQuery {
+  readonly id: number;
+  /** Question section (QNAME, QTYPE, QCLASS) with ASCII letters in QNAME lower-cased. */
+  readonly key: Uint8Array;
+  readonly nameLength: number;
+}
 
+/** Validates a client query and returns its match data, or null if invalid. */
+export function parseQuery(message: Uint8Array): ParsedQuery | null {
+  const range = validateStructure(message, false);
+  if (range === null) return null;
+
+  const key = message.slice(12, range.end);
+  const nameLength = range.typeOffset - 12;
   // DNS names are case-insensitive. Only ASCII letters have DNS case-folding;
   // leave length/type/class bytes and non-ASCII octets untouched.
-  for (let i = 0; i < qnameEnd; i += 1) {
+  for (let i = 0; i < nameLength; i += 1) {
     const value = key[i];
     if (value >= 0x41 && value <= 0x5a) key[i] = value + 0x20;
   }
 
-  return key;
+  return { id: readUint16(message, 0), key, nameLength };
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.byteLength !== b.byteLength) return false;
-  for (let i = 0; i < a.byteLength; i += 1) {
-    if (a[i] !== b[i]) return false;
+/** Compares the response question to the query key without allocating. */
+function questionMatches(message: Uint8Array, range: QuestionRange, query: ParsedQuery): boolean {
+  const length = range.end - 12;
+  if (length !== query.key.byteLength) return false;
+
+  for (let i = 0; i < length; i += 1) {
+    let value = message[12 + i];
+    if (i < query.nameLength && value >= 0x41 && value <= 0x5a) value += 0x20;
+    if (value !== query.key[i]) return false;
   }
   return true;
 }
 
-export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array): boolean {
+export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array | ParsedQuery): boolean {
   const responseQuestion = validateStructure(message, true);
   if (responseQuestion === null) return false;
   if (!query) return true;
 
-  const queryQuestion = validateStructure(query, false);
-  if (queryQuestion === null || message.byteLength < 2 || query.byteLength < 2) return false;
-  if (readUint16(message, 0) !== readUint16(query, 0)) return false;
+  const parsed = query instanceof Uint8Array ? parseQuery(query) : query;
+  if (parsed === null) return false;
+  if (readUint16(message, 0) !== parsed.id) return false;
 
-  const responseKey = questionKey(message, responseQuestion);
-  const queryKey = questionKey(query, queryQuestion);
-
-  return bytesEqual(responseKey, queryKey);
+  return questionMatches(message, responseQuestion, parsed);
 }
