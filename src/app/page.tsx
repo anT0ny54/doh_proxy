@@ -20,7 +20,7 @@ export default function Home() {
           <p className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-zinc-500">FreeDNS</p>
           <h1 className="text-4xl font-extrabold tracking-tight text-zinc-900 sm:text-5xl">Fast DNS-over-HTTPS</h1>
           <p className="mx-auto mt-4 max-w-2xl text-base leading-7 text-zinc-600 sm:text-lg">
-            A lightweight public DoH proxy using HaGeZi&apos;s balanced-protection DNS servers, with deterministic rotation, sequential failover, strict RFC 8484 validation, and no intentional DNS-response caching.
+            A lightweight public DoH proxy using HaGeZi&apos;s balanced-protection DNS servers, with deterministic rotation, sequential failover, strict RFC 8484 validation, and no server-side DNS cache.
           </p>
         </header>
 
@@ -61,7 +61,7 @@ export default function Home() {
         <section className="mt-10" aria-labelledby="protection-title">
           <div className="mb-4">
             <h2 id="protection-title" className="text-xl font-semibold text-zinc-900">HaGeZi protection &amp; routing</h2>
-            <p className="mt-1 text-sm leading-6 text-zinc-600">The primary endpoint uses three EU HaGeZi resolvers. The proxy rotates the primary server and falls back sequentially without exposing the upstream URL.</p>
+            <p className="mt-1 text-sm leading-6 text-zinc-600">The primary endpoint uses {HAGEZI_UPSTREAMS.length} EU HaGeZi resolvers. The proxy rotates the primary server and falls back sequentially without exposing the upstream URL.</p>
           </div>
           <div className="grid gap-4 sm:grid-cols-3">
             {HAGEZI_UPSTREAMS.map(({ hostname, location, description }) => (
@@ -80,7 +80,7 @@ export default function Home() {
           <div className="mt-4 grid gap-4 text-sm text-zinc-600 sm:grid-cols-3">
             <Step number="1" text="Set your device, browser, router, or DNS client to the recommended FreeDNS DoH URL." />
             <Step number="2" text="Use standard RFC 8484 GET with dns= or POST with application/dns-message." />
-            <Step number="3" text="For public deployments, add a platform-level firewall/rate-limit rule for the DoH paths." />
+            <Step number="3" text="Check it works by resolving a domain through your client. Fair-use rate limits apply per source IP." />
           </div>
         </section>
 
