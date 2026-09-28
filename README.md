@@ -35,15 +35,15 @@ Client
   +--> Node.js `proxy.ts`
   |      |
   |      +--> match `/api/doh/*`
-  |      +--> enforce 100 requests / 60 seconds per source IP
+  |      +--> enforce 600 requests / 60 seconds per source IP (RATE_LIMIT_PER_MINUTE)
   |      +--> return 429 when the process-local rate window is exceeded
   |      |
   |      +--> continue to the Next.js Route Handler
   |
   +--> GET/POST /api/doh/dns-query
   |      |
-  |      +--> enforce 32-request in-flight ceiling
-  |      |      +--> return 503 when 32 requests are active
+  |      +--> enforce 32-request (8 per client IP) in-flight ceiling
+  |      |      +--> return 503 when a ceiling is reached
   |      +--> validate DNS wire message
   |      +--> select rotated HaGeZi order
   |      +--> sequential upstream fetch
@@ -52,15 +52,15 @@ Client
   |
   +--> GET/POST /api/doh/<provider>/dns-query
          |
-         +--> enforce 32-request in-flight ceiling
-         |      +--> return 503 when 32 requests are active
+         +--> enforce 32-request (8 per client IP) in-flight ceiling
+         |      +--> return 503 when a ceiling is reached
          +--> validate DNS wire message
          +--> use one fixed provider upstream
          +--> validate response + match ID/Question
          +--> return application/dns-message
 ```
 
-The implementation is intentionally small: there is no local DNS cache and no arbitrary proxy target. Public DoH requests use fixed upstreams, bounded message handling, sequential failover, a process-local request-rate limit, and a process-local in-flight ceiling.
+The implementation is intentionally small: there is no server-side DNS cache (for GET, the upstream `max-age` is relayed as `private, max-age=N`, capped at 300 s, so clients can cache) and no arbitrary proxy target. Public DoH requests use fixed upstreams, bounded message handling, sequential failover, a process-local request-rate limit, and a process-local in-flight ceiling.
 
 ## API behavior
 
@@ -104,16 +104,18 @@ The starting position rotates periodically, but each request still has a determi
 
 The application uses two process-local protections before expensive upstream work begins.
 
-The first is a **100 requests per 60 seconds per source IP** fixed window in `proxy.ts`. It applies to `/api/doh/*`; requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
+The first is a **600 requests per 60 seconds per source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`. It applies to `/api/doh/*`; requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
 
-The second is a **32-request in-flight ceiling** in the DoH handler. This includes slow POST-body reads and upstream waits, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
+The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler. POST bodies must arrive within 1 second. This includes slow POST-body reads and upstream waits, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
 
-The in-flight ceiling and request-rate limiter are process-local. Platform-level WAF, firewall, connection, or traffic controls can still provide cross-instance protection when required.
+The in-flight ceilings, circuit breakers and request-rate limiter are process-local (on serverless hosts such as Vercel or Netlify each instance has its own copy, so treat them as best-effort and use a platform WAF for hard limits). Platform-level WAF, firewall, connection, or traffic controls can still provide cross-instance protection when required.
 
 ## Configuration
 
 | Variable | Description | Default |
 |---|---|---|
+| `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. | `600` |
+| `HAGEZI_ROTATION_MODE` | Set to `request` to round-robin the primary HaGeZi resolver per request instead of per time slot. | time slot |
 | `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds. | `1800` |
 | `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | platform-derived or `http://localhost:3000`; Docker image: `http://localhost:8367` |
 
@@ -126,7 +128,7 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 - Only fixed, compiled-in upstream URLs are forwarded; arbitrary/custom upstream targets and redirects are not supported.
 - Request and response sizes are explicitly bounded to keep memory use predictable.
 - Response validation rejects malformed or mismatched DNS answers before relay.
-- All DoH responses use `Cache-Control: no-store` and do not implement an application DNS cache.
+- GET DoH responses relay a usable upstream `Cache-Control: max-age=N` as `private, max-age=N`, capped at 300 seconds. POST and error responses use `Cache-Control: no-store`. The proxy does not implement an application DNS cache.
 - The strict document CSP is applied only to the homepage; API responses carry `nosniff` and the other global security headers (a CSP has no effect on `application/dns-message` bodies).
 - A public DoH service can still consume significant bandwidth under abuse, so platform or gateway traffic controls remain important.
 
@@ -202,7 +204,7 @@ Runtime behavior should additionally be checked after deployment with:
 ✓ Oversized request                    → 413 / bounded rejection
 ✓ Unsupported POST content type        → 415
 ✓ In-flight overload protection         → 503 once 32 requests are active
-✓ Request rate limiting                  → 100 req / 60 s per source IP
+✓ Request rate limiting                  → 600 req / 60 s per source IP (configurable)
 ✓ Upstream failure                     → bounded sequential failover
 ✓ No intentional DNS response caching
 ```
@@ -223,34 +225,36 @@ https://<your-domain>/api/doh/cloudflare/dns-query
 
 The examples above use a placeholder deployment hostname; service-specific live endpoints may be listed separately when intentionally maintained.
 
-## License
-
-AGPL-3.0
-
 ## Repository
 
 https://github.com/anT0ny54/doh_proxy
 
-## Related services
+## 🌐 Free DNS Services
 
-| Service | DNS-over-HTTPS URL |
-| --- | --- |
-| HaGeZi Multi Pro + TIF (this project, Vercel) | `https://dns-pi.vercel.app/api/doh/dns-query` |
-| HaGeZi Multi Pro + TIF (this project, Netlify) | `https://dnssix.netlify.app/api/doh/dns-query` |
-| HaGeZi Multi Pro + TIF (alternate host) | `https://freedns.koyeb.app/dns-query` |
-| HaGeZi Multi Pro + TIF (alternate host) | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
-| HaGeZi Multi Pro + TIF (alternate host) | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
-## 🚀 Bandwidth Hero Server
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
 
-A lightweight image proxy designed to slash bandwidth usage and accelerate your browsing experience. 
+## ⚡ Bandwidth Hero Server
 
-Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to your device for faster loading and lower data consumption.
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 
-🖥️ **Try it out:** [Bandwidth Hero](https://bhserv.netlify.app/)
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
 
-## Support
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
 
-If you'd like to support development, donations are accepted at:
+## Supporting the Project
 
-**Bitcoin:** `1HntwKxyGCfnSGvGLMUTRAqLnTvLarAQP`
+If you find this project useful, donations are appreciated:
+
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
+## License
+
+See [`LICENSE`](LICENSE).

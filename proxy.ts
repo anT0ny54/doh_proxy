@@ -5,7 +5,8 @@
  * Next.js route. For multi-instance deployments, use a shared reverse-proxy
  * or WAF rate limiter so the limit is shared across instances.
  *
- * Limit: 100 requests per 60 seconds per source IP.
+ * Limit: 600 requests per 60 seconds per source IP by default (override with
+ * RATE_LIMIT_PER_MINUTE). IPv6 clients are keyed by /64.
  *
  * IMPORTANT: When running behind a reverse proxy, configure that proxy to
  * sanitize X-Forwarded-For/X-Real-IP. Otherwise clients may spoof the IP.
@@ -19,27 +20,18 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { RateLimiter } from "./src/lib/rate-limit";
+import { getClientIp } from "./src/lib/client-ip";
+import { RateLimiter, WINDOW_LIMIT } from "./src/lib/rate-limit";
 
-// Header values are attacker-controlled; bound them so the bucket keys (and
-// therefore memory) stay small. 64 covers the longest textual IPv6 address.
-const MAX_IP_LENGTH = 64;
-
-const limiter = new RateLimiter();
-
-function getClientIp(request: NextRequest): string | undefined {
-  // Prefer X-Real-IP when supplied by a trusted reverse proxy.
-  const realIp = request.headers.get("x-real-ip")?.trim();
-  if (realIp) return realIp.slice(0, MAX_IP_LENGTH);
-
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim();
-  if (forwarded) return forwarded.slice(0, MAX_IP_LENGTH);
-
-  return undefined;
+function readLimit(): number {
+  const configured = Number(process.env.RATE_LIMIT_PER_MINUTE?.trim());
+  return Number.isInteger(configured) && configured > 0 ? configured : WINDOW_LIMIT;
 }
 
+const limiter = new RateLimiter(readLimit());
+
 export default function proxy(request: NextRequest) {
-  const ip = getClientIp(request);
+  const ip = getClientIp(request.headers);
   if (ip === undefined) return NextResponse.next();
 
   // Rate-limit strictly by source IP. Including Host lets one client fragment
@@ -54,6 +46,7 @@ export default function proxy(request: NextRequest) {
         "Retry-After": String(result.retryAfterSeconds),
         // Browser-based DoH clients need CORS headers to read the 429.
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Retry-After",
       },
     });
   }
