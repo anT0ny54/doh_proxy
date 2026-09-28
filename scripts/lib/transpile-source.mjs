@@ -25,7 +25,7 @@ export function toDataUrl(source, filename) {
 export async function importTypeScript(path, baseUrl, importMap = {}, filename = path) {
   let source = await readFile(new URL(path, baseUrl), "utf8");
   for (const [from, to] of Object.entries(importMap)) {
-    source = source.replace(`from "${from}"`, `from "${to}"`);
+    source = source.replaceAll(`from "${from}"`, `from "${to}"`);
   }
   return import(toDataUrl(source, filename));
 }
