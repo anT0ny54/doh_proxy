@@ -236,10 +236,8 @@ function releaseInFlight(ip: string | undefined): void {
 }
 
 function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
-  if (request.method === "OPTIONS") return emptyResponse();
-
   // RFC 9110: a 204 response must not include Content-Length.
-  if (request.method === "HEAD") return emptyResponse();
+  if (request.method === "OPTIONS" || request.method === "HEAD") return emptyResponse();
 
   if (request.method !== "GET" && request.method !== "POST") {
     const result = textResponse("Method Not Allowed", 405);
