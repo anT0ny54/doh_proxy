@@ -21,10 +21,10 @@ export class NextResponse {
 }
 `, "next-server-stub.ts");
 
-const proxy = await importTypeScript("../proxy.ts", import.meta.url, {
+const proxy = await importTypeScript("../src/proxy.ts", import.meta.url, {
   "next/server": nextServerUrl,
-  "./src/lib/rate-limit": rateLimitUrl,
-  "./src/lib/client-ip": clientIpUrl,
+  "./lib/rate-limit": rateLimitUrl,
+  "./lib/client-ip": clientIpUrl,
 });
 
 function request(ip, host) {
