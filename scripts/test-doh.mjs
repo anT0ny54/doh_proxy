@@ -1,24 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import ts from "typescript";
-
-function toDataUrl(source, filename) {
-  const { outputText } = ts.transpileModule(source, {
-    fileName: filename,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.ESNext,
-    },
-  });
-  return `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
-}
+import { importTypeScript, toDataUrl } from "./lib/transpile-source.mjs";
 
 const dnsSource = await readFile(new URL("../src/lib/dns.ts", import.meta.url), "utf8");
 const providersSource = await readFile(new URL("../src/lib/providers.ts", import.meta.url), "utf8");
 const upstreamsSource = await readFile(new URL("../src/lib/upstreams.ts", import.meta.url), "utf8");
-let dohSource = await readFile(new URL("../src/lib/doh.ts", import.meta.url), "utf8");
-
+const clientIpSource = await readFile(new URL("../src/lib/client-ip.ts", import.meta.url), "utf8");
+const clientIpUrl = toDataUrl(clientIpSource, "client-ip.ts");
 const dnsUrl = toDataUrl(dnsSource, "dns.ts");
 const providersUrl = toDataUrl(providersSource, "providers.ts");
 const upstreamsUrl = toDataUrl(upstreamsSource, "upstreams.ts");
@@ -44,13 +33,13 @@ export class NextResponse {
 `;
 const nextServerUrl = toDataUrl(nextServerSource, "next-server-stub.ts");
 
-dohSource = dohSource
-  .replace('from "next/server"', `from "${nextServerUrl}"`)
-  .replace('from "@/lib/providers"', `from "${providersUrl}"`)
-  .replace('from "@/lib/dns"', `from "${dnsUrl}"`)
-  .replace('from "@/lib/upstreams"', `from "${upstreamsUrl}"`);
-
-const doh = await import(toDataUrl(dohSource, "doh.ts"));
+const doh = await importTypeScript("../src/lib/doh.ts", import.meta.url, {
+  "next/server": nextServerUrl,
+  "@/lib/providers": providersUrl,
+  "@/lib/dns": dnsUrl,
+  "@/lib/client-ip": clientIpUrl,
+  "@/lib/upstreams": upstreamsUrl,
+});
 
 function validQuery(id = 0x1234) {
   return Uint8Array.from([
@@ -420,7 +409,7 @@ try {
     const primaryRoute = await readFile(new URL("../src/app/api/doh/dns-query/route.ts", import.meta.url), "utf8");
     const providerRoute = await readFile(new URL("../src/app/api/doh/[provider]/dns-query/route.ts", import.meta.url), "utf8");
     const dohSourceText = await readFile(new URL("../src/lib/doh.ts", import.meta.url), "utf8");
-    const timeoutMs = Number(/const HAGEZI_TIMEOUT_MS = ([\d_]+);/.exec(dohSourceText)?.[1].replaceAll("_", ""));
+    const timeoutMs = Number(/const DEFAULT_TIMEOUT_MS = ([\d_]+);/.exec(dohSourceText)?.[1].replaceAll("_", ""));
     for (const route of [primaryRoute, providerRoute]) {
       const maxDuration = Number(/export const maxDuration = (\d+);/.exec(route)?.[1]);
       assert.ok(Number.isFinite(maxDuration) && timeoutMs < maxDuration * 1_000, "app deadline must fit inside maxDuration");
@@ -497,6 +486,135 @@ try {
       if (saved === undefined) delete process.env.HAGEZI_ROTATION_SECONDS;
       else process.env.HAGEZI_ROTATION_SECONDS = saved;
     }
+  });
+  await test("DoH GET tolerates padded base64url dns parameter", async () => {
+    globalThis.fetch = async () =>
+      new Response(validResponse(), {
+        status: 200,
+        headers: { "content-type": "application/dns-message" },
+      });
+
+    const base64url = Buffer.from(validQuery()).toString("base64url");
+    const padding = "=".repeat((4 - (base64url.length % 4)) % 4);
+    const response = await doh.proxyRequest(
+      new Request(`https://proxy.test/api/doh/dns-query?dns=${base64url}${padding}`, { method: "GET" }),
+      { upstreams: [{ endpoint: "https://upstream.test/dns-query" }], timeoutMs: 100, failover: false },
+    );
+
+    assert.equal(response.status, 200);
+  });
+
+  await test("DoH relays an upstream rejection even when a later upstream fails", async () => {
+    let calls = 0;
+    globalThis.fetch = async (url) => {
+      calls += 1;
+      if (String(url).includes("blocked.test")) {
+        return new Response("egress blocked", { status: 403 });
+      }
+      return new Promise((_resolve, reject) => setTimeout(() => reject(new Error("network down")), 25));
+    };
+
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [
+        { endpoint: "https://blocked.test/dns-query" },
+        { endpoint: "https://slow.test/dns-query" },
+      ],
+      timeoutMs: 5_000,
+      failover: true,
+    });
+
+    assert.equal(calls, 2);
+    assert.equal(response.status, 403);
+    assert.match(await response.text(), /rejected/);
+  });
+
+  await test("GET relays a capped upstream max-age as private; POST stays no-store", async () => {
+    globalThis.fetch = async () =>
+      new Response(validResponse(), {
+        status: 200,
+        headers: { "content-type": "application/dns-message", "cache-control": "max-age=86400" },
+      });
+    const options = { upstreams: [{ endpoint: "https://cache-hint.test/dns-query" }], timeoutMs: 500, failover: false };
+    const get = await doh.proxyRequest(getRequest(), options);
+    assert.equal(get.headers.get("cache-control"), "private, max-age=300");
+    const post = await doh.proxyRequest(postRequest(new Blob([validQuery()]).stream()), options);
+    assert.match(post.headers.get("cache-control"), /no-store/);
+    assert.equal(get.headers.get("x-doh-proxy-version"), null);
+  });
+
+  await test("Failover hands unused budget to later upstreams", async () => {
+    let lastTimeout = 0;
+    globalThis.fetch = async (url, init) => {
+      const host = new URL(String(url)).hostname;
+      if (host !== "last.test") return new Response("no", { status: 403 });
+      const started = Date.now();
+      await new Promise((resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          lastTimeout = Date.now() - started;
+          reject(new Error("aborted"));
+        });
+      });
+    };
+    await doh.proxyRequest(getRequest(), {
+      upstreams: [
+        { endpoint: "https://a.test/dns-query" },
+        { endpoint: "https://b.test/dns-query" },
+        { endpoint: "https://last.test/dns-query" },
+      ],
+      timeoutMs: 2_400,
+      failover: true,
+    });
+    assert.ok(lastTimeout > 1_500, `last upstream should get the remaining budget, got ${lastTimeout} ms`);
+  });
+
+  await test("Half-open breaker lets exactly one concurrent probe through", async () => {
+    let hits = 0;
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    let healthy = false;
+    globalThis.fetch = async () => {
+      hits += 1;
+      if (!healthy) return new Response("x", { status: 503 });
+      await gate;
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const options = { upstreams: [{ endpoint: "https://probe-once.test/dns-query" }, { endpoint: "https://probe-other.test/dns-query" }], timeoutMs: 500, failover: true };
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options);
+      now += 31_000;
+      healthy = true;
+      hits = 0;
+      const inflight = [doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options)];
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(hits, 3, "one probe on the recovering upstream plus one call each on the healthy fallback");
+      release();
+      await Promise.all(inflight);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test("One client IP cannot hold more than its share of in-flight slots", async () => {
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    globalThis.fetch = async () => {
+      await gate;
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const options = { upstreams: [{ endpoint: "https://per-ip.test/dns-query" }], timeoutMs: 2_000, failover: false };
+    const withIp = (ip) => {
+      const base = getRequest();
+      return new Request(base.url, { headers: { "x-real-ip": ip } });
+    };
+    const held = Array.from({ length: doh.MAX_IN_FLIGHT_PER_IP }, () => doh.proxyRequest(withIp("192.0.2.50"), options));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await doh.proxyRequest(withIp("192.0.2.50"), options)).status, 503);
+    release();
+    assert.ok((await Promise.all(held)).every((response) => response.status === 200));
+    assert.equal((await doh.proxyRequest(withIp("192.0.2.50"), options)).status, 200);
   });
 } finally {
   globalThis.fetch = originalFetch;

@@ -1,24 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import ts from "typescript";
-
-function toDataUrl(source, filename) {
-  const { outputText } = ts.transpileModule(source, {
-    fileName: filename,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.ESNext,
-    },
-  });
-  return `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
-}
+import { importTypeScript, toDataUrl } from "./lib/transpile-source.mjs";
 
 const dnsSource = await readFile(new URL("../src/lib/dns.ts", import.meta.url), "utf8");
 const providersSource = await readFile(new URL("../src/lib/providers.ts", import.meta.url), "utf8");
 const upstreamsSource = await readFile(new URL("../src/lib/upstreams.ts", import.meta.url), "utf8");
-let dohSource = await readFile(new URL("../src/lib/doh.ts", import.meta.url), "utf8");
-
+const clientIpSource = await readFile(new URL("../src/lib/client-ip.ts", import.meta.url), "utf8");
+const clientIpUrl = toDataUrl(clientIpSource, "client-ip.ts");
 const dnsUrl = toDataUrl(dnsSource, "dns.ts");
 const providersUrl = toDataUrl(providersSource, "providers.ts");
 const upstreamsUrl = toDataUrl(upstreamsSource, "upstreams.ts");
@@ -36,13 +25,13 @@ export class NextResponse {
 }
 `, "next-server-stub.ts");
 
-dohSource = dohSource
-  .replace('from "next/server"', `from "${nextServerUrl}"`)
-  .replace('from "@/lib/providers"', `from "${providersUrl}"`)
-  .replace('from "@/lib/dns"', `from "${dnsUrl}"`)
-  .replace('from "@/lib/upstreams"', `from "${upstreamsUrl}"`);
-
-const doh = await import(toDataUrl(dohSource, "doh.ts"));
+const doh = await importTypeScript("../src/lib/doh.ts", import.meta.url, {
+  "next/server": nextServerUrl,
+  "@/lib/providers": providersUrl,
+  "@/lib/dns": dnsUrl,
+  "@/lib/client-ip": clientIpUrl,
+  "@/lib/upstreams": upstreamsUrl,
+});
 
 function validQuery() {
   return Uint8Array.from([

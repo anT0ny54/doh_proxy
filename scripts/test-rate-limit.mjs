@@ -1,13 +1,8 @@
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import ts from "typescript";
+import { importTypeScript } from "./lib/transpile-source.mjs";
 
-const source = await readFile(new URL("../src/lib/rate-limit.ts", import.meta.url), "utf8");
-const { outputText } = ts.transpileModule(source, {
-  compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext },
-});
-const { RateLimiter } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`);
+const { RateLimiter } = await importTypeScript("../src/lib/rate-limit.ts", import.meta.url);
 
 test("allows up to the limit, then limits with a bounded Retry-After", () => {
   const limiter = new RateLimiter(3, 60_000, 100);
