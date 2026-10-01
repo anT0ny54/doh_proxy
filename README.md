@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js and the Node.js runtime. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover, and bounded request handling in the Next.js Node.js runtime.
+A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js and the Node.js runtime. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
 
 ## What this project provides
 
@@ -47,6 +47,7 @@ Client
   |      +--> validate DNS wire message
   |      +--> select rotated HaGeZi order
   |      +--> sequential upstream fetch
+  |      +--> skip upstreams whose circuit breaker is open
   |      +--> validate response + match ID/Question
   |      +--> return application/dns-message
   |
@@ -79,8 +80,10 @@ Request handling is bounded:
 - Upstream response bodies are read the same way (64 KiB cap plus the upstream deadline).
 - The primary HaGeZi path uses a **2.5 second** application deadline, inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
-- On the primary endpoint, any failed attempt (timeout, network error, 4xx/5xx, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream; if none answers, the last upstream rejection status (or `502`) is returned. The proxy never launches the full failover set concurrently.
-- An attempt is skipped when less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
+- The remaining deadline is shared across the attempts still to come, with each attempt getting at least 750 ms (or whatever is left).
+- On the primary endpoint, any failed attempt (timeout, network error, 4xx/5xx, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (for example `403` or `404`) is returned; timeouts, network errors, invalid bodies and retryable statuses (408, 425, 429, 500, 502, 503, 504) end as `502`. The proxy never launches the full failover set concurrently.
+- Failover stops (no further attempt is made) once less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
+- **Circuit breaker:** an upstream that fails 3 times in a row with a timeout, network error or retryable status is skipped for 30 seconds, after which a single probe request is allowed through (a stuck probe is released after 5 seconds). If every upstream is open, they are all tried anyway. Client-influenced outcomes (upstream 4xx, invalid bodies) never count toward the breaker. State is per process.
 
 DNS validation checks message size, header flags/opcode, exactly one Question, section boundaries, name encoding, backward compression pointers, and the complete message structure. Upstream responses must be `200 application/dns-message`, structurally valid, and match the original query transaction ID and Question section before they are relayed.
 
@@ -106,9 +109,11 @@ The application uses two process-local protections before expensive upstream wor
 
 The first is a **600 requests per 60 seconds per source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`. It applies to `/api/doh/*`; requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
 
-The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler. POST bodies must arrive within 1 second. This includes slow POST-body reads and upstream waits, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
+The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler. POST bodies must arrive within 1 second (or the request deadline, if shorter), and upstream waits are bounded by the request deadline, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
 
 The in-flight ceilings, circuit breakers and request-rate limiter are process-local (on serverless hosts such as Vercel or Netlify each instance has its own copy, so treat them as best-effort and use a platform WAF for hard limits). Platform-level WAF, firewall, connection, or traffic controls can still provide cross-instance protection when required.
+
+Requests without a usable `X-Real-IP` / `X-Forwarded-For` header (for example a container exposed directly) have an unknown client address: they are **not** rate limited and only count against the global in-flight ceiling. Put a reverse proxy or WAF in front for per-client limiting. `X-Real-IP` is preferred; otherwise the **last** `X-Forwarded-For` entry (the one added by the trusted proxy) is used.
 
 ## Configuration
 
@@ -151,7 +156,7 @@ docker build --build-arg NEXT_PUBLIC_SITE_URL=https://dns.example.com -t doh-pro
 docker run --rm -p 8367:8367 doh-proxy
 ```
 
-The Docker image uses Next.js standalone output and starts the generated server with:
+The Docker image (`node:22-alpine`, non-root `node` user, `NODE_OPTIONS=--max-old-space-size=320`, `PORT=8367`) uses Next.js standalone output, has a `HEALTHCHECK` on `/`, and starts the generated server with:
 
 ```text
 node server.js
@@ -165,6 +170,8 @@ node server.js
 npm install
 npm run dev
 ```
+
+See [`CHANGELOG.md`](CHANGELOG.md) for release history. `PROXY_VERSION` in `src/lib/doh.ts` must match `package.json` (enforced by `npm test`).
 
 Useful commands:
 
@@ -205,7 +212,7 @@ Runtime behavior should additionally be checked after deployment with:
 ✓ Unsupported POST content type        → 415
 ✓ In-flight overload protection         → 503 once 32 requests are active
 ✓ Request rate limiting                  → 600 req / 60 s per source IP (configurable)
-✓ Upstream failure                     → bounded sequential failover
+✓ Upstream failure                     → bounded sequential failover (502 if none answers)
 ✓ No intentional DNS response caching
 ```
 

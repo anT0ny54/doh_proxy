@@ -24,7 +24,6 @@ const isManagedPlatformBuild = Boolean(process.env.VERCEL) || Boolean(process.en
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
-  compress: true,
   output: isManagedPlatformBuild ? undefined : "standalone",
   async headers() {
     return [
