@@ -190,7 +190,9 @@ export function parseQuery(message: Uint8Array): ParsedQuery | null {
 /** Compares the response question to the query key without allocating. */
 function questionMatches(message: Uint8Array, range: QuestionRange, query: ParsedQuery): boolean {
   const length = range.end - 12;
-  if (length !== query.key.byteLength) return false;
+  // Same total length is not enough: the name/type boundary must line up too,
+  // otherwise type/class bytes could be case-folded as if they were name bytes.
+  if (length !== query.key.byteLength || range.typeOffset - 12 !== query.nameLength) return false;
 
   for (let i = 0; i < length; i += 1) {
     let value = message[12 + i];

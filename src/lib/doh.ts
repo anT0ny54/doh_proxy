@@ -11,7 +11,7 @@ import {
 } from "@/lib/dns";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-export const PROXY_VERSION = "2.8.0";
+export const PROXY_VERSION = "2.8.1";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
@@ -585,10 +585,12 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
       const result = upstreamFetch.response;
 
       try {
-        // Only retryable availability problems (timeouts, network errors, and
-        // retryable upstream statuses) count toward the breaker. Client-influenced outcomes — upstream 4xx,
-        // oversized or otherwise rejected responses — must not let one caller
-        // take an upstream offline for everybody.
+        // Only retryable availability problems (timeouts, network errors and
+        // retryable upstream statuses) count toward the breaker. Client-influenced
+        // outcomes (upstream 4xx, oversized or otherwise rejected responses) must
+        // not let one caller take an upstream offline for everybody. Retryable
+        // statuses are not retained for relay: if every upstream fails that way
+        // the client gets a generic 502.
         if (result.status !== 200) {
           cancelResponseBody(result);
           if (RETRYABLE_UPSTREAM_STATUSES.has(result.status)) {
