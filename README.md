@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js and the Node.js runtime. The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
+A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js 16, React 19, Tailwind CSS 4 and TypeScript 6 on the Node.js runtime (Node.js 22 or newer). The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
 
 ## What this project provides
 
@@ -27,14 +27,32 @@ These routes are for testing or using a specific compiled-in upstream through th
 
 Provider routes do **not** accept arbitrary upstream URLs and do not use the HaGeZi failover list.
 
+## Project layout
+
+```text
+src/proxy.ts                       Rate limiter entry point (Next.js proxy, matcher: /api/doh/:path*)
+src/app/api/doh/dns-query/         Primary HaGeZi endpoint (GET/POST/HEAD/OPTIONS)
+src/app/api/doh/[provider]/        Fixed provider endpoints (GET/POST/HEAD/OPTIONS)
+src/app/page.tsx                   Static homepage listing the endpoints
+src/lib/doh.ts                     Request handling, failover, circuit breaker, in-flight limits
+src/lib/dns.ts                     DNS wire-format validation and query/response matching
+src/lib/rate-limit.ts              In-process fixed-window limiter
+src/lib/client-ip.ts               Client IP extraction and normalization
+src/lib/providers.ts               Fixed provider upstreams
+src/lib/upstreams.ts               Fixed HaGeZi upstreams
+src/lib/site.ts                    Public origin resolution, repository URL, copyright year
+scripts/                           node:test suites (no build step needed)
+```
+
 ## Runtime architecture
 
 ```text
 Client
   |
-  +--> Node.js `proxy.ts`
+  +--> Node.js `src/proxy.ts`
   |      |
-  |      +--> match `/api/doh/*`
+  |      +--> match `/api/doh/*` (all methods, including HEAD/OPTIONS)
+  |      +--> skip limiting when no usable client IP header is present
   |      +--> enforce 600 requests / 60 seconds per source IP (RATE_LIMIT_PER_MINUTE)
   |      +--> return 429 when the process-local rate window is exceeded
   |      |
@@ -42,6 +60,7 @@ Client
   |
   +--> GET/POST /api/doh/dns-query
   |      |
+  |      +--> HEAD/OPTIONS -> 204 (no upstream work, no in-flight slot)
   |      +--> enforce 32-request (8 per client IP) in-flight ceiling
   |      |      +--> return 503 when a ceiling is reached
   |      +--> validate DNS wire message
@@ -53,10 +72,12 @@ Client
   |
   +--> GET/POST /api/doh/<provider>/dns-query
          |
+         +--> unknown provider id -> 404
+         +--> HEAD/OPTIONS -> 204 (no upstream work, no in-flight slot)
          +--> enforce 32-request (8 per client IP) in-flight ceiling
          |      +--> return 503 when a ceiling is reached
          +--> validate DNS wire message
-         +--> use one fixed provider upstream
+         +--> use one fixed provider upstream (no failover)
          +--> validate response + match ID/Question
          +--> return application/dns-message
 ```
@@ -67,10 +88,13 @@ The implementation is intentionally small: there is no server-side DNS cache (fo
 
 The proxy implements the RFC 8484 DoH request format:
 
-- **GET** uses the `dns` query parameter containing a base64url-encoded DNS wire message.
+- **GET** uses the `dns` query parameter containing a base64url-encoded DNS wire message. Optional `=` padding is accepted and stripped before the query is forwarded upstream.
 - **POST** uses the raw DNS wire message with `Content-Type: application/dns-message`.
 - **HEAD** and **OPTIONS** return `204` for health checks and CORS preflight.
-- Unsupported methods are handled by the Next.js route and return `405`.
+- Unsupported methods return `405`: the route files only export GET, POST, HEAD and OPTIONS, so Next.js answers other methods itself.
+- An unknown provider id on `/api/doh/<provider>/dns-query` returns `404`.
+- Responses carry permissive CORS headers (`Access-Control-Allow-Origin: *`, methods `GET, POST, HEAD, OPTIONS`, exposed header `Retry-After`), including the `429` returned by the rate limiter.
+- Upstream requests are sent with `User-Agent: FreeDNS-DoH/<version>` (`PROXY_VERSION`), `Accept: application/dns-message`, `cache: no-store` and `redirect: error`.
 
 Request handling is bounded:
 
@@ -78,10 +102,10 @@ Request handling is bounded:
 - GET query strings are capped at **8192 characters**.
 - POST bodies are read as a stream with a running 4 KiB cap; the read is aborted as soon as the cap or the request deadline is exceeded.
 - Upstream response bodies are read the same way (64 KiB cap plus the upstream deadline).
-- The primary HaGeZi path uses a **2.5 second** application deadline, inside the 5 second route `maxDuration`.
+- Both routes use a **2.5 second** application deadline (`DEFAULT_TIMEOUT_MS`), inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
 - The remaining deadline is shared across the attempts still to come, with each attempt getting at least 750 ms (or whatever is left).
-- On the primary endpoint, any failed attempt (timeout, network error, 4xx/5xx, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (for example `403` or `404`) is returned; timeouts, network errors, invalid bodies and retryable statuses (408, 425, 429, 500, 502, 503, 504) end as `502`. The proxy never launches the full failover set concurrently.
+- On the primary endpoint, any failed attempt (timeout, network error, 4xx/5xx, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (for example `403` or `404`) is returned; timeouts, network errors, invalid bodies, retryable statuses (408, 425, 429, 500, 502, 503, 504) and non-error statuses such as `204` or `3xx` end as `502`. The proxy never launches the full failover set concurrently.
 - Failover stops (no further attempt is made) once less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
 - **Circuit breaker:** an upstream that fails 3 times in a row with a timeout, network error or retryable status is skipped for 30 seconds, after which a single probe request is allowed through (a stuck probe is released after 5 seconds). If every upstream is open, they are all tried anyway. Client-influenced outcomes (upstream 4xx, invalid bodies) never count toward the breaker. State is per process.
 
@@ -107,9 +131,9 @@ The starting position rotates periodically, but each request still has a determi
 
 The application uses two process-local protections before expensive upstream work begins.
 
-The first is a **600 requests per 60 seconds per source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`. It applies to `/api/doh/*`; requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
+The first is a **600 requests per 60 seconds per source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`. It applies to every method on `/api/doh/*` (HEAD and OPTIONS count too); requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
 
-The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler. POST bodies must arrive within 1 second (or the request deadline, if shorter), and upstream waits are bounded by the request deadline, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
+The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler (HEAD/OPTIONS return before a slot is taken). POST bodies must arrive within 1 second (or the request deadline, if shorter), and upstream waits are bounded by the request deadline, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
 
 The in-flight ceilings, circuit breakers and request-rate limiter are process-local (on serverless hosts such as Vercel or Netlify each instance has its own copy, so treat them as best-effort and use a platform WAF for hard limits). Platform-level WAF, firewall, connection, or traffic controls can still provide cross-instance protection when required.
 
@@ -121,8 +145,8 @@ Requests without a usable `X-Real-IP` / `X-Forwarded-For` header (for example a 
 |---|---|---|
 | `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. | `600` |
 | `HAGEZI_ROTATION_MODE` | Set to `request` to round-robin the primary HaGeZi resolver per request instead of per time slot. | time slot |
-| `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds. | `1800` |
-| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | platform-derived or `http://localhost:3000`; Docker image: `http://localhost:8367` |
+| `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds; non-numeric values fall back to the default. | `1800` |
+| `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | derived from the platform (Netlify `URL`, or `DEPLOY_PRIME_URL` on non-production deploys; Vercel `VERCEL_PROJECT_PRODUCTION_URL`, or `VERCEL_URL` on previews), else `http://localhost:3000`; Docker image: `http://localhost:8367` |
 
 The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/lib/providers.ts` and `src/lib/upstreams.ts`; they are not configurable through request parameters.
 
@@ -134,7 +158,7 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 - Request and response sizes are explicitly bounded to keep memory use predictable.
 - Response validation rejects malformed or mismatched DNS answers before relay.
 - GET DoH responses relay a usable upstream `Cache-Control: max-age=N` as `private, max-age=N`, capped at 300 seconds. POST and error responses use `Cache-Control: no-store`. The proxy does not implement an application DNS cache.
-- The strict document CSP is applied only to the homepage; API responses carry `nosniff` and the other global security headers (a CSP has no effect on `application/dns-message` bodies).
+- The strict document CSP is applied only to the homepage. Every route (API included) gets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, a restrictive `Permissions-Policy` and `Cross-Origin-Resource-Policy: cross-origin`; the `X-Powered-By` header is disabled. A CSP has no effect on `application/dns-message` bodies.
 - A public DoH service can still consume significant bandwidth under abuse, so platform or gateway traffic controls remain important.
 
 ## Deployment
@@ -142,6 +166,8 @@ The provider endpoints and HaGeZi endpoint URLs are source-controlled in `src/li
 ### Managed Next.js hosting
 
 The DoH route handlers and `proxy.ts` run on the **Node.js runtime**. Deploy the repository using the platform's normal Next.js integration and configure any platform-level WAF/rate limiting as an additional outer layer when needed.
+
+`netlify.toml` pins `NODE_VERSION = 22` to match the Dockerfile and `package.json` `engines`. On Vercel/Netlify the build does not use standalone output.
 
 Verify:
 
@@ -162,7 +188,7 @@ The Docker image (`node:22-alpine`, non-root `node` user, `NODE_OPTIONS=--max-ol
 node server.js
 ```
 
-`next.config.ts` uses standalone output for self-hosted Node.js builds while allowing managed Vercel/Netlify builds to use their native Next.js output handling.
+`next.config.ts` uses standalone output unless the `VERCEL` or `NETLIFY` environment variable is set, so managed Vercel/Netlify builds use their native Next.js output handling. `NEXT_PUBLIC_SITE_URL` is inlined at build time, so it must be passed as a build argument.
 
 ## Development
 
@@ -170,6 +196,8 @@ node server.js
 npm install
 npm run dev
 ```
+
+Requires Node.js 22 or newer (`engines` in `package.json`).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for release history. `PROXY_VERSION` in `src/lib/doh.ts` must match `package.json` (enforced by `npm test`).
 
@@ -181,7 +209,7 @@ npm run lint
 npm run build
 ```
 
-`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation, redirect blocking), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP rate-limit tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`).
+`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation, redirect blocking, `PROXY_VERSION` / `package.json` sync, route `maxDuration` vs. app deadline), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP rate-limit tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`). The suites transpile the real `src/` TypeScript on the fly through `scripts/lib/transpile-source.mjs`; they need no build step.
 
 The project currently stays on the TypeScript 6.x line through the `package.json` dependency range; move to a newer major only alongside compatible Next.js ESLint tooling.
 
@@ -240,6 +268,8 @@ https://github.com/anT0ny54/doh_proxy
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
+These are separately deployed instances listed for convenience; they are not defined by this repository's code. This codebase serves its endpoint at `/api/doh/dns-query`; instances exposing a bare `/dns-query` path run behind their own routing.
+
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
@@ -264,4 +294,4 @@ If you find this project useful, donations are appreciated:
 
 ## License
 
-See [`LICENSE`](LICENSE).
+GNU Affero General Public License v3.0 (AGPL-3.0). See [`LICENSE`](LICENSE).
