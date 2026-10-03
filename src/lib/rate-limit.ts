@@ -1,5 +1,5 @@
 /**
- * Fixed-window, in-process rate limiter used by the root `proxy.ts`.
+ * Fixed-window, in-process rate limiter used by `src/proxy.ts`.
  *
  * Buckets are keyed by source IP and live in a `Map`, whose iteration order is insertion order. Every
  * bucket is (re)inserted at the moment its window starts, so the Map is ordered
@@ -16,7 +16,7 @@
 export const WINDOW_SIZE_MS = 60_000;
 // Generous default: one browser page load or household easily issues dozens of
 // DNS lookups per minute, and CGNAT/office clients share an IP. Override with
-// RATE_LIMIT_PER_MINUTE in proxy.ts.
+// RATE_LIMIT_PER_MINUTE (read in src/proxy.ts).
 export const WINDOW_LIMIT = 600;
 export const MAX_BUCKETS = 10_000;
 
