@@ -1,18 +1,11 @@
 @import "tailwindcss";
 
-html {
-  background: #f4f4f5;
-}
-
 body {
-  min-height: 100vh;
   background: #f4f4f5;
   color: #18181b;
 }
 
-button,
-input,
-select {
+button {
   touch-action: manipulation;
 }
 
