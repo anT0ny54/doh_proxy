@@ -44,14 +44,22 @@ export default function CopyButton({ value, label }: { value: string; label: str
     timer.current = window.setTimeout(() => setStatus("idle"), 1600);
   }
 
+  const text = status === "copied" ? "Copied" : status === "failed" ? "Copy failed" : "Copy";
+
   return (
-    <button
-      type="button"
-      onClick={copy}
-      className="min-h-11 shrink-0 rounded-xl border border-zinc-300 bg-zinc-900 px-4 text-sm font-medium text-white transition hover:bg-zinc-800 active:scale-[0.99]"
-      aria-label={label}
-    >
-      {status === "copied" ? "Copied" : status === "failed" ? "Copy failed" : "Copy"}
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={copy}
+        className="min-h-11 shrink-0 rounded-xl border border-zinc-300 bg-zinc-900 px-4 text-sm font-medium text-white transition hover:bg-zinc-800 active:scale-[0.99]"
+        aria-label={label}
+      >
+        {text}
+      </button>
+      {/* aria-label hides the visible text from assistive tech, so announce the result separately. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {status === "idle" ? "" : text}
+      </span>
+    </>
   );
 }
