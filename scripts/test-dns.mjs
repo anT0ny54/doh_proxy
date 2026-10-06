@@ -209,7 +209,6 @@ await test("DNS question name matching is case-insensitive", () => {
   response[qnameStart + 2] = 87;
   assert.equal(dns.isValidDnsResponse(response, validQuery), true);
 });
-    
 
 test("accepts a CNAME chain whose next owner name points into earlier RDATA", () => {
   const name = (...labels) => [...labels.flatMap((l) => [l.length, ...Buffer.from(l)]), 0];
@@ -222,7 +221,6 @@ test("accepts a CNAME chain whose next owner name points into earlier RDATA", ()
   const response = Uint8Array.from([0, 1, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0, ...question, ...cname, ...a]);
   assert.equal(dns.isValidDnsResponse(response, query), true);
 });
-
 
 test("rejects a compressed name whose expanded form exceeds 255 octets", () => {
   const label = (length, value = 97) => [length, ...new Uint8Array(length).fill(value)];
@@ -279,4 +277,19 @@ test("responses may exceed 4 KiB but queries may not", () => {
   };
   assert.equal(dns.isValidDnsQuery(padded(100)), true);
   assert.equal(dns.isValidDnsQuery(padded(4_100)), false);
+});
+
+test("parseQuery never modifies its input, even for Buffer views", () => {
+  // Mixed-case QNAME (0x20 encoding) so that case-folding would change bytes.
+  const mixed = Uint8Array.from(validQuery);
+  mixed[13] = 87; // 'W'
+  mixed[17] = 69; // 'E'
+  const asBuffer = Buffer.from(mixed);
+  const snapshot = Buffer.from(asBuffer);
+
+  const parsed = dns.parseQuery(asBuffer);
+  assert.ok(parsed);
+  assert.deepEqual(asBuffer, snapshot, "input bytes must be left untouched");
+  assert.equal(parsed.key[1], 119, "the match key is lower-cased");
+  assert.equal(dns.isValidDnsResponse(validResponse(mixed), parsed), true);
 });
