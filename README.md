@@ -60,7 +60,7 @@ Client
   |      |
   |      +--> match `/api/doh/*` (all methods, including HEAD/OPTIONS)
   |      +--> skip limiting when no usable client IP header is present
-  |      +--> enforce 600 requests / 60 seconds per identified source IP (RATE_LIMIT_PER_MINUTE)
+  |      +--> enforce 100 requests / 60 seconds per identified source IP (RATE_LIMIT_PER_MINUTE)
   |      +--> return 429 when the process-local rate window is exceeded
   |      |
   |      +--> continue to the Next.js Route Handler
@@ -134,7 +134,7 @@ The starting position rotates periodically, but each request still has a determi
 
 The application uses two process-local protections before expensive upstream work begins.
 
-The first is a **600 requests per 60 seconds per identified source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`, tracked in an in-memory map capped at 10,000 source keys (the oldest bucket is evicted first). It applies to every method on `/api/doh/*` (HEAD and OPTIONS count too); requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is local to each runtime instance. When no usable `X-Real-IP` or `X-Forwarded-For` address is available, the request is not per-client rate limited and continues to the route handler. Forwarding headers must therefore be sanitized by the front proxy when they are used to identify the client.
+The first is a **100 requests per 60 seconds per identified source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`, tracked in an in-memory map capped at 10,000 source keys (the oldest bucket is evicted first). It applies to every method on `/api/doh/*` (HEAD and OPTIONS count too); requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is local to each runtime instance. When no usable `X-Real-IP` or `X-Forwarded-For` address is available, the request is not per-client rate limited and continues to the route handler. Forwarding headers must therefore be sanitized by the front proxy when they are used to identify the client.
 
 The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler (HEAD/OPTIONS return before a slot is taken). POST bodies must arrive within 1 second (or the request deadline, if shorter), and upstream waits are bounded by the request deadline, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
 
@@ -146,7 +146,7 @@ Requests without a usable `X-Real-IP` / `X-Forwarded-For` header (for example a 
 
 | Variable | Description | Default |
 |---|---|---|
-| `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. | `600` |
+| `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. | `100` |
 | `HAGEZI_ROTATION_MODE` | Set to `request` to round-robin the primary HaGeZi resolver per request instead of per time slot. | time slot |
 | `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds; non-numeric values fall back to the default. | `1800` |
 | `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | derived from the platform (Netlify `URL`, or `DEPLOY_PRIME_URL` on non-production deploys; Vercel `VERCEL_PROJECT_PRODUCTION_URL`, or `VERCEL_URL` on previews), else `http://localhost:3000`; Docker image: `http://localhost:8367` |
