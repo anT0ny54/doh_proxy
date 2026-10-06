@@ -175,7 +175,10 @@ export function parseQuery(message: Uint8Array): ParsedQuery | null {
   const range = validateStructure(message, false);
   if (range === null) return null;
 
-  const key = message.slice(12, range.end);
+  // Always copy: Buffer#slice (the GET path passes a Buffer) returns a view, and
+  // the case-folding below would otherwise rewrite the caller's bytes in place.
+  const key = new Uint8Array(range.end - 12);
+  key.set(message.subarray(12, range.end));
   const nameLength = range.typeOffset - 12;
   // DNS names are case-insensitive. Only ASCII letters have DNS case-folding;
   // leave length/type/class bytes and non-ASCII octets untouched.
