@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight public DNS-over-HTTPS (DoH) proxy built with Next.js 16, React 19, Tailwind CSS 4 and TypeScript 6 on the Node.js runtime (Node.js 22 or newer). The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
+A lightweight DNS-over-HTTPS (DoH) proxy built with the Node.js runtime, using the Next.js 16, React 19, Tailwind CSS 4, and TypeScript 6 dependency lines declared in `package.json` (Node.js 22 or newer). The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
 
 ## What this project provides
 
@@ -34,6 +34,9 @@ src/proxy.ts                       Rate limiter entry point (Next.js proxy, matc
 src/app/api/doh/dns-query/         Primary HaGeZi endpoint (GET/POST/HEAD/OPTIONS)
 src/app/api/doh/[provider]/        Fixed provider endpoints (GET/POST/HEAD/OPTIONS)
 src/app/page.tsx                   Static homepage listing the endpoints
+src/app/layout.tsx                 Root layout, metadata and viewport
+src/app/globals.css, icon.svg      Tailwind entry stylesheet and favicon
+src/components/CopyButton.tsx      Client component: copy-to-clipboard button (with fallback)
 src/lib/doh.ts                     Request handling, failover, circuit breaker, in-flight limits
 src/lib/dns.ts                     DNS wire-format validation and query/response matching
 src/lib/rate-limit.ts              In-process fixed-window limiter
@@ -41,7 +44,11 @@ src/lib/client-ip.ts               Client IP extraction and normalization
 src/lib/providers.ts               Fixed provider upstreams
 src/lib/upstreams.ts               Fixed HaGeZi upstreams
 src/lib/site.ts                    Public origin resolution, repository URL, copyright year
-scripts/                           node:test suites (no build step needed)
+scripts/test-*.mjs                 node:test suites (no build step needed)
+scripts/lib/transpile-source.mjs   Test helper that transpiles src/ TypeScript on the fly
+Dockerfile, next.config.ts         Self-hosted standalone build, security headers
+netlify.toml                       Pins Node.js 22 for Netlify builds
+CHANGELOG.md                       Release history
 ```
 
 ## Runtime architecture
@@ -53,7 +60,7 @@ Client
   |      |
   |      +--> match `/api/doh/*` (all methods, including HEAD/OPTIONS)
   |      +--> skip limiting when no usable client IP header is present
-  |      +--> enforce 600 requests / 60 seconds per source IP (RATE_LIMIT_PER_MINUTE)
+  |      +--> enforce 600 requests / 60 seconds per identified source IP (RATE_LIMIT_PER_MINUTE)
   |      +--> return 429 when the process-local rate window is exceeded
   |      |
   |      +--> continue to the Next.js Route Handler
@@ -82,7 +89,7 @@ Client
          +--> return application/dns-message
 ```
 
-The implementation is intentionally small: there is no server-side DNS cache (for GET, the upstream `max-age` is relayed as `private, max-age=N`, capped at 300 s, so clients can cache) and no arbitrary proxy target. Public DoH requests use fixed upstreams, bounded message handling, sequential failover, a process-local request-rate limit, and a process-local in-flight ceiling.
+The implementation is intentionally small: there is no server-side DNS cache (for GET, an upstream `max-age` may be relayed as `private, max-age=N`, capped at 300 s, so clients can cache) and no arbitrary proxy target. Public DoH requests use fixed upstreams, bounded message handling, sequential failover, a process-local request-rate limit, and a process-local in-flight ceiling.
 
 ## API behavior
 
@@ -91,29 +98,25 @@ The proxy implements the RFC 8484 DoH request format:
 - **GET** uses the `dns` query parameter containing a base64url-encoded DNS wire message. Optional `=` padding is accepted and stripped before the query is forwarded upstream.
 - **POST** uses the raw DNS wire message with `Content-Type: application/dns-message`.
 - **HEAD** and **OPTIONS** return `204` for health checks and CORS preflight.
-- Unsupported methods return `405`: the route files only export GET, POST, HEAD and OPTIONS, so Next.js answers other methods itself.
+- Unsupported methods return `405`: the route files only export GET, POST, HEAD and OPTIONS, so Next.js answers other methods itself. `proxyRequest` additionally has a defensive `405` (with `Allow: GET, POST, HEAD, OPTIONS`) for callers that bypass the route files.
 - An unknown provider id on `/api/doh/<provider>/dns-query` returns `404`.
-- Responses carry permissive CORS headers (`Access-Control-Allow-Origin: *`, methods `GET, POST, HEAD, OPTIONS`, exposed header `Retry-After`), including the `429` returned by the rate limiter.
+- Responses from the DoH handler carry permissive CORS headers (`Access-Control-Allow-Origin: *`, methods `GET, POST, HEAD, OPTIONS`, headers `Accept, Content-Type, Cache-Control`, exposed header `Retry-After`). The `429` returned by the rate limiter carries only `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Retry-After`, which is enough for browser clients to read it.
 - Upstream requests are sent with `User-Agent: FreeDNS-DoH/<version>` (`PROXY_VERSION`), `Accept: application/dns-message`, `cache: no-store` and `redirect: error`.
 
 Request handling is bounded:
 
-- Client queries are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`); upstream responses at **64 KiB** (`MAX_DNS_RESPONSE_SIZE = 65535`, the RFC 8484 maximum).
+- Client queries are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`); upstream responses at **64 KiB** (`MAX_DNS_RESPONSE_SIZE = 65535`, the RFC 8484 maximum) so DNSSEC and large TXT answers, which routinely exceed 4 KiB, still work. Anything larger is rejected instead of being buffered without a bound.
 - GET query strings are capped at **8192 characters**.
 - POST bodies are read as a stream with a running 4 KiB cap; the read is aborted as soon as the cap or the request deadline is exceeded.
 - Upstream response bodies are read the same way (64 KiB cap plus the upstream deadline).
 - Both routes use a **2.5 second** application deadline (`DEFAULT_TIMEOUT_MS`), inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
-- The remaining deadline is shared across the attempts still to come, with each attempt getting at least 750 ms (or whatever is left).
-- On the primary endpoint, any failed attempt (timeout, network error, 4xx/5xx, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (for example `403` or `404`) is returned; timeouts, network errors, invalid bodies, retryable statuses (408, 425, 429, 500, 502, 503, 504) and non-error statuses such as `204` or `3xx` end as `502`. The proxy never launches the full failover set concurrently.
+- The remaining deadline is shared across the attempts still to come. The nominal failover slice is at least 750 ms, but an attempt is skipped when less than 100 ms remains.
+- On the primary endpoint, any failed attempt (timeout, network error, non-200 status, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (4xx/5xx other than 408, 425, 429, 500, 502, 503, 504; for example `403` or `404`) is returned as `DNS upstream rejected request`; it is kept even if a later attempt times out or fails with a retryable status. A non-200 status outside 400-599 (for example `204`) is recorded as a `502` rejection. Everything else (timeouts, network errors including blocked redirects, wrong content type, invalid, mismatched or oversized bodies, retryable statuses) ends as `502 DNS upstream unavailable`. Provider routes try exactly one upstream. The proxy never launches the full failover set concurrently.
 - Failover stops (no further attempt is made) once less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
-- **Circuit breaker:** an upstream that fails 3 times in a row with a timeout, network error or retryable status is skipped for 30 seconds, after which a single probe request is allowed through (a stuck probe is released after 5 seconds). If every upstream is open, they are all tried anyway. Client-influenced outcomes (upstream 4xx, invalid bodies) never count toward the breaker. State is per process.
+- **Circuit breaker:** an upstream that accumulates 3 failures (timeout, network error or retryable status: 408, 425, 429, 500, 502, 503 or 504) without an intervening success is skipped for 30 seconds, after which one half-open probe is allowed. A stuck probe is released after 5 seconds. If every upstream is open, the set is still probed. Non-retryable upstream statuses and invalid/wrong-content-type responses do not increment the breaker. State is per process.
 
 DNS validation checks message size, header flags/opcode, exactly one Question, section boundaries, name encoding, backward compression pointers, and the complete message structure. Upstream responses must be `200 application/dns-message`, structurally valid, and match the original query transaction ID and Question section before they are relayed.
-
-### Size limits
-
-Queries are limited to 4 KiB and responses to 64 KiB so memory and bandwidth stay bounded while DNSSEC and large TXT answers (which routinely exceed 4 KiB) still work. Anything larger is rejected instead of being buffered without a bound.
 
 ## Primary upstreams
 
@@ -131,7 +134,7 @@ The starting position rotates periodically, but each request still has a determi
 
 The application uses two process-local protections before expensive upstream work begins.
 
-The first is a **600 requests per 60 seconds per source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`. It applies to every method on `/api/doh/*` (HEAD and OPTIONS count too); requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is intentionally local to each runtime instance, and forwarding headers must be sanitized by the front proxy when they are used to identify the client.
+The first is a **600 requests per 60 seconds per identified source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`, tracked in an in-memory map capped at 10,000 source keys (the oldest bucket is evicted first). It applies to every method on `/api/doh/*` (HEAD and OPTIONS count too); requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is local to each runtime instance. When no usable `X-Real-IP` or `X-Forwarded-For` address is available, the request is not per-client rate limited and continues to the route handler. Forwarding headers must therefore be sanitized by the front proxy when they are used to identify the client.
 
 The second is a **32-request in-flight ceiling** (at most 8 per identified client IP) in the DoH handler (HEAD/OPTIONS return before a slot is taken). POST bodies must arrive within 1 second (or the request deadline, if shorter), and upstream waits are bounded by the request deadline, so stalled clients cannot consume the whole Node.js process. Requests that arrive after the ceiling is reached receive `503 Service Unavailable` with `Retry-After: 1` rather than waiting in an unbounded queue.
 
@@ -190,6 +193,8 @@ node server.js
 
 `next.config.ts` uses standalone output unless the `VERCEL` or `NETLIFY` environment variable is set, so managed Vercel/Netlify builds use their native Next.js output handling. `NEXT_PUBLIC_SITE_URL` is inlined at build time, so it must be passed as a build argument.
 
+For a self-hosted build outside Docker, run the generated server (`node .next/standalone/server.js`, after copying `.next/static` to `.next/standalone/.next/static` as the Dockerfile does) rather than `npm start`; `package.json`'s `start` script is plain `next start`, which is not meant for standalone output.
+
 ## Development
 
 ```bash
@@ -209,40 +214,33 @@ npm run lint
 npm run build
 ```
 
-`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`: failover, timeouts, circuit breaker, GET/POST validation, redirect blocking, `PROXY_VERSION` / `package.json` sync, route `maxDuration` vs. app deadline), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP rate-limit tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`). The suites transpile the real `src/` TypeScript on the fly through `scripts/lib/transpile-source.mjs`; they need no build step.
+`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`, including failover, timeouts, circuit breakers, GET/POST validation, redirect blocking, cache-control handling, version/config checks, and route deadline checks), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`). The suites transpile the real `src/` TypeScript on the fly through `scripts/lib/transpile-source.mjs`; they do not require a Next.js build.
 
 The project currently stays on the TypeScript 6.x line through the `package.json` dependency range; move to a newer major only alongside compatible Next.js ESLint tooling.
 
 ## Validation checklist
 
-The repository includes checks for:
+The repository includes automated checks for:
 
 ```text
-✓ Normal DNS query structure
-✓ Query/response message-type validation
-✓ First-question compression rejection
-✓ Backward compression handling
-✓ Forward / invalid compression rejection
-✓ DNS name length bounds
-✓ Response transaction-ID matching
-✓ Response Question matching
-✓ Case-insensitive DNS Question-name matching
+✓ DNS query/response structure and message-type validation
+✓ Compression-pointer direction and target validation
+✓ DNS name expansion length bounds
+✓ Response transaction-ID and Question matching, including case-insensitivity
+✓ parseQuery input immutability for Node Buffer views (0x20 preservation)
+✓ Queries up to 4 KiB and responses up to 65535 bytes
+✓ DoH GET/POST validation and padded base64url handling
+✓ Upstream redirect blocking, content-type validation and response validation
+✓ Sequential failover, retryable-status handling and bounded timeouts
+✓ Circuit-breaker open/half-open behavior
+✓ GET max-age relay and POST no-store behavior
+✓ Global/per-client in-flight ceilings
+✓ Proxy source-IP normalization and rate limiting
+✓ Rate-limiter expiry, capacity eviction and clock rollback handling
+✓ PROXY_VERSION/package.json synchronization and route deadline checks
 ```
 
-Runtime behavior should additionally be checked after deployment with:
-
-```text
-✓ HEAD /api/doh/dns-query              → 204
-✓ Valid GET ?dns=<base64url>           → 200 application/dns-message
-✓ Valid POST application/dns-message   → 200 application/dns-message
-✓ Invalid or missing GET dns           → 400
-✓ Oversized request                    → 413 / bounded rejection
-✓ Unsupported POST content type        → 415
-✓ In-flight overload protection         → 503 once 32 requests are active
-✓ Request rate limiting                  → 600 req / 60 s per source IP (configurable)
-✓ Upstream failure                     → bounded sequential failover (502 if none answers)
-✓ No intentional DNS response caching
-```
+For deployment, also verify the live endpoint with a real DoH client. The repository's automated tests use mocked upstreams and do not prove external resolver availability or platform-level rate limiting.
 
 ## Endpoint examples
 
