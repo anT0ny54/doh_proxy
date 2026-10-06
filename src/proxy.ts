@@ -5,7 +5,7 @@
  * Next.js route. For multi-instance deployments, use a shared reverse-proxy
  * or WAF rate limiter so the limit is shared across instances.
  *
- * Limit: 600 requests per 60 seconds per source IP by default (override with
+ * Limit: 100 requests per 60 seconds per source IP by default (override with
  * RATE_LIMIT_PER_MINUTE). IPv6 clients are keyed by /64.
  *
  * IMPORTANT: When running behind a reverse proxy, configure that proxy to
