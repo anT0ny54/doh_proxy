@@ -45,9 +45,14 @@ src/lib/providers.ts               Fixed provider upstreams
 src/lib/upstreams.ts               Fixed HaGeZi upstreams
 src/lib/site.ts                    Public origin resolution, repository URL, copyright year
 scripts/test-*.mjs                 node:test suites (no build step needed)
-scripts/lib/transpile-source.mjs   Test helper that transpiles src/ TypeScript on the fly
+scripts/lib/transpile-source.mjs   Test helper: transpiles src/ TypeScript on the fly, provides the
+                                   `next/server` stub and `importDoh()` loader shared by the suites
 Dockerfile, next.config.ts         Self-hosted standalone build, security headers
 netlify.toml                       Pins Node.js 22 for Netlify builds
+package.json, package-lock.json    Dependencies, scripts, `engines` (Node.js >=22)
+tsconfig.json, eslint.config.mjs,  TypeScript, ESLint and Tailwind/PostCSS configuration
+postcss.config.mjs
+LICENSE                            GNU AGPL-3.0
 CHANGELOG.md                       Release history
 ```
 
@@ -103,6 +108,24 @@ The proxy implements the RFC 8484 DoH request format:
 - Responses from the DoH handler carry permissive CORS headers (`Access-Control-Allow-Origin: *`, methods `GET, POST, HEAD, OPTIONS`, headers `Accept, Content-Type, Cache-Control`, exposed header `Retry-After`). The `429` returned by the rate limiter carries only `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Retry-After`, which is enough for browser clients to read it.
 - Upstream requests are sent with `User-Agent: FreeDNS-DoH/<version>` (`PROXY_VERSION`), `Accept: application/dns-message`, `cache: no-store` and `redirect: error`.
 
+Status codes returned by the proxy itself (error bodies are `text/plain`; a successful answer is `application/dns-message`; `204` has no body):
+
+| Status | When |
+|---|---|
+| `200` | Valid, matching upstream answer relayed. |
+| `204` | `HEAD` or `OPTIONS` on a known route (no upstream work). |
+| `400` | `dns` parameter missing, repeated or not valid base64url; malformed DNS message; POST without a body or with a `Content-Length` that is not an integer or is below 12. |
+| `404` | Unknown provider id on `/api/doh/<provider>/dns-query`. |
+| `405` | Method other than GET, POST, HEAD, OPTIONS. |
+| `408` | POST body not received within 1 second (or the request deadline, if shorter). |
+| `413` | POST body (declared or streamed) larger than 4 KiB. |
+| `414` | GET query string longer than 8192 characters. |
+| `415` | POST `Content-Type` is not `application/dns-message`. |
+| `429` | Per-IP rate limit exceeded (returned by `src/proxy.ts`, with `Retry-After`). |
+| `503` | In-flight ceiling reached (global or per client IP), with `Retry-After: 1`. |
+| 4xx/5xx | Last non-retryable upstream rejection, relayed as `DNS upstream rejected request` (see below). |
+| `502` | No upstream produced a valid answer (`DNS upstream unavailable`). |
+
 Request handling is bounded:
 
 - Client queries are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`); upstream responses at **64 KiB** (`MAX_DNS_RESPONSE_SIZE = 65535`, the RFC 8484 maximum) so DNSSEC and large TXT answers, which routinely exceed 4 KiB, still work. Anything larger is rejected instead of being buffered without a bound.
@@ -112,7 +135,7 @@ Request handling is bounded:
 - Both routes use a **2.5 second** application deadline (`DEFAULT_TIMEOUT_MS`), inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.
 - The remaining deadline is shared across the attempts still to come. The nominal failover slice is at least 750 ms, but an attempt is skipped when less than 100 ms remains.
-- On the primary endpoint, any failed attempt (timeout, network error, non-200 status, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (4xx/5xx other than 408, 425, 429, 500, 502, 503, 504; for example `403` or `404`) is returned as `DNS upstream rejected request`; it is kept even if a later attempt times out or fails with a retryable status. A non-200 status outside 400-599 (for example `204`) is recorded as a `502` rejection. Everything else (timeouts, network errors including blocked redirects, wrong content type, invalid, mismatched or oversized bodies, retryable statuses) ends as `502 DNS upstream unavailable`. Provider routes try exactly one upstream. The proxy never launches the full failover set concurrently.
+- On the primary endpoint, any failed attempt (timeout, network error, non-200 status, wrong content type, invalid or mismatched DNS body) falls through to the next fixed upstream. If none answers, the last non-retryable upstream rejection status (4xx/5xx other than 408, 425, 429, 500, 502, 503, 504; for example `403` or `404`) is returned as `DNS upstream rejected request`; it is kept even if a later attempt times out or fails with a retryable status. A non-200 status outside 400-599 (for example `204`) is recorded as a `502` rejection and, if nothing else answers, returned as `502 DNS upstream rejected request`. Everything else (timeouts, network errors including blocked redirects, wrong content type, invalid, mismatched or oversized bodies, retryable statuses) ends as `502 DNS upstream unavailable`. Provider routes try exactly one upstream. The proxy never launches the full failover set concurrently.
 - Failover stops (no further attempt is made) once less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
 - **Circuit breaker:** an upstream that accumulates 3 failures (timeout, network error or retryable status: 408, 425, 429, 500, 502, 503 or 504) without an intervening success is skipped for 30 seconds, after which one half-open probe is allowed. A stuck probe is released after 5 seconds. If every upstream is open, the set is still probed. Non-retryable upstream statuses and invalid/wrong-content-type responses do not increment the breaker. State is per process.
 
@@ -146,8 +169,8 @@ Requests without a usable `X-Real-IP` / `X-Forwarded-For` header (for example a 
 
 | Variable | Description | Default |
 |---|---|---|
-| `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. | `100` |
-| `HAGEZI_ROTATION_MODE` | Set to `request` to round-robin the primary HaGeZi resolver per request instead of per time slot. | time slot |
+| `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. Read once at startup; a value that is not a positive integer is ignored. | `100` |
+| `HAGEZI_ROTATION_MODE` | Set to `request` (case-insensitive) to round-robin the primary HaGeZi resolver per request instead of per time slot. Any other value keeps time-slot rotation. | time slot |
 | `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds; non-numeric values fall back to the default. | `1800` |
 | `NEXT_PUBLIC_SITE_URL` | Public origin used by the homepage and metadata when explicitly set. **Build-time only** (the homepage is statically generated); for Docker pass it as `--build-arg`. | derived from the platform (Netlify `URL`, or `DEPLOY_PRIME_URL` on non-production deploys; Vercel `VERCEL_PROJECT_PRODUCTION_URL`, or `VERCEL_URL` on previews), else `http://localhost:3000`; Docker image: `http://localhost:8367` |
 
@@ -214,7 +237,7 @@ npm run lint
 npm run build
 ```
 
-`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`, including failover, timeouts, circuit breakers, GET/POST validation, redirect blocking, cache-control handling, version/config checks, and route deadline checks), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`). The suites transpile the real `src/` TypeScript on the fly through `scripts/lib/transpile-source.mjs`; they do not require a Next.js build.
+`npm test` runs the DNS parser/response-validation tests (`scripts/test-dns.mjs`), DoH runtime tests (`scripts/test-doh.mjs`, including failover, timeouts, circuit breakers, GET/POST validation, redirect blocking, cache-control handling, version/config checks, and route deadline checks), in-flight capacity tests (`scripts/test-capacity.mjs`), proxy source-IP tests (`scripts/test-proxy.mjs`), and limiter unit tests (`scripts/test-rate-limit.mjs`). The suites transpile the real `src/` TypeScript on the fly through `scripts/lib/transpile-source.mjs` (which also supplies the `next/server` stub and the shared `importDoh()` loader); they do not require a Next.js build. `typescript` (a dev dependency) must be installed for this helper to work.
 
 The project currently stays on the TypeScript 6.x line through the `package.json` dependency range; move to a newer major only alongside compatible Next.js ESLint tooling.
 
