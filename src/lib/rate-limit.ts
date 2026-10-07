@@ -59,11 +59,11 @@ export class RateLimiter {
     this.lastNow = effectiveNow;
     this.evictExpired(effectiveNow);
 
+    // evictExpired() has already dropped every bucket whose window ended (the
+    // Map is ordered by `resetAt`), so a bucket found here is always in-window
+    // and a missing one always starts a new window at the end of the Map.
     const current = this.buckets.get(key);
-    if (!current || current.resetAt <= effectiveNow) {
-      // Delete first so the re-created bucket moves to the end of the Map and
-      // insertion order keeps matching `resetAt` order.
-      this.buckets.delete(key);
+    if (!current) {
       this.evictOldestWhileFull();
       this.buckets.set(key, { count: 1, resetAt: effectiveNow + this.windowMs });
       return ALLOWED;

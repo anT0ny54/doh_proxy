@@ -154,10 +154,6 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
   return offset === message.byteLength ? question : null;
 }
 
-export function isValidDnsQuery(message: Uint8Array): boolean {
-  return validateStructure(message, false) !== null;
-}
-
 /**
  * A validated query reduced to what response matching needs. Build it once per
  * request with {@link parseQuery} and reuse it for every upstream attempt
