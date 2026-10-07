@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { importTypeScript } from "./lib/transpile-source.mjs";
 
 const dns = await importTypeScript("../src/lib/dns.ts", import.meta.url);
+const isValidDnsQuery = (message) => dns.parseQuery(message) !== null;
 
 function queryWithName(nameBytes, id = 1) {
   return Uint8Array.from([
@@ -95,18 +96,18 @@ function validResponse(query = validQuery) {
 }
 
 await test("accepts a normal DNS query", () => {
-  assert.equal(dns.isValidDnsQuery(validQuery), true);
+  assert.equal(isValidDnsQuery(validQuery), true);
 });
 
 await test("rejects a response presented as a query", () => {
   const response = Uint8Array.from(validQuery);
   response[2] |= 0x80;
-  assert.equal(dns.isValidDnsQuery(response), false);
+  assert.equal(isValidDnsQuery(response), false);
 });
 
 await test("rejects a compressed first-question QNAME without a prior name", () => {
   const query = Uint8Array.from([0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x0c, 0, 1, 0, 1]);
-  assert.equal(dns.isValidDnsQuery(query), false);
+  assert.equal(isValidDnsQuery(query), false);
 });
 
 await test("accepts backward compression in a resource-record owner name", () => {
@@ -181,7 +182,7 @@ await test("rejects names longer than 255 octets", () => {
     labels.push(length, ...new Array(length).fill(97));
     remaining -= length + 1;
   }
-  assert.equal(dns.isValidDnsQuery(queryWithName(labels)), false);
+  assert.equal(isValidDnsQuery(queryWithName(labels)), false);
 });
 
 await test("accepts a structurally valid DNS response", () => {
@@ -275,8 +276,8 @@ test("responses may exceed 4 KiB but queries may not", () => {
     const opt = [0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, rdata.length >> 8, rdata.length & 0xff, ...rdata];
     return Uint8Array.from([...validQuery.slice(0, 10), 0, 1, ...validQuery.slice(12), ...opt]);
   };
-  assert.equal(dns.isValidDnsQuery(padded(100)), true);
-  assert.equal(dns.isValidDnsQuery(padded(4_100)), false);
+  assert.equal(isValidDnsQuery(padded(100)), true);
+  assert.equal(isValidDnsQuery(padded(4_100)), false);
 });
 
 test("parseQuery never modifies its input, even for Buffer views", () => {

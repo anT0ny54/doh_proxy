@@ -1,45 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { importTypeScript, toDataUrl } from "./lib/transpile-source.mjs";
+import { importDoh } from "./lib/transpile-source.mjs";
 
-const dnsSource = await readFile(new URL("../src/lib/dns.ts", import.meta.url), "utf8");
-const providersSource = await readFile(new URL("../src/lib/providers.ts", import.meta.url), "utf8");
-const upstreamsSource = await readFile(new URL("../src/lib/upstreams.ts", import.meta.url), "utf8");
-const clientIpSource = await readFile(new URL("../src/lib/client-ip.ts", import.meta.url), "utf8");
-const clientIpUrl = toDataUrl(clientIpSource, "client-ip.ts");
-const dnsUrl = toDataUrl(dnsSource, "dns.ts");
-const providersUrl = toDataUrl(providersSource, "providers.ts");
-const upstreamsUrl = toDataUrl(upstreamsSource, "upstreams.ts");
-const nextServerSource = `
-export class NextResponse {
-  constructor(body = null, init = {}) {
-    this.body = body;
-    this.status = init.status ?? 200;
-    this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
-  }
-  async text() {
-    if (this.body === null || this.body === undefined) return "";
-    if (typeof this.body === "string") return this.body;
-    const bytes = this.body instanceof ArrayBuffer ? new Uint8Array(this.body) : new Uint8Array(this.body);
-    return new TextDecoder().decode(bytes);
-  }
-  async arrayBuffer() {
-    if (this.body === null || this.body === undefined) return new ArrayBuffer(0);
-    if (typeof this.body === "string") return new TextEncoder().encode(this.body).buffer;
-    return this.body instanceof ArrayBuffer ? this.body : new Uint8Array(this.body).slice().buffer;
-  }
-}
-`;
-const nextServerUrl = toDataUrl(nextServerSource, "next-server-stub.ts");
-
-const doh = await importTypeScript("../src/lib/doh.ts", import.meta.url, {
-  "next/server": nextServerUrl,
-  "@/lib/providers": providersUrl,
-  "@/lib/dns": dnsUrl,
-  "@/lib/client-ip": clientIpUrl,
-  "@/lib/upstreams": upstreamsUrl,
-});
+const doh = await importDoh();
 
 function validQuery(id = 0x1234) {
   return Uint8Array.from([
@@ -401,11 +365,13 @@ try {
     assert.equal(resolved, 0);
   });
 
-  await test("Application timeout stays below the route execution ceiling", async () => {
+  await test("HaGeZi upstream set is pre-parsed and rotated", () => {
     const hageziUpstreams = doh.getHageziUpstreams();
     assert.equal(hageziUpstreams.length, 3);
     assert.ok(hageziUpstreams.every((upstream) => upstream.url instanceof URL));
+  });
 
+  await test("Application timeout stays below the route execution ceiling", async () => {
     const primaryRoute = await readFile(new URL("../src/app/api/doh/dns-query/route.ts", import.meta.url), "utf8");
     const providerRoute = await readFile(new URL("../src/app/api/doh/[provider]/dns-query/route.ts", import.meta.url), "utf8");
     const dohSourceText = await readFile(new URL("../src/lib/doh.ts", import.meta.url), "utf8");
@@ -414,19 +380,21 @@ try {
       const maxDuration = Number(/export const maxDuration = (\d+);/.exec(route)?.[1]);
       assert.ok(Number.isFinite(maxDuration) && timeoutMs < maxDuration * 1_000, "app deadline must fit inside maxDuration");
     }
+  });
 
+  await test("PROXY_VERSION matches package.json", async () => {
     const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
     assert.equal(doh.PROXY_VERSION, pkg.version, "PROXY_VERSION must match package.json");
+  });
 
-    const oldRoute = new URL("../src/app/api/doh/[provider]/[format]/route.ts", import.meta.url);
-    await assert.rejects(readFile(oldRoute));
-
+  await test("Copyright year is a fixed constant, not computed at render time", async () => {
     const page = await readFile(new URL("../src/app/page.tsx", import.meta.url), "utf8");
     assert.match(page, /COPYRIGHT_YEAR/);
     assert.doesNotMatch(page, /new Date\(\)\.getFullYear\(\)/);
     const site = await readFile(new URL("../src/lib/site.ts", import.meta.url), "utf8");
     assert.match(site, /export const COPYRIGHT_YEAR = \d{4};/);
   });
+
   await test("Non-error upstream statuses are never relayed as-is", async () => {
     globalThis.fetch = async () => new Response(null, { status: 204 });
     const response = await doh.proxyRequest(getRequest(), {

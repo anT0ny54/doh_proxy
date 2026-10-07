@@ -1,25 +1,14 @@
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { importTypeScript, toDataUrl } from "./lib/transpile-source.mjs";
+import { importTypeScript, libUrl, nextServerUrl } from "./lib/transpile-source.mjs";
 
-const rateLimitSource = await readFile(new URL("../src/lib/rate-limit.ts", import.meta.url), "utf8");
+// proxy.ts reads RATE_LIMIT_PER_MINUTE once at import; make the suite
+// independent of the caller's environment so it always tests the default.
+delete process.env.RATE_LIMIT_PER_MINUTE;
 
-const rateLimitUrl = toDataUrl(rateLimitSource, "rate-limit.ts");
-const clientIpUrl = toDataUrl(await readFile(new URL("../src/lib/client-ip.ts", import.meta.url), "utf8"), "client-ip.ts");
+const rateLimitUrl = await libUrl("rate-limit");
+const clientIpUrl = await libUrl("client-ip");
 const { WINDOW_LIMIT } = await import(rateLimitUrl);
-const nextServerUrl = toDataUrl(`
-export class NextResponse {
-  constructor(body = null, init = {}) {
-    this.body = body;
-    this.status = init.status ?? 200;
-    this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
-  }
-  static next() {
-    return new NextResponse(null, { status: 200 });
-  }
-}
-`, "next-server-stub.ts");
 
 const proxy = await importTypeScript("../src/proxy.ts", import.meta.url, {
   "next/server": nextServerUrl,

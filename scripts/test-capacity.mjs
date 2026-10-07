@@ -1,37 +1,8 @@
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { importTypeScript, toDataUrl } from "./lib/transpile-source.mjs";
+import { importDoh } from "./lib/transpile-source.mjs";
 
-const dnsSource = await readFile(new URL("../src/lib/dns.ts", import.meta.url), "utf8");
-const providersSource = await readFile(new URL("../src/lib/providers.ts", import.meta.url), "utf8");
-const upstreamsSource = await readFile(new URL("../src/lib/upstreams.ts", import.meta.url), "utf8");
-const clientIpSource = await readFile(new URL("../src/lib/client-ip.ts", import.meta.url), "utf8");
-const clientIpUrl = toDataUrl(clientIpSource, "client-ip.ts");
-const dnsUrl = toDataUrl(dnsSource, "dns.ts");
-const providersUrl = toDataUrl(providersSource, "providers.ts");
-const upstreamsUrl = toDataUrl(upstreamsSource, "upstreams.ts");
-const nextServerUrl = toDataUrl(`
-export class NextResponse {
-  constructor(body = null, init = {}) {
-    this.body = body;
-    this.status = init.status ?? 200;
-    this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
-  }
-  async arrayBuffer() {
-    if (this.body === null || this.body === undefined) return new ArrayBuffer(0);
-    return this.body instanceof ArrayBuffer ? this.body : new Uint8Array(this.body).slice().buffer;
-  }
-}
-`, "next-server-stub.ts");
-
-const doh = await importTypeScript("../src/lib/doh.ts", import.meta.url, {
-  "next/server": nextServerUrl,
-  "@/lib/providers": providersUrl,
-  "@/lib/dns": dnsUrl,
-  "@/lib/client-ip": clientIpUrl,
-  "@/lib/upstreams": upstreamsUrl,
-});
+const doh = await importDoh();
 
 function validQuery() {
   return Uint8Array.from([
