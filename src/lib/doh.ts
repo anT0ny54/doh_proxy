@@ -215,16 +215,14 @@ function getProviderUpstream(providerId: string): NormalizedDoHUpstream | undefi
 }
 
 function baseHeaders(): Headers {
-  const headers = new Headers({
+  return new Headers({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Accept, Content-Type, Cache-Control",
     "Access-Control-Expose-Headers": "Retry-After",
     "Access-Control-Max-Age": "86400",
     "Cache-Control": "no-store, max-age=0",
-    "Allow": "GET, POST, HEAD, OPTIONS",
   });
-  return headers;
 }
 
 function textResponse(message: string, status: number): NextResponse {
@@ -234,9 +232,7 @@ function textResponse(message: string, status: number): NextResponse {
 }
 
 function emptyResponse(): NextResponse {
-  const headers = baseHeaders();
-  headers.set("Allow", "GET, POST, HEAD, OPTIONS");
-  return new NextResponse(null, { status: 204, headers });
+  return new NextResponse(null, { status: 204, headers: baseHeaders() });
 }
 
 function busyResponse(): NextResponse {
@@ -372,7 +368,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
         const result = await Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(timeoutToken), Math.max(1, remaining));
+            timer = setTimeout(() => reject(timeoutToken), remaining);
           }),
         ]);
 
