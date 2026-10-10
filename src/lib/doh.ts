@@ -93,9 +93,11 @@ const state: ProxyState = (globalStore.__dohProxyState ??= {
 });
 
 /**
- * Open = THRESHOLD consecutive failures. After the cooldown exactly one caller
- * is let through as a half-open probe; its failure re-opens the breaker
- * immediately and its success resets it.
+ * Open = THRESHOLD failures without an intervening success. While open, the
+ * breaker blocks traffic during the cooldown and, afterwards, while a half-open
+ * probe is in flight. Read-only on purpose: filtering a list of upstreams must
+ * not reserve a probe for one that is never actually contacted (see
+ * {@link claimProbe}).
  */
 function isCircuitBreakerOpen(endpoint: string): boolean {
   const cb = state.circuitBreakers.get(endpoint);
@@ -103,10 +105,19 @@ function isCircuitBreakerOpen(endpoint: string): boolean {
 
   const now = Date.now();
   if (now - cb.lastFailureTime < CIRCUIT_BREAKER_COOLDOWN_MS) return true;
-  if (cb.probeStartedAt !== 0 && now - cb.probeStartedAt < CIRCUIT_BREAKER_PROBE_TTL_MS) return true;
+  return cb.probeStartedAt !== 0 && now - cb.probeStartedAt < CIRCUIT_BREAKER_PROBE_TTL_MS;
+}
 
-  cb.probeStartedAt = now;
-  return false;
+/**
+ * Reserves the half-open probe slot of a tripped breaker right before an
+ * attempt starts, so concurrent requests skip that upstream until the probe
+ * reports back (failure re-opens the breaker, success resets it) or the slot
+ * expires. Doing this at attempt time, not while filtering, keeps a recovered
+ * upstream from being locked out when an earlier upstream answers first.
+ */
+function claimProbe(endpoint: string): void {
+  const cb = state.circuitBreakers.get(endpoint);
+  if (cb && cb.failures >= CIRCUIT_BREAKER_THRESHOLD) cb.probeStartedAt = Date.now();
 }
 
 function recordFailure(endpoint: string): void {
@@ -171,11 +182,6 @@ function getRotationConfig(): RotationConfig {
   return config;
 }
 
-/**
- * Failover order for the primary endpoint. By default the first choice changes
- * on a time slot (consistent across instances); with
- * HAGEZI_ROTATION_MODE=request it round-robins per request to spread load.
- */
 let overrideUpstreams: readonly NormalizedDoHUpstream[] | null | undefined;
 
 /**
@@ -199,6 +205,12 @@ function getOverrideUpstreams(): readonly NormalizedDoHUpstream[] | undefined {
   return overrideUpstreams ?? undefined;
 }
 
+/**
+ * Failover order for the primary endpoint. By default the first choice changes
+ * on a time slot (consistent across instances); with
+ * HAGEZI_ROTATION_MODE=request it round-robins per request to spread load. A
+ * valid HAGEZI_UPSTREAM_ENDPOINTS override replaces the rotated built-in list.
+ */
 export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
   const override = getOverrideUpstreams();
   if (override) return override;
@@ -273,11 +285,16 @@ function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
   return null;
 }
 
-async function cancelReaderBestEffort<T>(reader: ReadableStreamDefaultReader<T>): Promise<boolean> {
+/**
+ * Cancels a stream or reader but never waits longer than
+ * STREAM_CANCEL_TIMEOUT_MS for it to settle. Never rejects; resolves `true`
+ * when the cancellation settled in time.
+ */
+async function cancelBestEffort(target: { cancel(): Promise<void> }): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      reader.cancel().then(
+      target.cancel().then(
         () => true,
         () => true,
       ),
@@ -358,7 +375,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
     for (;;) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        await cancelReaderBestEffort(reader);
+        await cancelBestEffort(reader);
         return textResponse("Request body timeout", 408);
       }
 
@@ -376,14 +393,14 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
 
         const nextTotal = total + result.value.byteLength;
         if (nextTotal > MAX_DNS_MESSAGE_SIZE) {
-          await cancelReaderBestEffort(reader);
+          await cancelBestEffort(reader);
           return textResponse("Payload too large", 413);
         }
 
         chunks.push(result.value);
         total = nextTotal;
       } catch (error) {
-        await cancelReaderBestEffort(reader);
+        await cancelBestEffort(reader);
         if (error === timeoutToken) return textResponse("Request body timeout", 408);
         throw error;
       } finally {
@@ -398,7 +415,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
     }
   }
 
-  const body = concatChunks(chunks, total);
+  const body = chunks.length === 1 ? chunks[0] : concatChunks(chunks, total);
   const parsed = parseQuery(body);
   if (parsed === null) return textResponse("Invalid DNS message", 400);
   return { body, parsed };
@@ -433,7 +450,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
 
       const nextTotal = total + value.byteLength;
       if (nextTotal > MAX_DNS_RESPONSE_SIZE) {
-        settled = await cancelReaderBestEffort(reader);
+        settled = await cancelBestEffort(reader);
         return null;
       }
 
@@ -456,19 +473,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
 }
 
 function cancelResponseBody(response: Response): void {
-  const body = response.body;
-  if (!body) return;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  void Promise.race([
-    body.cancel(),
-    new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, STREAM_CANCEL_TIMEOUT_MS);
-    }),
-  ])
-    .catch(() => undefined)
-    .finally(() => {
-      if (timer !== undefined) clearTimeout(timer);
-    });
+  if (response.body) void cancelBestEffort(response.body);
 }
 
 /**
@@ -573,14 +578,15 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
 
   const failover = options.failover !== false;
   const configured = typeof options.upstreams === "function" ? options.upstreams() : options.upstreams;
-  const normalizedUpstreams = configured.map(normalizeUpstream);
-  let upstreams = failover ? normalizedUpstreams : normalizedUpstreams.slice(0, 1);
+  // Provider routes try exactly one upstream, so only that one is normalized.
+  let upstreams = (failover ? configured : configured.slice(0, 1)).map(normalizeUpstream);
 
   // Skip upstreams whose breaker is open, but never fail fast when *all* of
   // them are open: a probe request is what lets a recovered upstream close its
   // breaker sooner, and a dead-looking upstream may still answer.
   const healthy = upstreams.filter((upstream) => !isCircuitBreakerOpen(upstream.endpoint));
-  if (healthy.length > 0) upstreams = healthy;
+  const probeAll = healthy.length === 0;
+  if (!probeAll) upstreams = healthy;
 
   // Last definite upstream rejection (non-200 status) seen across attempts. A
   // later timeout or invalid body does not erase it; it is relayed only if no
@@ -589,6 +595,9 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
 
   for (let index = 0; index < upstreams.length; index += 1) {
     const upstream = upstreams[index];
+    // An earlier attempt may have taken a while, and another request may have
+    // claimed this upstream's half-open probe in the meantime.
+    if (!probeAll && isCircuitBreakerOpen(upstream.endpoint)) continue;
     // Share what is left of the budget across the attempts still to come, so
     // time saved by fast failures flows to later upstreams (the last one gets
     // everything that remains).
@@ -599,6 +608,7 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
     const attemptTimeout = Math.min(remaining, share);
     if (attemptTimeout < MIN_ATTEMPT_TIMEOUT_MS) break;
 
+    claimProbe(upstream.endpoint);
     try {
       const upstreamFetch = await fetchUpstream(
         request,

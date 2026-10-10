@@ -79,14 +79,17 @@ export function normalizeIp(raw: string): string | undefined {
  * configuration changes are honored.
  */
 export function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return TRUTHY_VALUES.has((env[TRUST_PROXY_HEADERS_ENV] ?? "").trim().toLowerCase());
+  const value = (env[TRUST_PROXY_HEADERS_ENV] ?? "").trim().toLowerCase();
+  if (value === "") return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  return TRUTHY_VALUES.has(value);
 }
 
 /**
  * Best-effort client identity from headers added by a trusted reverse proxy.
- * Returns undefined when no usable address is present OR when forwarding
- * headers are not trusted (see {@link isProxyTrustEnabled}): a spoofed value
- * must never be allowed to mint a rate-limit identity.
+ * Returns undefined when no usable address is present or when forwarding
+ * headers are explicitly disabled. The deployment must sanitize these headers
+ * at its trusted proxy boundary before relying on per-client limits.
  */
 export function getClientIp(headers: Headers, trusted: boolean = isProxyTrustEnabled()): string | undefined {
   if (!trusted) return undefined;
