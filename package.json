@@ -1,7 +1,7 @@
 {
   "name": "doh_proxy",
   "version": "2.8.1",
-  "license": "AGPL-3.0",
+  "license": "AGPL-3.0-only",
   "private": true,
   "engines": {
     "node": ">=22.0.0"
@@ -11,7 +11,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test scripts/test-dns.mjs scripts/test-dns-rdata.mjs scripts/test-doh.mjs scripts/test-capacity.mjs scripts/test-proxy.mjs scripts/test-rate-limit.mjs",
+    "test": "node --test scripts/test-dns.mjs scripts/test-dns-rdata.mjs scripts/test-doh.mjs scripts/test-capacity.mjs scripts/test-proxy.mjs scripts/test-rate-limit.mjs scripts/test-config.mjs",
     "test:integration": "node --test scripts/test-integration.mjs"
   },
   "dependencies": {
