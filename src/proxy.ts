@@ -14,10 +14,9 @@
  * when a reverse proxy (nginx, Caddy, a platform front end, ...) overwrites
  * or sanitizes those headers on every request. See src/lib/client-ip.ts.
  * When the flag is unset, or when neither header is present, the client
- * address is unknown and the request is NOT limited: lumping every anonymous
- * client into one shared bucket would cap the whole service at a single
- * client's quota and let one client lock out everyone. Put a sanitizing
- * reverse proxy or WAF in front to get per-client limiting.
+ * address is unknown and the request is NOT per-client limited. Rate limiting
+ * trusts forwarding headers by default, so deploy behind a proxy that
+ * overwrites/sanitizes them; set TRUST_PROXY_HEADERS=0 when directly exposed.
  *
  * LOCATION: this file must live in `src/` because the app uses `src/app`.
  * Next.js only detects proxy.ts/middleware.ts next to the `app` directory, so
