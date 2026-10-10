@@ -90,12 +90,9 @@ jobs:
           fi
 
   audit:
-    # Advisory by design: audit findings must be evaluated against the actual
-    # dependency tree before upgrading; they should not silently block merges.
-    name: Dependency security audit (advisory)
+    name: Dependency security audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
 
     steps:
       - name: Check out repository
@@ -112,5 +109,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: npm audit
-        run: npm audit --audit-level=high
+      # Blocking gate: production dependencies must be vulnerability-free.
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
+      # Advisory: the remaining findings are dev-only. The braces/micromatch/
+      # fast-glob chain is lint-time only and its advisory has no patched
+      # release (vulnerable range "*"), so this step reports but never blocks.
+      - name: Full audit including devDependencies (advisory)
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
