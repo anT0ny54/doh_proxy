@@ -9,14 +9,13 @@
  * RATE_LIMIT_PER_MINUTE). IPv6 clients are keyed by /64.
  *
  * TRUSTED-PROXY BOUNDARY: client identity comes from X-Real-IP /
- * X-Forwarded-For, which a direct client can forge. These headers are only
- * honored when TRUST_PROXY_HEADERS is set to a truthy value — set it ONLY
- * when a reverse proxy (nginx, Caddy, a platform front end, ...) overwrites
- * or sanitizes those headers on every request. See src/lib/client-ip.ts.
- * When the flag is unset, or when neither header is present, the client
- * address is unknown and the request is NOT per-client limited. Rate limiting
- * trusts forwarding headers by default, so deploy behind a proxy that
- * overwrites/sanitizes them; set TRUST_PROXY_HEADERS=0 when directly exposed.
+ * X-Forwarded-For, which a direct client can forge. These headers are trusted
+ * BY DEFAULT (TRUST_PROXY_HEADERS unset or truthy), so deploy behind a reverse
+ * proxy (nginx, Caddy, a platform front end, ...) that overwrites or sanitizes
+ * them on every request, and set TRUST_PROXY_HEADERS=0 when the app is exposed
+ * directly. See src/lib/client-ip.ts. When trust is disabled, or when no
+ * usable header is present, the client address is unknown and the request is
+ * NOT per-client limited.
  *
  * LOCATION: this file must live in `src/` because the app uses `src/app`.
  * Next.js only detects proxy.ts/middleware.ts next to the `app` directory, so
