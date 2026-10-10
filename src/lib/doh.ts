@@ -120,6 +120,17 @@ function claimProbe(endpoint: string): void {
   if (cb && cb.failures >= CIRCUIT_BREAKER_THRESHOLD) cb.probeStartedAt = Date.now();
 }
 
+/**
+ * Frees a half-open probe slot after an attempt that ended without a verdict
+ * (non-retryable status, wrong content type, invalid body). Those outcomes do
+ * not count as failures, so they must not keep the upstream blocked for the
+ * whole probe TTL either.
+ */
+function releaseProbe(endpoint: string): void {
+  const cb = state.circuitBreakers.get(endpoint);
+  if (cb) cb.probeStartedAt = 0;
+}
+
 function recordFailure(endpoint: string): void {
   let cb = state.circuitBreakers.get(endpoint);
   if (!cb) {
@@ -187,7 +198,8 @@ let overrideUpstreams: readonly NormalizedDoHUpstream[] | null | undefined;
 /**
  * Optional comma-separated endpoint override (HAGEZI_UPSTREAM_ENDPOINTS).
  * Primarily for the integration test-suite and self-hosted deployments that
- * pin their own resolvers; unset in production. Invalid entries are ignored.
+ * pin their own resolvers; unset in production. Entries that are not valid
+ * http(s) URLs are ignored.
  */
 function getOverrideUpstreams(): readonly NormalizedDoHUpstream[] | undefined {
   if (overrideUpstreams !== undefined) return overrideUpstreams ?? undefined;
@@ -196,7 +208,8 @@ function getOverrideUpstreams(): readonly NormalizedDoHUpstream[] | undefined {
   const parsed: NormalizedDoHUpstream[] = [];
   for (const endpoint of endpoints) {
     try {
-      parsed.push({ endpoint, url: new URL(endpoint) });
+      const url = new URL(endpoint);
+      if (url.protocol === "https:" || url.protocol === "http:") parsed.push({ endpoint, url });
     } catch {
       // Ignore malformed endpoints rather than failing every request.
     }
@@ -402,7 +415,9 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
       } catch (error) {
         await cancelBestEffort(reader);
         if (error === timeoutToken) return textResponse("Request body timeout", 408);
-        throw error;
+        // The client's body stream failed (e.g. the upload was aborted). Answer
+        // instead of letting the error escape the handler as an unhandled 500.
+        return textResponse("Request body error", 400);
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
@@ -505,8 +520,14 @@ async function fetchUpstream(
   timeoutMs: number,
 ): Promise<UpstreamFetch> {
   const isGet = request.method === "GET" && dnsParam !== undefined;
-  // `dnsParam` already passed the base64url check, so it needs no encoding.
-  const url = isGet ? `${upstream.endpoint}?dns=${dnsParam}` : upstream.url;
+  let url: string | URL = upstream.url;
+  if (isGet) {
+    // `dnsParam` already passed the base64url check. Going through URL keeps an
+    // operator-supplied query string (e.g. `?token=...`) intact.
+    const target = new URL(upstream.url);
+    target.searchParams.set("dns", dnsParam);
+    url = target.href;
+  }
 
   const headers = new Headers({
     Accept: DNS_MESSAGE,
@@ -639,18 +660,23 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
           // Only 4xx/5xx statuses are retained for a final relay; other non-200
           // statuses are invalid for DoH and fall back to a generic 502.
           lastRejectedStatus = result.status >= 400 && result.status <= 599 ? result.status : 502;
+          releaseProbe(upstream.endpoint);
           continue;
         }
 
         const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
         if (contentType !== DNS_MESSAGE) {
           cancelResponseBody(result);
+          releaseProbe(upstream.endpoint);
           continue;
         }
 
         // readResponseBody cancels the stream itself on its early-exit paths.
         const responseBody = await readResponseBody(result);
-        if (responseBody === null || !isValidDnsResponse(responseBody, query.parsed)) continue;
+        if (responseBody === null || !isValidDnsResponse(responseBody, query.parsed)) {
+          releaseProbe(upstream.endpoint);
+          continue;
+        }
 
         recordSuccess(upstream.endpoint);
 

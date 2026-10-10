@@ -3,10 +3,12 @@ import { isIP } from "node:net";
 const MAX_HEADER_ENTRY_LENGTH = 128;
 
 /**
- * Process environment variable that opts in to trusting forwarding headers.
- * Set it to a truthy value ("1", "true", "yes", "on") ONLY when a reverse
- * proxy in front of this app overwrites/sanitizes X-Real-IP and
- * X-Forwarded-For on every request.
+ * Process environment variable controlling whether forwarding headers are
+ * trusted. Trust is ON when it is unset or empty, and when set to "1", "true",
+ * "yes" or "on"; it is OFF for "0", "false", "no", "off" and for any
+ * unrecognized value. Leave it enabled ONLY when a reverse proxy in front of
+ * this app overwrites/sanitizes X-Real-IP and X-Forwarded-For on every request;
+ * set it to "0" when the app is exposed directly.
  */
 export const TRUST_PROXY_HEADERS_ENV = "TRUST_PROXY_HEADERS";
 
@@ -73,10 +75,10 @@ export function normalizeIp(raw: string): string | undefined {
  * These headers are only trustworthy when a sanitizing reverse proxy in front
  * of this app overwrites them on every request. A directly connected client
  * can otherwise forge arbitrary values and rotate them to evade the per-IP
- * request limiter and the per-IP in-flight limit. Trust is therefore opt-in
- * via TRUST_PROXY_HEADERS and must stay unset when the app is exposed
- * directly. Evaluated per call (no module-level cache) so tests and runtime
- * configuration changes are honored.
+ * request limiter and the per-IP in-flight limit. Trust is therefore ON by
+ * default (unset/empty) and must be disabled with TRUST_PROXY_HEADERS=0 when
+ * the app is exposed directly. Evaluated per call (no module-level cache) so
+ * tests and runtime configuration changes are honored.
  */
 export function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = (env[TRUST_PROXY_HEADERS_ENV] ?? "").trim().toLowerCase();
@@ -88,7 +90,7 @@ export function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boole
 /**
  * Best-effort client identity from headers added by a trusted reverse proxy.
  * Returns undefined when no usable address is present or when forwarding
- * headers are explicitly disabled. The deployment must sanitize these headers
+ * headers are disabled (TRUST_PROXY_HEADERS=0 or another non-truthy value). The deployment must sanitize these headers
  * at its trusted proxy boundary before relying on per-client limits.
  */
 export function getClientIp(headers: Headers, trusted: boolean = isProxyTrustEnabled()): string | undefined {

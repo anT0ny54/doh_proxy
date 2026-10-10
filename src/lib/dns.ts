@@ -55,7 +55,7 @@ function skipName(
   message: Uint8Array,
   start: number,
   allowCompression: boolean,
-  targets?: Uint8Array,
+  targets: Uint8Array,
 ): number | null {
   let offset = start;
   let nextOffset = start;
@@ -63,7 +63,7 @@ function skipName(
   let jumps = 0;
   let expandedNameLength = 0;
 
-  if (targets) targets[start] = 1;
+  targets[start] = 1;
 
   // Work is bounded without a separate step counter: an expanded name is capped
   // at 255 bytes (at most ~127 labels) and pointer jumps are capped at 16.
@@ -74,7 +74,7 @@ function skipName(
     if (length === 0) {
       expandedNameLength += 1;
       if (expandedNameLength > 255) return null;
-      if (targets) targets[offset] = 1;
+      targets[offset] = 1;
       return jumped ? nextOffset : offset + 1;
     }
 
@@ -89,7 +89,7 @@ function skipName(
       if (
         pointer < 12 ||
         pointer >= offset ||
-        (targets && targets[pointer] === 0) ||
+        targets[pointer] === 0 ||
         ++jumps > 16
       ) {
         return null;
@@ -103,7 +103,7 @@ function skipName(
     }
 
     if ((length & 0xc0) !== 0 || length > 63 || offset + 1 + length > message.byteLength) return null;
-    if (targets) targets[lengthOffset] = 1;
+    targets[lengthOffset] = 1;
     expandedNameLength += 1 + length;
     if (expandedNameLength > 255) return null;
     offset += 1 + length;
