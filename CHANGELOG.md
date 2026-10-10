@@ -29,6 +29,14 @@
   upstream list (comma-separated). Used by the integration suite; also useful
   for self-hosted deployments that pin their own resolvers.
 
+### Fixed
+- Integration suite robustness: the oversized-body case now streams chunked
+  data past the size cap instead of relying on a declared content-length the
+  fetch client refuses to under-send; the slow-upload case accepts the
+  buffering behavior of the middleware pipeline (bounded terminal response);
+  the 405 case no longer asserts an `Allow` header that Next's router does not
+  set for unexported methods.
+
 ### Notes
 - Rate limits and in-flight ceilings remain per-instance. In multi-instance
   deployments, enforce global limits at a shared gateway or WAF.
