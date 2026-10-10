@@ -1,0 +1,34 @@
+# Changelog
+
+## Unreleased
+
+### Security
+- **Trusted-proxy boundary for client identity.** `X-Real-IP` /
+  `X-Forwarded-For` are now honored only when `TRUST_PROXY_HEADERS` is set to
+  a truthy value. Directly connected clients can forge these headers, and
+  previously a forged IP would mint a fresh rate-limit/in-flight identity.
+  Set `TRUST_PROXY_HEADERS=1` only behind a reverse proxy that overwrites or
+  sanitizes these headers on every request.
+- **Stricter DNS compression-pointer validation.** RDATA is now decoded
+  according to record type (NS/CNAME/PTR/DNAME, MX, SOA, SRV, SVCB/HTTPS), and
+  only bytes validated as genuine domain names become compression targets.
+  Previously the entire RDATA region was marked as targetable, letting
+  malformed upstream responses pass structural validation.
+
+### Added
+- CI workflow (`.github/workflows/ci.yml`) running lint, unit tests, build,
+  real-HTTP integration tests, a Docker image build + container smoke test,
+  and a separate `npm audit` job on every push and pull request to `main`.
+- End-to-end integration suite (`npm run test:integration`) that launches the
+  built application against a local mock DoH upstream and covers GET, POST,
+  invalid content types, oversized bodies, slow clients, upstream failures,
+  response headers and shutdown.
+- DNS parser regression tests (`scripts/test-dns-rdata.mjs`) for the new
+  RDATA validation, including malformed-response and compression-cycle cases.
+- `HAGEZI_UPSTREAM_ENDPOINTS` environment variable to override the primary
+  upstream list (comma-separated). Used by the integration suite; also useful
+  for self-hosted deployments that pin their own resolvers.
+
+### Notes
+- Rate limits and in-flight ceilings remain per-instance. In multi-instance
+  deployments, enforce global limits at a shared gateway or WAF.

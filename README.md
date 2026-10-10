@@ -155,6 +155,18 @@ The starting position rotates periodically, but each request still has a determi
 
 ## Request protection
 
+### Client identity and rate limiting
+
+Per-IP rate limiting and per-IP in-flight caps key off `X-Real-IP` /
+`X-Forwarded-For`. A directly connected client can forge these headers, so
+they are **ignored unless `TRUST_PROXY_HEADERS` is set to a truthy value**
+("1", "true", "yes", "on") — set it only when a reverse proxy (nginx, Caddy,
+a platform front end, …) overwrites or sanitizes those headers on every
+request. Without it, requests are not attributed to a client IP; put a
+sanitizing reverse proxy or WAF in front to enforce per-client limits. Rate
+limits and in-flight ceilings remain per-instance; use a shared gateway or
+WAF for global limits in multi-instance deployments.
+
 The application uses two process-local protections before expensive upstream work begins.
 
 The first is a **100 requests per 60 seconds per identified source IP** fixed window (set `RATE_LIMIT_PER_MINUTE` to change; IPv6 clients are keyed by /64, and ports/IPv4-mapped forms are normalized) in `proxy.ts`, tracked in an in-memory map capped at 10,000 source keys (the oldest bucket is evicted first). It applies to every method on `/api/doh/*` (HEAD and OPTIONS count too); requests over the window receive `429 Too Many Requests` with `Retry-After`. The limiter is local to each runtime instance. When no usable `X-Real-IP` or `X-Forwarded-For` address is available, the request is not per-client rate limited and continues to the route handler. Forwarding headers must therefore be sanitized by the front proxy when they are used to identify the client.
@@ -289,15 +301,14 @@ https://github.com/anT0ny54/doh_proxy
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
-These are separately deployed instances listed for convenience; they are not defined by this repository's code. This codebase serves its endpoint at `/api/doh/dns-query`; instances exposing a bare `/dns-query` path run behind their own routing.
-
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns.mydoh.workers.dev/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
 ## ⚡ Bandwidth Hero Server
 
