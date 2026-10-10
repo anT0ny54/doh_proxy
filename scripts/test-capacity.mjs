@@ -1,42 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
 import { importDoh } from "./lib/transpile-source.mjs";
 
 const doh = await importDoh();
-
-function validQuery() {
-  return Uint8Array.from([
-    0x12, 0x34,
-    0x01, 0x00,
-    0x00, 0x01,
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-    3, 119, 119, 119,
-    7, 101, 120, 97, 109, 112, 108, 101,
-    0,
-    0, 1,
-    0, 1,
-  ]);
-}
-
-function validResponse(query = validQuery()) {
-  const question = query.slice(12);
-  return Uint8Array.from([
-    query[0], query[1],
-    0x81, 0x80,
-    0x00, 0x01,
-    0x00, 0x01,
-    0x00, 0x00,
-    0x00, 0x00,
-    ...question,
-    0xc0, 0x0c,
-    0x00, 0x01,
-    0x00, 0x01,
-    0x00, 0x00, 0x00, 0x3c,
-    0x00, 0x04, 1, 2, 3, 4,
-  ]);
-}
 
 function getRequest() {
   const dns = Buffer.from(validQuery()).toString("base64url");

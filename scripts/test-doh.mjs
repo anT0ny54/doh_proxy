@@ -1,48 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
 import { importDoh } from "./lib/transpile-source.mjs";
 
-// The suite drives per-IP in-flight limits through x-real-ip headers, so opt
-// in to trusting forwarding headers (client-ip.ts ignores them otherwise).
+// The suite drives per-IP in-flight limits through x-real-ip headers, so pin
+// forwarding-header trust on explicitly (it is also the default).
 process.env.TRUST_PROXY_HEADERS = "1";
 
 const doh = await importDoh();
-
-function validQuery(id = 0x1234) {
-  return Uint8Array.from([
-    id >>> 8,
-    id & 0xff,
-    0x01, 0x00,
-    0x00, 0x01,
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-    3, 119, 119, 119,
-    7, 101, 120, 97, 109, 112, 108, 101,
-    0,
-    0, 1,
-    0, 1,
-  ]);
-}
-
-function validResponse(query = validQuery()) {
-  const question = query.slice(12);
-  return Uint8Array.from([
-    query[0], query[1],
-    0x81, 0x80,
-    0x00, 0x01,
-    0x00, 0x01,
-    0x00, 0x00,
-    0x00, 0x00,
-    ...question,
-    0xc0, 0x0c,
-    0x00, 0x01,
-    0x00, 0x01,
-    0x00, 0x00, 0x00, 0x3c,
-    0x00, 0x04, 1, 2, 3, 4,
-  ]);
-}
 
 function getRequest(query = validQuery()) {
   const dns = Buffer.from(query).toString("base64url");
@@ -183,6 +149,35 @@ try {
 
     assert.equal(response.status, 408);
     assert.ok(Date.now() - started < 400, "body cancellation must not extend the deadline indefinitely");
+  });
+
+  await test("A failing POST body stream gets 400 instead of escaping the handler", async () => {
+    globalThis.fetch = async () => {
+      throw new Error("fetch must not run after a body read error");
+    };
+
+    const failingBody = {
+      getReader() {
+        return {
+          read() {
+            return Promise.reject(new Error("client aborted the upload"));
+          },
+          cancel() {
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
+    };
+
+    const response = await doh.proxyRequest(postRequest(failingBody), {
+      upstreams: [{ endpoint: "https://never-reached.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: false,
+    });
+
+    assert.equal(response.status, 400);
+    assert.equal(await response.text(), "Request body error");
   });
 
   await test("HEAD and OPTIONS return before any upstream fetch", async () => {
@@ -624,6 +619,60 @@ try {
     } finally {
       Date.now = realNow;
     }
+  });
+
+  await test("A non-retryable answer to a half-open probe releases the probe slot", async () => {
+    const hits = { a: 0, b: 0 };
+    let aStatus = 503;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("probe-release-a.test")) {
+        hits.a += 1;
+        return new Response(null, { status: aStatus });
+      }
+      hits.b += 1;
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const options = {
+      upstreams: [{ endpoint: "https://probe-release-a.test/dns-query" }, { endpoint: "https://probe-release-b.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: true,
+    };
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200); // opens A
+      assert.equal(hits.a, 3);
+
+      aStatus = 403; // non-retryable: neither a failure nor a success
+      now += 31_000; // cooldown elapsed: A is half-open
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 4, "the half-open probe reaches A");
+      now += 1_000; // well inside the 5 s probe TTL
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 5, "an inconclusive probe must not block A for the whole probe TTL");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test("GET keeps an existing query string on the upstream endpoint", async () => {
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://query-keep.test/dns-query?token=abc" }],
+      timeoutMs: 1_000,
+      failover: false,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(seen.length, 1);
+    const target = new URL(seen[0]);
+    assert.equal(target.searchParams.get("token"), "abc");
+    assert.ok(target.searchParams.get("dns"), "the dns parameter is appended");
+    assert.equal(seen[0].split("?").length, 2, "exactly one '?' separator");
   });
 
   await test("A wrong upstream content type fails over without tripping the breaker", async () => {

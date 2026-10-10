@@ -9,52 +9,20 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
 import { importDoh, libUrl } from "./lib/transpile-source.mjs";
 
 delete process.env.TRUST_PROXY_HEADERS;
 delete process.env.HAGEZI_ROTATION_MODE;
 delete process.env.HAGEZI_ROTATION_SECONDS;
-process.env.HAGEZI_UPSTREAM_ENDPOINTS = " https://one.test/dns-query , not a url,, http://two.test:8443/q ";
+process.env.HAGEZI_UPSTREAM_ENDPOINTS = " https://one.test/dns-query , not a url,, ftp://three.test/dns-query, http://two.test:8443/q ";
 
 const doh = await importDoh();
 const clientIp = await import(await libUrl("client-ip"));
 
 const DNS_MESSAGE = "application/dns-message";
 
-function validQuery() {
-  return Uint8Array.from([
-    0x12, 0x34,
-    0x01, 0x00,
-    0x00, 0x01,
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-    3, 119, 119, 119,
-    7, 101, 120, 97, 109, 112, 108, 101,
-    0,
-    0, 1,
-    0, 1,
-  ]);
-}
-
-function validResponse(query = validQuery()) {
-  return Uint8Array.from([
-    query[0], query[1],
-    0x81, 0x80,
-    0x00, 0x01,
-    0x00, 0x01,
-    0x00, 0x00,
-    0x00, 0x00,
-    ...query.slice(12),
-    0xc0, 0x0c,
-    0x00, 0x01,
-    0x00, 0x01,
-    0x00, 0x00, 0x00, 0x3c,
-    0x00, 0x04, 1, 2, 3, 4,
-  ]);
-}
-
-test("HAGEZI_UPSTREAM_ENDPOINTS replaces the built-in list, trims entries and ignores invalid ones", () => {
+test("HAGEZI_UPSTREAM_ENDPOINTS replaces the built-in list, trims entries and ignores invalid or non-http(s) ones", () => {
   const upstreams = doh.getHageziUpstreams();
   assert.deepEqual(
     upstreams.map((upstream) => upstream.endpoint),
@@ -86,7 +54,7 @@ test("the override is not rotated, in either rotation mode, and is read only onc
   }
 });
 
-test("forwarding headers are trusted only for explicit truthy TRUST_PROXY_HEADERS values", () => {
+test("forwarding headers are trusted by default and for truthy TRUST_PROXY_HEADERS values, not for anything else", () => {
   const enabled = (value) => clientIp.isProxyTrustEnabled(value === undefined ? {} : { TRUST_PROXY_HEADERS: value });
   for (const value of ["1", "true", "TRUE", " yes ", "on"]) assert.equal(enabled(value), true, JSON.stringify(value));
   for (const value of ["0", "false", "off", "no"]) assert.equal(enabled(value), false, JSON.stringify(value));
@@ -94,7 +62,7 @@ test("forwarding headers are trusted only for explicit truthy TRUST_PROXY_HEADER
   for (const value of ["2", "enabled"]) assert.equal(enabled(value), false, JSON.stringify(value));
 });
 
-test("getClientIp ignores X-Real-IP / X-Forwarded-For unless trusted (and is untrusted by default)", () => {
+test("getClientIp ignores X-Real-IP / X-Forwarded-For when trust is off (and trusts them by default)", () => {
   const spoofed = new Headers({ "x-real-ip": "203.0.113.9", "x-forwarded-for": "198.51.100.1" });
   assert.equal(clientIp.getClientIp(spoofed, false), undefined);
   assert.equal(clientIp.getClientIp(spoofed), "203.0.113.9", "the environment default trusts forwarding headers");

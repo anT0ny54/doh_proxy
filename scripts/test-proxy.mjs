@@ -6,7 +6,7 @@ import { importTypeScript, libUrl, nextServerUrl } from "./lib/transpile-source.
 // independent of the caller's environment so it always tests the default.
 delete process.env.RATE_LIMIT_PER_MINUTE;
 
-// Exercise the limiter through the default trusted-proxy configuration.
+// Pin forwarding-header trust on explicitly (it is also the default).
 process.env.TRUST_PROXY_HEADERS = "1";
 
 const rateLimitUrl = await libUrl("rate-limit");
