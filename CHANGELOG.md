@@ -29,6 +29,14 @@
   upstream list (comma-separated). Used by the integration suite; also useful
   for self-hosted deployments that pin their own resolvers.
 
+### Changed
+- Upgraded `next` and `eslint-config-next` to ^16.4.0 (lockfile regenerated):
+  resolves the critical `next/og` RCE and the sharp/source-map-js advisories.
+  The remaining audit findings are a dev-only lint-time chain
+  (braces/micromatch/fast-glob) whose advisory has no patched release
+  (vulnerable range "*"); production `npm audit --omit=dev` is clean. CI now
+  gates on the production audit and reports the full audit as advisory.
+
 ### Fixed
 - Integration suite robustness: the oversized-body case now streams chunked
   data past the size cap instead of relying on a declared content-length the
