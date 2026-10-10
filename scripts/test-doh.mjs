@@ -3,6 +3,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { importDoh } from "./lib/transpile-source.mjs";
 
+// The suite drives per-IP in-flight limits through x-real-ip headers, so opt
+// in to trusting forwarding headers (client-ip.ts ignores them otherwise).
+process.env.TRUST_PROXY_HEADERS = "1";
+
 const doh = await importDoh();
 
 function validQuery(id = 0x1234) {

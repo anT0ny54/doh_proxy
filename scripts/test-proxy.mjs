@@ -6,6 +6,10 @@ import { importTypeScript, libUrl, nextServerUrl } from "./lib/transpile-source.
 // independent of the caller's environment so it always tests the default.
 delete process.env.RATE_LIMIT_PER_MINUTE;
 
+// The suite exercises the rate limiter through x-real-ip headers, so opt in
+// to trusting forwarding headers (client-ip.ts ignores them otherwise).
+process.env.TRUST_PROXY_HEADERS = "1";
+
 const rateLimitUrl = await libUrl("rate-limit");
 const clientIpUrl = await libUrl("client-ip");
 const { WINDOW_LIMIT } = await import(rateLimitUrl);
