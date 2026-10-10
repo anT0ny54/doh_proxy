@@ -2,7 +2,8 @@
  * End-to-end integration tests. Launches the PRODUCTION build with
  * `next start` against a local mock DoH upstream and exercises real HTTP:
  * GET/POST, invalid content types, oversized bodies, slow clients, upstream
- * failures, response headers and graceful shutdown.
+ * failures and response headers. (Processes are only terminated in teardown;
+ * graceful shutdown itself is not asserted.)
  *
  * Requires `npm run build` first (CI runs build before this script).
  * Hermetic via HAGEZI_UPSTREAM_ENDPOINTS (see src/lib/doh.ts).

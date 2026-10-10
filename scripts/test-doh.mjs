@@ -587,6 +587,147 @@ try {
     assert.ok((await Promise.all(held)).every((response) => response.status === 200));
     assert.equal((await doh.proxyRequest(withIp("192.0.2.50"), options)).status, 200);
   });
+
+  await test("A half-open probe is reserved only when the upstream is actually contacted", async () => {
+    const hits = { a: 0, b: 0 };
+    let aHealthy = false;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("probe-leak-a.test")) {
+        hits.a += 1;
+        if (!aHealthy) return new Response(null, { status: 503 });
+      } else {
+        hits.b += 1;
+      }
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const a = { endpoint: "https://probe-leak-a.test/dns-query" };
+    const b = { endpoint: "https://probe-leak-b.test/dns-query" };
+    const aFirst = { upstreams: [a, b], timeoutMs: 1_000, failover: true };
+    const bFirst = { upstreams: [b, a], timeoutMs: 1_000, failover: true };
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200); // opens A
+      assert.equal(hits.a, 3);
+
+      aHealthy = true;
+      now += 31_000; // cooldown elapsed: A is half-open
+      assert.equal((await doh.proxyRequest(getRequest(), bFirst)).status, 200); // B answers first; A is not contacted
+      assert.equal(hits.a, 3);
+
+      now += 1_000; // well inside the 5 s probe TTL
+      assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200);
+      assert.equal(hits.a, 4, "an unused probe must not lock out a recovered upstream");
+      assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200);
+      assert.equal(hits.a, 5, "a successful probe closes the breaker");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test("A wrong upstream content type fails over without tripping the breaker", async () => {
+    let wrongCalls = 0;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("wrong-ct.test")) {
+        wrongCalls += 1;
+        return new Response(validResponse(), { status: 200, headers: { "content-type": "text/html" } });
+      }
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const options = {
+      upstreams: [{ endpoint: "https://wrong-ct.test/dns-query" }, { endpoint: "https://right-ct.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: true,
+    };
+    for (let i = 0; i < 5; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+    assert.equal(wrongCalls, 5, "client-independent invalid responses must not open the breaker");
+
+    const sole = await doh.proxyRequest(getRequest(), { ...options, upstreams: [options.upstreams[0]], failover: false });
+    assert.equal(sole.status, 502);
+  });
+
+  await test("Upstream responses over 65535 bytes are rejected and failover continues", async () => {
+    const oversized = new Uint8Array(65_536);
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      const host = new URL(String(url)).hostname;
+      seen.push(host);
+      if (host === "big-declared.test") {
+        return new Response(oversized, { status: 200, headers: { "content-type": "application/dns-message", "content-length": "65536" } });
+      }
+      if (host === "big-streamed.test") {
+        return new Response(oversized, { status: 200, headers: { "content-type": "application/dns-message" } });
+      }
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [
+        { endpoint: "https://big-declared.test/dns-query" },
+        { endpoint: "https://big-streamed.test/dns-query" },
+        { endpoint: "https://small.test/dns-query" },
+      ],
+      timeoutMs: 2_000,
+      failover: true,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(seen, ["big-declared.test", "big-streamed.test", "small.test"]);
+  });
+
+  await test("Handler-level 405 for unsupported methods carries an Allow header", async () => {
+    globalThis.fetch = async () => {
+      throw new Error("fetch must not run for unsupported methods");
+    };
+    const response = await doh.proxyRequest(getLikeRequest("PUT"), {
+      upstreams: [{ endpoint: "https://never-reached.test/dns-query" }],
+    });
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get("allow"), "GET, POST, HEAD, OPTIONS");
+    assert.equal(await response.text(), "Method Not Allowed");
+  });
+
+  await test("HAGEZI_ROTATION_MODE=request round-robins the primary resolver per request", () => {
+    const saved = process.env.HAGEZI_ROTATION_MODE;
+    try {
+      process.env.HAGEZI_ROTATION_MODE = " Request "; // trimmed and case-insensitive
+      const firsts = Array.from({ length: 4 }, () => doh.getHageziUpstreams()[0].endpoint);
+      assert.equal(new Set(firsts.slice(0, 3)).size, 3, "three consecutive requests start on three different resolvers");
+      assert.equal(firsts[3], firsts[0], "the cycle repeats after one full round");
+      assert.equal(new Set(doh.getHageziUpstreams().map((upstream) => upstream.endpoint)).size, 3, "every rotation keeps all upstreams");
+    } finally {
+      if (saved === undefined) delete process.env.HAGEZI_ROTATION_MODE;
+      else process.env.HAGEZI_ROTATION_MODE = saved;
+    }
+  });
+
+  await test("HAGEZI_ROTATION_SECONDS is clamped to 60-86400 seconds and bad values use the default", () => {
+    const savedSeconds = process.env.HAGEZI_ROTATION_SECONDS;
+    const savedMode = process.env.HAGEZI_ROTATION_MODE;
+    const realNow = Date.now;
+    const firstAt = (seconds, now) => {
+      process.env.HAGEZI_ROTATION_SECONDS = seconds;
+      Date.now = () => now;
+      return doh.getHageziUpstreams()[0].endpoint;
+    };
+    try {
+      delete process.env.HAGEZI_ROTATION_MODE;
+      const minute = 60_000 * 300; // slot 300 (% 3 === 0) at 60 s
+      assert.equal(firstAt("1", minute), firstAt("1", minute + 59_000), "1 s is raised to 60 s");
+
+      const day = 86_400_000 * 3;
+      assert.equal(firstAt("999999", day), firstAt("999999", day + 86_399_000), "huge values are capped at 86400 s");
+      assert.notEqual(firstAt("999999", day), firstAt("999999", day + 86_400_000));
+
+      const half = 1_800_000 * 3;
+      assert.equal(firstAt("abc", half), firstAt("abc", half + 1_799_000), "non-numeric falls back to 1800 s");
+      assert.notEqual(firstAt("abc", half), firstAt("abc", half + 1_800_000));
+    } finally {
+      Date.now = realNow;
+      if (savedSeconds === undefined) delete process.env.HAGEZI_ROTATION_SECONDS;
+      else process.env.HAGEZI_ROTATION_SECONDS = savedSeconds;
+      if (savedMode !== undefined) process.env.HAGEZI_ROTATION_MODE = savedMode;
+    }
+  });
 } finally {
   globalThis.fetch = originalFetch;
 }
