@@ -8,15 +8,16 @@
  * Limit: 100 requests per 60 seconds per source IP by default (override with
  * RATE_LIMIT_PER_MINUTE). IPv6 clients are keyed by /64.
  *
- * IMPORTANT: When running behind a reverse proxy, configure that proxy to
- * sanitize X-Forwarded-For/X-Real-IP. Otherwise clients may spoof the IP.
- *
- * When neither header is present (for example the container is exposed
- * directly, without a reverse proxy) the client address is unknown, because
- * NextRequest does not expose the socket address. Such requests are NOT
- * limited: lumping every anonymous client into one shared bucket would cap the
- * whole service at a single client's quota and let one client lock out
- * everyone. Put a reverse proxy or WAF in front to get per-client limiting.
+ * TRUSTED-PROXY BOUNDARY: client identity comes from X-Real-IP /
+ * X-Forwarded-For, which a direct client can forge. These headers are only
+ * honored when TRUST_PROXY_HEADERS is set to a truthy value — set it ONLY
+ * when a reverse proxy (nginx, Caddy, a platform front end, ...) overwrites
+ * or sanitizes those headers on every request. See src/lib/client-ip.ts.
+ * When the flag is unset, or when neither header is present, the client
+ * address is unknown and the request is NOT limited: lumping every anonymous
+ * client into one shared bucket would cap the whole service at a single
+ * client's quota and let one client lock out everyone. Put a sanitizing
+ * reverse proxy or WAF in front to get per-client limiting.
  *
  * LOCATION: this file must live in `src/` because the app uses `src/app`.
  * Next.js only detects proxy.ts/middleware.ts next to the `app` directory, so
@@ -24,7 +25,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { getClientIp } from "./lib/client-ip";
+import { getClientIp, isProxyTrustEnabled } from "./lib/client-ip";
 import { RateLimiter, WINDOW_LIMIT } from "./lib/rate-limit";
 
 function readLimit(): number {
@@ -35,7 +36,7 @@ function readLimit(): number {
 const limiter = new RateLimiter(readLimit());
 
 export default function proxy(request: NextRequest) {
-  const ip = getClientIp(request.headers);
+  const ip = getClientIp(request.headers, isProxyTrustEnabled());
   if (ip === undefined) return NextResponse.next();
 
   // Rate-limit strictly by source IP. Including Host lets one client fragment
