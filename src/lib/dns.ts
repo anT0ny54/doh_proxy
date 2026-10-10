@@ -163,8 +163,11 @@ function validateRdataNames(
     case TYPE_HTTPS: {
       // priority (2 bytes) + target name; the remaining SvcParams are opaque
       // key/value data, so the name only has to end inside the RDATA.
+      // RFC 9460, section 2.2: "Compression pointers MUST NOT be used in the
+      // target name", so the name is validated uncompressed (validated bytes
+      // still become compression targets for other names).
       if (rdLength < 3) return false;
-      const next = skipName(message, rdataStart + 2, true, targets);
+      const next = skipName(message, rdataStart + 2, false, targets);
       return next !== null && next <= end;
     }
     default:
