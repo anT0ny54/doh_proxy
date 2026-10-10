@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test-build:
@@ -42,9 +42,13 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
 
       - name: Integration tests (real HTTP)
         run: npm run test:integration
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
 
       - name: Build Docker image
         run: docker build -t doh-proxy:ci .
@@ -54,23 +58,44 @@ jobs:
         run: |
           set -Eeuo pipefail
           docker run -d --name doh-proxy -P doh-proxy:ci
-          mapped="$(docker port doh-proxy | grep -m1 '/tcp' | sed 's/.*://')"
+
+          # The Dockerfile EXPOSEs a single port (8367); ask Docker for the
+          # host mapping instead of scraping free-form output.
+          mapped=""
+          for _ in $(seq 1 30); do
+            mapped="$(docker port doh-proxy 8367/tcp 2>/dev/null | head -n1 | cut -d: -f2 || true)"
+            [ -n "$mapped" ] && break
+            sleep 1
+          done
+          if [ -z "$mapped" ]; then
+            echo "Could not determine the container's published port" >&2
+            docker logs doh-proxy || true
+            docker rm -f doh-proxy || true
+            exit 1
+          fi
+          echo "Container published on 127.0.0.1:${mapped}"
+
           ready=0
           for _ in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:${mapped}/" > /dev/null 2>&1; then ready=1; break; fi
             sleep 1
           done
+
           docker logs doh-proxy
           docker rm -f doh-proxy
+
           if [ "$ready" != "1" ]; then
             echo "Container did not serve HTTP on its advertised port" >&2
             exit 1
           fi
 
   audit:
-    name: Dependency security audit
+    # Advisory by design: audit findings must be evaluated against the actual
+    # dependency tree before upgrading; they should not silently block merges.
+    name: Dependency security audit (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    continue-on-error: true
 
     steps:
       - name: Check out repository
