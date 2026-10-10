@@ -2,6 +2,16 @@ import { isIP } from "node:net";
 
 const MAX_HEADER_ENTRY_LENGTH = 128;
 
+/**
+ * Process environment variable that opts in to trusting forwarding headers.
+ * Set it to a truthy value ("1", "true", "yes", "on") ONLY when a reverse
+ * proxy in front of this app overwrites/sanitizes X-Real-IP and
+ * X-Forwarded-For on every request.
+ */
+export const TRUST_PROXY_HEADERS_ENV = "TRUST_PROXY_HEADERS";
+
+const TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
+
 /** Expands an IPv6 literal into eight 16-bit groups, or null if malformed. */
 function expandIpv6(ip: string): number[] | null {
   let text = ip;
@@ -58,10 +68,29 @@ export function normalizeIp(raw: string): string | undefined {
 }
 
 /**
- * Best-effort client identity from headers added by a trusted reverse proxy.
- * Returns undefined when no usable address is present.
+ * Whether X-Real-IP / X-Forwarded-For may be used for client identity.
+ *
+ * These headers are only trustworthy when a sanitizing reverse proxy in front
+ * of this app overwrites them on every request. A directly connected client
+ * can otherwise forge arbitrary values and rotate them to evade the per-IP
+ * request limiter and the per-IP in-flight limit. Trust is therefore opt-in
+ * via TRUST_PROXY_HEADERS and must stay unset when the app is exposed
+ * directly. Evaluated per call (no module-level cache) so tests and runtime
+ * configuration changes are honored.
  */
-export function getClientIp(headers: Headers): string | undefined {
+export function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return TRUTHY_VALUES.has((env[TRUST_PROXY_HEADERS_ENV] ?? "").trim().toLowerCase());
+}
+
+/**
+ * Best-effort client identity from headers added by a trusted reverse proxy.
+ * Returns undefined when no usable address is present OR when forwarding
+ * headers are not trusted (see {@link isProxyTrustEnabled}): a spoofed value
+ * must never be allowed to mint a rate-limit identity.
+ */
+export function getClientIp(headers: Headers, trusted: boolean = isProxyTrustEnabled()): string | undefined {
+  if (!trusted) return undefined;
+
   // X-Real-IP carries a single address, so there is no client-controlled list.
   const realIp = headers.get("x-real-ip");
   if (realIp) {

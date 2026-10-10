@@ -9,6 +9,16 @@ export const MAX_DNS_MESSAGE_SIZE = 4_096;
  */
 export const MAX_DNS_RESPONSE_SIZE = 65_535;
 
+// RR types whose entire RDATA is a single domain name.
+const RDATA_NAME_ONLY_TYPES = new Set([2, 5, 12, 39]); // NS, CNAME, PTR, DNAME
+const TYPE_SOA = 6;
+const TYPE_MX = 15;
+const TYPE_SRV = 33;
+const TYPE_SVCB = 64;
+const TYPE_HTTPS = 65;
+// SOA RDATA after the two names: serial, refresh, retry, expire, minimum.
+const SOA_FIXED_LENGTH = 20;
+
 interface DnsCounts {
   readonly questions: number;
   readonly answers: number;
@@ -36,9 +46,10 @@ function readCounts(message: Uint8Array): DnsCounts | null {
  * bytes in the same DNS message, matching DNS backward-pointer semantics.
  *
  * `targets` is a per-message bitmap of offsets that this structural parser
- * permits as compression targets. RDATA regions are conservatively marked in
- * full because the parser does not decode every RR-specific RDATA format, while
- * still requiring the target to be in already-parsed bytes.
+ * permits as compression targets. Only bytes validated as part of a domain
+ * name (question section, RR owner names, and RR-type-decoded RDATA names)
+ * are marked; opaque RDATA contributes no targets, so a pointer cannot
+ * reference arbitrary header/ttl/RDATA bytes that merely look name-like.
  */
 function skipName(
   message: Uint8Array,
@@ -106,19 +117,78 @@ interface QuestionRange {
   readonly typeOffset: number;
 }
 
+/**
+ * Validates the domain names embedded in RDATA for the record types whose
+ * layout this parser understands, marking only the validated name bytes as
+ * compression targets. Returns false when a name-bearing RDATA is malformed;
+ * returns true for RDATA types that carry no domain names (their bytes stay
+ * opaque and never become compression targets).
+ */
+function validateRdataNames(
+  message: Uint8Array,
+  type: number,
+  rdataStart: number,
+  rdLength: number,
+  targets: Uint8Array,
+): boolean {
+  const end = rdataStart + rdLength;
+
+  if (RDATA_NAME_ONLY_TYPES.has(type)) {
+    // NS/CNAME/PTR/DNAME: the entire RDATA is exactly one domain name.
+    const next = skipName(message, rdataStart, true, targets);
+    return next !== null && next === end;
+  }
+
+  switch (type) {
+    case TYPE_MX: {
+      // preference (2 bytes) + exchange name, which must fill the rest.
+      if (rdLength < 3) return false;
+      const next = skipName(message, rdataStart + 2, true, targets);
+      return next !== null && next === end;
+    }
+    case TYPE_SOA: {
+      // mname + rname + five uint32 fields; the fixed tail must fill exactly.
+      const mnameEnd = skipName(message, rdataStart, true, targets);
+      if (mnameEnd === null || mnameEnd >= end) return false;
+      const rnameEnd = skipName(message, mnameEnd, true, targets);
+      return rnameEnd !== null && rnameEnd + SOA_FIXED_LENGTH === end;
+    }
+    case TYPE_SRV: {
+      // priority + weight + port (6 bytes) + target name filling the rest.
+      if (rdLength < 7) return false;
+      const next = skipName(message, rdataStart + 6, true, targets);
+      return next !== null && next === end;
+    }
+    case TYPE_SVCB:
+    case TYPE_HTTPS: {
+      // priority (2 bytes) + target name; the remaining SvcParams are opaque
+      // key/value data, so the name only has to end inside the RDATA.
+      if (rdLength < 3) return false;
+      const next = skipName(message, rdataStart + 2, true, targets);
+      return next !== null && next <= end;
+    }
+    default:
+      // A/AAAA/TXT/DS/DNSKEY/RRSIG/... and unknown types: RDATA carries no
+      // domain names, so none of its bytes are valid compression targets.
+      return true;
+  }
+}
+
 function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8Array): number | null {
   let offset = skipName(message, start, true, targets);
   if (offset === null || offset + 10 > message.byteLength) return null;
 
-  offset += 8;
+  const type = readUint16(message, offset);
+  offset += 8; // type (2) + class (2) + ttl (4)
   const rdLength = readUint16(message, offset);
   offset += 2;
 
   const end = offset + rdLength;
   if (end > message.byteLength) return null;
 
-  // Names embedded in RDATA are valid compression targets for later records.
-  targets.fill(1, offset, end);
+  // Only bytes decoded as genuine domain names become compression targets;
+  // never the RDATA region as a whole.
+  if (!validateRdataNames(message, type, offset, rdLength, targets)) return null;
   return end;
 }
 

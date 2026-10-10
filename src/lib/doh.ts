@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getClientIp } from "@/lib/client-ip";
+import { getClientIp, isProxyTrustEnabled } from "@/lib/client-ip";
 import { DOH_PROVIDERS } from "@/lib/providers";
 import {
   DNS_MESSAGE,
@@ -176,7 +176,32 @@ function getRotationConfig(): RotationConfig {
  * on a time slot (consistent across instances); with
  * HAGEZI_ROTATION_MODE=request it round-robins per request to spread load.
  */
+let overrideUpstreams: readonly NormalizedDoHUpstream[] | null | undefined;
+
+/**
+ * Optional comma-separated endpoint override (HAGEZI_UPSTREAM_ENDPOINTS).
+ * Primarily for the integration test-suite and self-hosted deployments that
+ * pin their own resolvers; unset in production. Invalid entries are ignored.
+ */
+function getOverrideUpstreams(): readonly NormalizedDoHUpstream[] | undefined {
+  if (overrideUpstreams !== undefined) return overrideUpstreams ?? undefined;
+  const raw = process.env.HAGEZI_UPSTREAM_ENDPOINTS?.trim() ?? "";
+  const endpoints = raw ? raw.split(",").map((entry) => entry.trim()).filter(Boolean) : [];
+  const parsed: NormalizedDoHUpstream[] = [];
+  for (const endpoint of endpoints) {
+    try {
+      parsed.push({ endpoint, url: new URL(endpoint) });
+    } catch {
+      // Ignore malformed endpoints rather than failing every request.
+    }
+  }
+  overrideUpstreams = parsed.length > 0 ? parsed : null;
+  return overrideUpstreams ?? undefined;
+}
+
 export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
+  const override = getOverrideUpstreams();
+  if (override) return override;
   const { seconds, perRequest } = getRotationConfig();
   const count = ROTATED_HAGEZI_UPSTREAMS.length;
   const slot = perRequest
@@ -518,7 +543,7 @@ function relayedMaxAge(cacheControl: string | null): number {
 export async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
   const earlyResponse = getEarlyMethodResponse(request);
   if (earlyResponse) return earlyResponse;
-  const clientIp = getClientIp(request.headers);
+  const clientIp = getClientIp(request.headers, isProxyTrustEnabled());
   if (!tryAcquireInFlight(clientIp)) return busyResponse();
 
   try {
