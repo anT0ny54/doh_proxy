@@ -177,6 +177,33 @@ test("HTTPS/SVCB target name must end inside the RDATA", () => {
   assert.equal(isValidDnsResponse(buildResponse(QUERY, [bad]), QUERY), false);
 });
 
+test("compressed SVCB/HTTPS target name is rejected (RFC 9460 section 2.2)", () => {
+  // Bare compression pointer into the question section as the target name.
+  for (const type of [64, 65]) {
+    const rr = resourceRecord("example.com", type, Buffer.concat([u16(1), Buffer.from([0xc0, 0x0c])]));
+    const response = buildResponse(QUERY, [rr]);
+    assert.equal(isValidDnsResponse(response, QUERY), false, `type ${type} with pointer target`);
+  }
+
+  // Pointer after a leading label is also rejected.
+  for (const type of [64, 65]) {
+    const rr = resourceRecord("example.com", type, Buffer.concat([u16(0), Buffer.from([3, 99, 100, 110, 0xc0, 0x0c])]));
+    const response = buildResponse(QUERY, [rr]);
+    assert.equal(isValidDnsResponse(response, QUERY), false, `type ${type} with mid-name pointer`);
+  }
+
+  // Sanity: uncompressed targets with SvcParams still validate.
+  for (const type of [64, 65]) {
+    const rr = resourceRecord(
+      "example.com",
+      type,
+      Buffer.concat([u16(1), encodeName("cdn.example.com"), u16(0), u16(0)]),
+    );
+    const response = buildResponse(QUERY, [rr]);
+    assert.equal(isValidDnsResponse(response, QUERY), true, `type ${type} with uncompressed target`);
+  }
+});
+
 test("compression cycle inside MX exchange name is rejected", () => {
   const mxOwner = encodeName("example.com");
   const nameOffset = answerStart(QUERY) + mxOwner.length + 10 + 2;
