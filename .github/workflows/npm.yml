@@ -12,9 +12,9 @@ permissions:
 
 jobs:
   generate-lockfile:
-    name: Generate and commit package-lock.json
+    name: Regenerate, verify and commit package-lock.json
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -22,41 +22,48 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Node.js
+      - name: Set up Node.js 22
         uses: actions/setup-node@v5
         with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: package.json
+          node-version: 22
 
-      - name: Verify npm
+      # A full regeneration (not --package-lock-only on top of the old file)
+      # re-resolves every transitive dependency, including Next.js'
+      # platform-specific @next/swc-* optional packages.
+      - name: Regenerate package-lock.json
         shell: bash
         run: |
           set -Eeuo pipefail
+          rm -f package-lock.json
+          rm -rf node_modules
+          npm install --ignore-scripts --no-audit --no-fund
 
-          test -f package.json
-          node --version
-          npm --version
-
-      - name: Update package-lock.json
+      - name: Check platform binaries are locked
         shell: bash
         run: |
           set -Eeuo pipefail
+          for pkg in @next/swc-linux-x64-gnu @next/swc-linux-x64-musl; do
+            if ! grep -q "\"node_modules/${pkg}\"" package-lock.json; then
+              echo "package-lock.json has no entry for ${pkg}" >&2
+              exit 1
+            fi
+          done
 
-          npm install \
-            --package-lock-only \
-            --ignore-scripts \
-            --no-audit \
-            --no-fund
-
-      - name: Validate package-lock.json
+      # Never commit a lockfile that breaks the project.
+      - name: Verify with the new lockfile
         shell: bash
         run: |
           set -Eeuo pipefail
+          npm ci --no-audit --no-fund
+          npm run lint
+          npm run typecheck
+          npm test
+          npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
 
-          test -s package-lock.json
-          npm ci --dry-run --ignore-scripts --no-audit --no-fund
-
+      # Pushes made with GITHUB_TOKEN do not trigger other workflows, so CI
+      # will not run on this commit by itself; run it manually or open a PR.
       - name: Commit and push changes
         shell: bash
         run: |
@@ -72,7 +79,5 @@ jobs:
             exit 0
           fi
 
-          git commit \
-            -m "chore(deps): update package-lock.json [skip ci]"
-
+          git commit -m "chore(deps): regenerate package-lock.json"
           git push origin "HEAD:${GITHUB_REF_NAME}"

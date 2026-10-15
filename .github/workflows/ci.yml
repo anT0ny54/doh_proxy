@@ -37,6 +37,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Type check
+        run: npm run typecheck
+
       - name: Unit tests
         run: npm test
 
@@ -53,39 +56,35 @@ jobs:
       - name: Build Docker image
         run: docker build -t doh-proxy:ci .
 
+      # Runs the image on the host network against the local mock upstream
+      # and performs a real DoH query, so a broken standalone bundle or a
+      # missing socket-IP preload fails CI (not just "the home page loads").
       - name: Docker container smoke test
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker run -d --name doh-proxy -P doh-proxy:ci
+          node scripts/lib/mock-upstream.mjs 18053 &
+          mock_pid=$!
+          docker run -d --name doh-proxy --network host \
+            -e PORT=18367 \
+            -e HAGEZI_UPSTREAM_ENDPOINTS=http://127.0.0.1:18053/dns-query \
+            doh-proxy:ci
 
-          # The Dockerfile EXPOSEs a single port (8367); ask Docker for the
-          # host mapping instead of scraping free-form output.
-          mapped=""
-          for _ in $(seq 1 30); do
-            mapped="$(docker port doh-proxy 8367/tcp 2>/dev/null | head -n1 | cut -d: -f2 || true)"
-            [ -n "$mapped" ] && break
-            sleep 1
-          done
-          if [ -z "$mapped" ]; then
-            echo "Could not determine the container's published port" >&2
-            docker logs doh-proxy || true
-            docker rm -f doh-proxy || true
-            exit 1
-          fi
-          echo "Container published on 127.0.0.1:${mapped}"
-
-          ready=0
+          query="$(node --input-type=module -e 'import { validQuery } from "./scripts/lib/dns-fixtures.mjs"; process.stdout.write(Buffer.from(validQuery()).toString("base64url"))')"
+          result=""
           for _ in $(seq 1 60); do
-            if curl -fsS "http://127.0.0.1:${mapped}/" > /dev/null 2>&1; then ready=1; break; fi
+            result="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' \
+              "http://127.0.0.1:18367/api/doh/dns-query?dns=${query}" 2>/dev/null || true)"
+            [ "$result" = "200 application/dns-message" ] && break
             sleep 1
           done
 
           docker logs doh-proxy
           docker rm -f doh-proxy
+          kill "$mock_pid" || true
 
-          if [ "$ready" != "1" ]; then
-            echo "Container did not serve HTTP on its advertised port" >&2
+          if [ "$result" != "200 application/dns-message" ]; then
+            echo "Container did not answer a DoH query (got: ${result:-no response})" >&2
             exit 1
           fi
 
@@ -104,18 +103,15 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 22
-          cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
+      # npm audit only needs the lockfile; no install required.
       # Blocking gate: production dependencies must be vulnerability-free.
       - name: Production dependency audit
-        run: npm audit --omit=dev --audit-level=high
+        run: npm audit --package-lock-only --omit=dev --audit-level=high
 
       # Advisory: the remaining findings are dev-only. The braces/micromatch/
       # fast-glob chain is lint-time only and its advisory has no patched
       # release (vulnerable range "*"), so this step reports but never blocks.
       - name: Full audit including devDependencies (advisory)
-        run: npm audit --audit-level=moderate
+        run: npm audit --package-lock-only --audit-level=moderate
         continue-on-error: true

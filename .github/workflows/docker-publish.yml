@@ -2,6 +2,10 @@ name: Docker Build and Publish
 
 on:
   workflow_dispatch:
+  # Version tags (v2.9.0) publish semver-tagged images; the semver tag rules
+  # below only produce tags on these refs.
+  push:
+    tags: ["v*"]
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
@@ -11,8 +15,38 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Lint, type check and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
   build:
     name: Build Docker image
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
