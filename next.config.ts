@@ -20,11 +20,18 @@ const documentCsp =
 // Dockerfile, however, copies `.next/standalone` for self-hosting and needs
 // it. Both platforms set their own build-time environment variable, so use
 // that to scope standalone output to self-hosted (e.g. Docker) builds only.
-const isManagedPlatformBuild = Boolean(process.env.VERCEL) || Boolean(process.env.NETLIFY);
+const platform = process.env.VERCEL ? "vercel" : process.env.NETLIFY ? "netlify" : "self-hosted";
+const isManagedPlatformBuild = platform !== "self-hosted";
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
   output: isManagedPlatformBuild ? undefined : "standalone",
+  // Inlined into server code: selects the platform's unforgeable client-IP
+  // header by default (see src/lib/config.ts).
+  env: { DOH_BUILD_PLATFORM: platform },
+  // The app never uses next/image. Disabling the optimizer removes the
+  // image-optimization endpoint (and its sharp attack surface) entirely.
+  images: { unoptimized: true },
   async headers() {
     return [
       { source: "/(.*)", headers: securityHeaders },

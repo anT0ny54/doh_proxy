@@ -34,9 +34,12 @@ ENV HOSTNAME=0.0.0.0
 # The official node image already ships an unprivileged `node` user (uid 1000).
 COPY --from=builder --chown=node:node /app/.next/standalone ./
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+# Records the TCP peer address for the rate limiter (TRUST_PROXY_HEADERS=0, and
+# as a fallback when trusted forwarding headers are absent).
+COPY --chown=node:node server/socket-ip-preload.cjs ./
 
 USER node
 EXPOSE 8367
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget -q --spider "http://127.0.0.1:${PORT}/" || exit 1
-CMD ["node", "server.js"]
+CMD ["node", "--require", "./socket-ip-preload.cjs", "server.js"]
