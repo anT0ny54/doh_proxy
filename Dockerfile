@@ -13,8 +13,6 @@ FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
-# proxy.ts now lives in src/ (Next.js ignores a root-level proxy.ts when the
-# app uses src/app), so it is already covered by the `src` copy above.
 COPY next.config.ts tsconfig.json postcss.config.mjs ./
 # The homepage is statically generated and NEXT_PUBLIC_* values are inlined at
 # build time, so the public origin must be supplied as a build argument:
@@ -29,17 +27,23 @@ FROM base AS runner
 ENV NODE_ENV=production
 ENV NODE_OPTIONS=--max-old-space-size=320
 ENV PORT=8367
+# IPv4 only by default (Docker sets HOSTNAME to the container id, so it must be
+# set explicitly). For dual-stack on an IPv6-enabled Docker network use
+# `-e HOSTNAME=::`.
 ENV HOSTNAME=0.0.0.0
 
 # The official node image already ships an unprivileged `node` user (uid 1000).
 COPY --from=builder --chown=node:node /app/.next/standalone ./
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
-# Records the TCP peer address for the rate limiter (TRUST_PROXY_HEADERS=0, and
-# as a fallback when trusted forwarding headers are absent).
+# Records the TCP peer address for the rate limiter (client identity, the
+# TRUSTED_PROXIES check and the fallback) and sets tight HTTP request/header
+# timeouts for slow clients.
 COPY --chown=node:node server/socket-ip-preload.cjs ./
 
 USER node
 EXPOSE 8367
+# HEAD on the DoH route exercises the proxy and the route bundle (not just the
+# prerendered homepage) without upstream traffic; HEAD is not rate limited.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -q --spider "http://127.0.0.1:${PORT}/" || exit 1
+  CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/doh/dns-query',{method:'HEAD'}).then(r=>process.exit(r.status===204?0:1),()=>process.exit(1))"
 CMD ["node", "--require", "./socket-ip-preload.cjs", "server.js"]

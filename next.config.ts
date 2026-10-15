@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import packageJson from "./package.json";
 
 const securityHeaders = [
   { key: "X-Content-Type-Options", value: "nosniff" },
@@ -26,9 +27,19 @@ const isManagedPlatformBuild = platform !== "self-hosted";
 const nextConfig: NextConfig = {
   poweredByHeader: false,
   output: isManagedPlatformBuild ? undefined : "standalone",
-  // Inlined into server code: selects the platform's unforgeable client-IP
-  // header by default (see src/lib/config.ts).
-  env: { DOH_BUILD_PLATFORM: platform },
+  // Inlined into server code: the platform selects the unforgeable client-IP
+  // header by default (see src/lib/config.ts); only the version string of
+  // package.json is inlined (upstream User-Agent), not the whole file.
+  env: { DOH_BUILD_PLATFORM: platform, DOH_PROXY_VERSION: packageJson.version },
+  experimental: {
+    // src/proxy.ts makes Next.js buffer every request body before the route
+    // runs (default cap: 10 MB), i.e. before the in-flight ceiling and the
+    // route's own 4 KiB streaming cap apply. The cap is one byte over
+    // MAX_DNS_MESSAGE_SIZE (src/lib/dns.ts): server/socket-ip-preload.cjs
+    // splits the chunk crossing it, so an oversized body reaches the route as
+    // 4097 bytes and is still answered 413. Checked by scripts/test-config.mjs.
+    proxyClientMaxBodySize: 4_097,
+  },
   // The app never uses next/image. Disabling the optimizer removes the
   // image-optimization endpoint (and its sharp attack surface) entirely.
   images: { unoptimized: true },
