@@ -11,7 +11,7 @@ import {
 } from "@/lib/dns";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-export const PROXY_VERSION = "2.8.1";
+export const PROXY_VERSION = "2.8.2";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
@@ -345,7 +345,9 @@ function decodeBase64Url(value: string): ValidatedQuery | null {
 }
 
 function validateGet(url: URL): { readonly dnsParam: string; readonly query: ValidatedQuery } | NextResponse {
-  if (url.search.length > MAX_QUERY_STRING_LENGTH) return textResponse("Query string too long", 414);
+  // `url.search` includes the leading "?", so without the +1 the effective
+  // cap was MAX_QUERY_STRING_LENGTH - 1.
+  if (url.search.length > MAX_QUERY_STRING_LENGTH + 1) return textResponse("Query string too long", 414);
 
   const dnsValues = url.searchParams.getAll("dns");
   if (dnsValues.length !== 1) return textResponse("Invalid DNS message", 400);
@@ -440,7 +442,7 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     const size = Number(contentLength);
-    if (!Number.isInteger(size) || size > MAX_DNS_RESPONSE_SIZE) {
+    if (!Number.isInteger(size) || size < 0 || size > MAX_DNS_RESPONSE_SIZE) {
       cancelResponseBody(response);
       return null;
     }
@@ -514,18 +516,19 @@ interface UpstreamFetch {
 
 async function fetchUpstream(
   request: NextRequest,
-  dnsParam: string | undefined,
+  dnsSearch: string | undefined,
   upstream: NormalizedDoHUpstream,
-  body: Uint8Array | undefined,
+  body: ArrayBuffer | undefined,
   timeoutMs: number,
 ): Promise<UpstreamFetch> {
-  const isGet = request.method === "GET" && dnsParam !== undefined;
   let url: string | URL = upstream.url;
-  if (isGet) {
-    // `dnsParam` already passed the base64url check. Going through URL keeps an
-    // operator-supplied query string (e.g. `?token=...`) intact.
+  if (dnsSearch !== undefined) {
+    // `dnsSearch` (including the base64url encoding of the dns parameter) is
+    // built once per request; only the upstream base URL differs between
+    // failover attempts. Going through URL keeps an operator-supplied query
+    // string (e.g. `?token=...`) intact.
     const target = new URL(upstream.url);
-    target.searchParams.set("dns", dnsParam);
+    target.search = target.search ? `${target.search}&${dnsSearch}` : `?${dnsSearch}`;
     url = target.href;
   }
 
@@ -533,17 +536,24 @@ async function fetchUpstream(
     Accept: DNS_MESSAGE,
     "User-Agent": USER_AGENT,
   });
-  if (request.method === "POST") headers.set("Content-Type", DNS_MESSAGE);
+  if (body !== undefined) headers.set("Content-Type", DNS_MESSAGE);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Propagate client disconnects: when the client goes away mid-request, abort
+  // the upstream fetch immediately instead of holding an in-flight slot and
+  // burning the remaining deadline. The guard covers plain-object requests in
+  // the test suites, which have no `signal` (Node 22+ supports AbortSignal.any).
+  const signal = request.signal
+    ? AbortSignal.any([controller.signal, request.signal])
+    : controller.signal;
 
   try {
     const response = await fetch(url, {
       method: request.method,
       headers,
-      body: body === undefined ? undefined : toArrayBuffer(body),
-      signal: controller.signal,
+      body,
+      signal,
       cache: "no-store",
       redirect: "error",
     });
@@ -602,6 +612,12 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
   // Provider routes try exactly one upstream, so only that one is normalized.
   let upstreams = (failover ? configured : configured.slice(0, 1)).map(normalizeUpstream);
 
+  // Copy the POST body into a fresh ArrayBuffer once per request (the failover
+  // loop would otherwise re-copy it on every attempt), and pre-encode the GET
+  // dns parameter once so each attempt only merges it into the upstream URL.
+  const postBody = request.method === "POST" ? toArrayBuffer(query.body) : undefined;
+  const dnsSearch = dnsParam === undefined ? undefined : `dns=${encodeURIComponent(dnsParam)}`;
+
   // Skip upstreams whose breaker is open, but never fail fast when *all* of
   // them are open: a probe request is what lets a recovered upstream close its
   // breaker sooner, and a dead-looking upstream may still answer.
@@ -631,13 +647,7 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
 
     claimProbe(upstream.endpoint);
     try {
-      const upstreamFetch = await fetchUpstream(
-        request,
-        dnsParam,
-        upstream,
-        request.method === "POST" ? query.body : undefined,
-        attemptTimeout,
-      );
+      const upstreamFetch = await fetchUpstream(request, dnsSearch, upstream, postBody, attemptTimeout);
       const result = upstreamFetch.response;
 
       try {
@@ -692,6 +702,12 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
         upstreamFetch.cleanup();
       }
     } catch {
+      if (request.signal?.aborted) {
+        // The client disconnected: stop failing over without blaming the
+        // upstream or holding its half-open circuit-breaker probe slot.
+        releaseProbe(upstream.endpoint);
+        break;
+      }
       // Network errors and timeouts are retryable; try the next fixed upstream.
       recordFailure(upstream.endpoint);
     }

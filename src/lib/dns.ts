@@ -115,6 +115,8 @@ function skipName(
 interface QuestionRange {
   readonly end: number;
   readonly typeOffset: number;
+  /** False only for QDCOUNT=0 responses, which carry no question to match. */
+  readonly present: boolean;
 }
 
 /**
@@ -207,13 +209,22 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
   const opcode = (flags >>> 11) & 0x0f;
 
   if (isResponse !== expectedResponse || opcode !== 0) return null;
-  if (counts.questions !== 1) return null;
+  // Queries must carry exactly one uncompressed question. Responses with
+  // QDCOUNT=0 are rare but legal (some upstreams omit the question section);
+  // relaying for them must not 502 across the whole failover list.
+  if (expectedResponse ? counts.questions > 1 : counts.questions !== 1) return null;
 
   const targets = new Uint8Array(message.byteLength);
-  const questionNameStart = 12;
-  const questionNameEnd = skipName(message, questionNameStart, false, targets);
-  if (questionNameEnd === null || questionNameEnd + 4 > message.byteLength) return null;
-  const question = { end: questionNameEnd + 4, typeOffset: questionNameEnd };
+  let question: QuestionRange;
+  if (counts.questions === 1) {
+    // Question QNAME compression stays rejected: a response question is the
+    // first name in the message, so there is no earlier name to point at.
+    const questionNameEnd = skipName(message, 12, false, targets);
+    if (questionNameEnd === null || questionNameEnd + 4 > message.byteLength) return null;
+    question = { end: questionNameEnd + 4, typeOffset: questionNameEnd, present: true };
+  } else {
+    question = { end: 12, typeOffset: 12, present: false };
+  }
 
   let offset = question.end;
 
@@ -282,6 +293,9 @@ export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array | Par
   const parsed = query instanceof Uint8Array ? parseQuery(query) : query;
   if (parsed === null) return false;
   if (readUint16(message, 0) !== parsed.id) return false;
+  // A QDCOUNT=0 response has no question section; the transaction ID is the
+  // only match available.
+  if (!responseQuestion.present) return true;
 
   return questionMatches(message, responseQuestion, parsed);
 }

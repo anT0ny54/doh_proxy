@@ -25,14 +25,17 @@ function expandIpv6(ip: string): number[] | null {
     text = `${text.slice(0, lastColon + 1)}${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
   }
 
+  // "::" alone splits into three empty segments; it is the valid unspecified
+  // address and must expand to eight zero groups, not be rejected.
   const halves = text.split("::");
-  if (halves.length > 2) return null;
+  if (halves.length > 2 && !halves.every((half) => half === "")) return null;
+  const compressed = halves.length >= 2;
   const head = halves[0] ? halves[0].split(":") : [];
-  const rest = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const rest = compressed && halves[halves.length - 1] ? halves[halves.length - 1].split(":") : [];
   const missing = 8 - head.length - rest.length;
-  if (halves.length === 2 ? missing < 1 : missing !== 0) return null;
+  if (compressed ? missing < 1 : missing !== 0) return null;
 
-  const groups = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill("0"), ...rest].map((group) =>
+  const groups = [...head, ...Array<string>(compressed ? missing : 0).fill("0"), ...rest].map((group) =>
     /^[0-9a-f]{1,4}$/i.test(group) ? Number.parseInt(group, 16) : Number.NaN,
   );
   return groups.length === 8 && groups.every((group) => Number.isInteger(group)) ? groups : null;
