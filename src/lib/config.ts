@@ -1,0 +1,111 @@
+/**
+ * Runtime configuration, parsed ONCE when the module loads. Every setting is
+ * read the same way (no per-request `process.env` lookups); restart the
+ * process to apply a change.
+ */
+
+/** Request header through which `src/proxy.ts` hands the client key to the route. */
+export const CLIENT_KEY_HEADER = "x-doh-client-key";
+/**
+ * Header written by `server/socket-ip-preload.cjs` with the TCP peer address.
+ * Keep in sync with that file (checked by scripts/test-config.mjs).
+ */
+export const SOCKET_IP_HEADER = "x-doh-socket-ip";
+/** globalThis flag set by the preload; the socket header is ignored without it. */
+export const SOCKET_IP_PRELOAD_FLAG = "__dohSocketIpPreload";
+
+export const DEFAULT_RATE_LIMIT_PER_MINUTE = 100;
+export const DEFAULT_HAGEZI_ROTATION_SECONDS = 1_800;
+const MIN_HAGEZI_ROTATION_SECONDS = 60;
+const MAX_HAGEZI_ROTATION_SECONDS = 86_400;
+const MAX_TRUSTED_PROXY_HOPS = 16;
+
+export type Platform = "vercel" | "netlify" | "self-hosted";
+
+/**
+ * Header that the platform edge itself sets from the TCP peer (and overwrites
+ * on every request), so a client cannot forge it. Self-hosted deployments use
+ * the right-most X-Forwarded-For entry, which the nearest reverse proxy adds.
+ */
+const PLATFORM_CLIENT_IP_HEADERS: Readonly<Record<Platform, readonly string[]>> = {
+  vercel: ["x-real-ip", "x-forwarded-for"],
+  netlify: ["x-nf-client-connection-ip"],
+  "self-hosted": ["x-forwarded-for"],
+};
+
+export interface ClientIpConfig {
+  readonly trustProxyHeaders: boolean;
+  readonly clientIpHeaders: readonly string[];
+  readonly trustedProxyHops: number;
+}
+
+export interface ProxyConfig extends ClientIpConfig {
+  readonly platform: Platform;
+  readonly rateLimitPerMinute: number;
+  readonly hageziRotationSeconds: number;
+  readonly hageziRotationPerRequest: boolean;
+  readonly hageziUpstreamEndpoints: readonly string[];
+}
+
+const TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
+
+/** Unset/empty or "1"/"true"/"yes"/"on" enable trust; anything else disables it. */
+export function parseTrust(value: string | undefined): boolean {
+  const normalized = (value ?? "").trim().toLowerCase();
+  return normalized === "" || TRUTHY_VALUES.has(normalized);
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
+  const parsed = Number(value?.trim() || Number.NaN);
+  return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
+}
+
+function parseRotationSeconds(value: string | undefined): number {
+  const raw = value?.trim();
+  const parsed = raw ? Number(raw) : Number.NaN;
+  if (!Number.isFinite(parsed)) return DEFAULT_HAGEZI_ROTATION_SECONDS;
+  return Math.min(Math.max(Math.floor(parsed), MIN_HAGEZI_ROTATION_SECONDS), MAX_HAGEZI_ROTATION_SECONDS);
+}
+
+function parseList(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
+}
+
+/** Valid http(s) entries of HAGEZI_UPSTREAM_ENDPOINTS; malformed ones are dropped. */
+function parseUpstreamEndpoints(value: string | undefined): string[] {
+  return parseList(value).filter((endpoint) => {
+    try {
+      const { protocol } = new URL(endpoint);
+      return protocol === "https:" || protocol === "http:";
+    } catch {
+      return false;
+    }
+  });
+}
+
+function detectPlatform(env: NodeJS.ProcessEnv): Platform {
+  // DOH_BUILD_PLATFORM is inlined at build time by next.config.ts; the
+  // runtime VERCEL/NETLIFY markers are a fallback for unusual build setups.
+  const platform = env.DOH_BUILD_PLATFORM ?? process.env.DOH_BUILD_PLATFORM;
+  if (platform === "vercel" || platform === "netlify" || platform === "self-hosted") return platform;
+  if (env.VERCEL) return "vercel";
+  if (env.NETLIFY) return "netlify";
+  return "self-hosted";
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): ProxyConfig {
+  const platform = detectPlatform(env);
+  const headers = parseList(env.CLIENT_IP_HEADERS).map((name) => name.toLowerCase());
+  return Object.freeze({
+    platform,
+    trustProxyHeaders: parseTrust(env.TRUST_PROXY_HEADERS),
+    clientIpHeaders: Object.freeze(headers.length > 0 ? headers : [...PLATFORM_CLIENT_IP_HEADERS[platform]]),
+    trustedProxyHops: parsePositiveInteger(env.TRUSTED_PROXY_HOPS, 1, MAX_TRUSTED_PROXY_HOPS),
+    rateLimitPerMinute: parsePositiveInteger(env.RATE_LIMIT_PER_MINUTE, DEFAULT_RATE_LIMIT_PER_MINUTE),
+    hageziRotationSeconds: parseRotationSeconds(env.HAGEZI_ROTATION_SECONDS),
+    hageziRotationPerRequest: env.HAGEZI_ROTATION_MODE?.trim().toLowerCase() === "request",
+    hageziUpstreamEndpoints: Object.freeze(parseUpstreamEndpoints(env.HAGEZI_UPSTREAM_ENDPOINTS)),
+  });
+}
+
+export const CONFIG: ProxyConfig = loadConfig();

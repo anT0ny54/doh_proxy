@@ -9,15 +9,52 @@ export const MAX_DNS_MESSAGE_SIZE = 4_096;
  */
 export const MAX_DNS_RESPONSE_SIZE = 65_535;
 
-// RR types whose entire RDATA is a single domain name.
-const RDATA_NAME_ONLY_TYPES = new Set([2, 5, 12, 39]); // NS, CNAME, PTR, DNAME
-const TYPE_SOA = 6;
-const TYPE_MX = 15;
-const TYPE_SRV = 33;
-const TYPE_SVCB = 64;
-const TYPE_HTTPS = 65;
-// SOA RDATA after the two names: serial, refresh, retry, expire, minimum.
-const SOA_FIXED_LENGTH = 20;
+// RDATA layouts of the record types that embed domain names. A positive number
+// is a fixed-size field (bytes); the negative markers are variable fields.
+const NAME = -1; // domain name, compression allowed
+const NAME_UNCOMPRESSED = -2; // domain name, compression forbidden
+const CHARACTER_STRING = -3; // length-prefixed <character-string>
+
+interface RdataLayout {
+  readonly fields: readonly number[];
+  /** True when opaque data may follow the last field (SVCB/HTTPS SvcParams). */
+  readonly opaqueTail?: boolean;
+}
+
+const SINGLE_NAME: RdataLayout = { fields: [NAME] };
+const TWO_NAMES: RdataLayout = { fields: [NAME, NAME] };
+const PREFERENCE_NAME: RdataLayout = { fields: [2, NAME] };
+// RFC 9460, section 2.2: "Compression pointers MUST NOT be used in the target name".
+const SVCB_LAYOUT: RdataLayout = { fields: [2, NAME_UNCOMPRESSED], opaqueTail: true };
+
+/**
+ * Compression is accepted for the RFC 1035 types and for the types that
+ * RFC 3597, section 4 says receivers SHOULD decompress (RP, AFSDB, RT, PX,
+ * SRV, NAPTR). Types not listed carry no domain names: their RDATA is opaque.
+ */
+const RDATA_LAYOUTS: ReadonlyMap<number, RdataLayout> = new Map([
+  [2, SINGLE_NAME], // NS
+  [3, SINGLE_NAME], // MD
+  [4, SINGLE_NAME], // MF
+  [5, SINGLE_NAME], // CNAME
+  [6, { fields: [NAME, NAME, 20] }], // SOA: mname, rname, 5 x uint32
+  [7, SINGLE_NAME], // MB
+  [8, SINGLE_NAME], // MG
+  [9, SINGLE_NAME], // MR
+  [12, SINGLE_NAME], // PTR
+  [14, TWO_NAMES], // MINFO
+  [15, PREFERENCE_NAME], // MX
+  [17, TWO_NAMES], // RP
+  [18, PREFERENCE_NAME], // AFSDB
+  [21, PREFERENCE_NAME], // RT
+  [26, { fields: [2, NAME, NAME] }], // PX
+  [33, { fields: [6, NAME] }], // SRV: priority, weight, port, target
+  [35, { fields: [4, CHARACTER_STRING, CHARACTER_STRING, CHARACTER_STRING, NAME] }], // NAPTR
+  [36, PREFERENCE_NAME], // KX
+  [39, SINGLE_NAME], // DNAME
+  [64, SVCB_LAYOUT], // SVCB
+  [65, SVCB_LAYOUT], // HTTPS
+]);
 
 interface DnsCounts {
   readonly questions: number;
@@ -102,7 +139,9 @@ function skipName(
       continue;
     }
 
-    if ((length & 0xc0) !== 0 || length > 63 || offset + 1 + length > message.byteLength) return null;
+    // Not a pointer and not 0b00 (0x40/0x80 are reserved label types). After
+    // this check `length` is at most 63.
+    if ((length & 0xc0) !== 0 || offset + 1 + length > message.byteLength) return null;
     targets[lengthOffset] = 1;
     expandedNameLength += 1 + length;
     if (expandedNameLength > 255) return null;
@@ -120,11 +159,11 @@ interface QuestionRange {
 }
 
 /**
- * Validates the domain names embedded in RDATA for the record types whose
- * layout this parser understands, marking only the validated name bytes as
- * compression targets. Returns false when a name-bearing RDATA is malformed;
- * returns true for RDATA types that carry no domain names (their bytes stay
- * opaque and never become compression targets).
+ * Validates the domain names embedded in RDATA for the record types listed in
+ * RDATA_LAYOUTS, marking only the validated name bytes as compression targets.
+ * Returns false when name-bearing RDATA is malformed; returns true for types
+ * whose RDATA carries no names (their bytes stay opaque and never become
+ * compression targets).
  */
 function validateRdataNames(
   message: Uint8Array,
@@ -133,50 +172,27 @@ function validateRdataNames(
   rdLength: number,
   targets: Uint8Array,
 ): boolean {
+  const layout = RDATA_LAYOUTS.get(type);
+  if (!layout) return true;
+
   const end = rdataStart + rdLength;
-
-  if (RDATA_NAME_ONLY_TYPES.has(type)) {
-    // NS/CNAME/PTR/DNAME: the entire RDATA is exactly one domain name.
-    const next = skipName(message, rdataStart, true, targets);
-    return next !== null && next === end;
+  let offset = rdataStart;
+  for (const field of layout.fields) {
+    if (field > 0) {
+      offset += field;
+      if (offset > end) return false;
+    } else if (field === CHARACTER_STRING) {
+      if (offset >= end) return false;
+      offset += 1 + message[offset];
+      if (offset > end) return false;
+    } else {
+      if (offset >= end) return false;
+      const next = skipName(message, offset, field === NAME, targets);
+      if (next === null || next > end) return false;
+      offset = next;
+    }
   }
-
-  switch (type) {
-    case TYPE_MX: {
-      // preference (2 bytes) + exchange name, which must fill the rest.
-      if (rdLength < 3) return false;
-      const next = skipName(message, rdataStart + 2, true, targets);
-      return next !== null && next === end;
-    }
-    case TYPE_SOA: {
-      // mname + rname + five uint32 fields; the fixed tail must fill exactly.
-      const mnameEnd = skipName(message, rdataStart, true, targets);
-      if (mnameEnd === null || mnameEnd >= end) return false;
-      const rnameEnd = skipName(message, mnameEnd, true, targets);
-      return rnameEnd !== null && rnameEnd + SOA_FIXED_LENGTH === end;
-    }
-    case TYPE_SRV: {
-      // priority + weight + port (6 bytes) + target name filling the rest.
-      if (rdLength < 7) return false;
-      const next = skipName(message, rdataStart + 6, true, targets);
-      return next !== null && next === end;
-    }
-    case TYPE_SVCB:
-    case TYPE_HTTPS: {
-      // priority (2 bytes) + target name; the remaining SvcParams are opaque
-      // key/value data, so the name only has to end inside the RDATA.
-      // RFC 9460, section 2.2: "Compression pointers MUST NOT be used in the
-      // target name", so the name is validated uncompressed (validated bytes
-      // still become compression targets for other names).
-      if (rdLength < 3) return false;
-      const next = skipName(message, rdataStart + 2, false, targets);
-      return next !== null && next <= end;
-    }
-    default:
-      // A/AAAA/TXT/DS/DNSKEY/RRSIG/... and unknown types: RDATA carries no
-      // domain names, so none of its bytes are valid compression targets.
-      return true;
-  }
+  return layout.opaqueTail ? offset <= end : offset === end;
 }
 
 function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8Array): number | null {
@@ -198,8 +214,9 @@ function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8A
 }
 
 function validateStructure(message: Uint8Array, expectedResponse: boolean): QuestionRange | null {
-  const maxSize = expectedResponse ? MAX_DNS_RESPONSE_SIZE : MAX_DNS_MESSAGE_SIZE;
-  if (message.byteLength > maxSize) return null;
+  // Responses are size-capped while they are read (see readResponseBody in
+  // doh.ts); parseQuery is the only gate for the query cap.
+  if (!expectedResponse && message.byteLength > MAX_DNS_MESSAGE_SIZE) return null;
 
   const counts = readCounts(message);
   if (!counts) return null;
@@ -285,17 +302,19 @@ function questionMatches(message: Uint8Array, range: QuestionRange, query: Parse
   return true;
 }
 
-export function isValidDnsResponse(message: Uint8Array, query?: Uint8Array | ParsedQuery): boolean {
+/**
+ * Validates an upstream response structurally and, when a parsed query is
+ * given, that it answers that query (transaction ID and Question section).
+ */
+export function isValidDnsResponse(message: Uint8Array, query?: ParsedQuery): boolean {
   const responseQuestion = validateStructure(message, true);
   if (responseQuestion === null) return false;
   if (!query) return true;
 
-  const parsed = query instanceof Uint8Array ? parseQuery(query) : query;
-  if (parsed === null) return false;
-  if (readUint16(message, 0) !== parsed.id) return false;
+  if (readUint16(message, 0) !== query.id) return false;
   // A QDCOUNT=0 response has no question section; the transaction ID is the
   // only match available.
   if (!responseQuestion.present) return true;
 
-  return questionMatches(message, responseQuestion, parsed);
+  return questionMatches(message, responseQuestion, query);
 }

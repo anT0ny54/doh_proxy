@@ -1,52 +1,31 @@
 import { isIP } from "node:net";
+import { CONFIG, SOCKET_IP_HEADER, SOCKET_IP_PRELOAD_FLAG, type ClientIpConfig } from "@/lib/config";
 
 const MAX_HEADER_ENTRY_LENGTH = 128;
 
-/**
- * Process environment variable controlling whether forwarding headers are
- * trusted. Trust is ON when it is unset or empty, and when set to "1", "true",
- * "yes" or "on"; it is OFF for "0", "false", "no", "off" and for any
- * unrecognized value. Leave it enabled ONLY when a reverse proxy in front of
- * this app overwrites/sanitizes X-Real-IP and X-Forwarded-For on every request;
- * set it to "0" when the app is exposed directly.
- */
-export const TRUST_PROXY_HEADERS_ENV = "TRUST_PROXY_HEADERS";
-
-const TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
-
-/** Expands an IPv6 literal into eight 16-bit groups, or null if malformed. */
-function expandIpv6(ip: string): number[] | null {
+/** Expands an IPv6 literal that `isIP()` has already validated into eight groups. */
+function expandIpv6(ip: string): number[] {
   let text = ip;
-  const lastColon = text.lastIndexOf(":");
-  const tail = text.slice(lastColon + 1);
-  if (tail.includes(".")) {
-    const octets = tail.split(".").map(Number);
-    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return null;
-    text = `${text.slice(0, lastColon + 1)}${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+  if (text.includes(".")) {
+    // Embedded IPv4 tail (e.g. ::ffff:1.2.3.4) -> two hex groups.
+    const lastColon = text.lastIndexOf(":");
+    const [a, b, c, d] = text.slice(lastColon + 1).split(".").map(Number);
+    text = `${text.slice(0, lastColon + 1)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
   }
 
-  // "::" alone splits into three empty segments; it is the valid unspecified
-  // address and must expand to eight zero groups, not be rejected.
-  const halves = text.split("::");
-  if (halves.length > 2 && !halves.every((half) => half === "")) return null;
-  const compressed = halves.length >= 2;
-  const head = halves[0] ? halves[0].split(":") : [];
-  const rest = compressed && halves[halves.length - 1] ? halves[halves.length - 1].split(":") : [];
-  const missing = 8 - head.length - rest.length;
-  if (compressed ? missing < 1 : missing !== 0) return null;
-
-  const groups = [...head, ...Array<string>(compressed ? missing : 0).fill("0"), ...rest].map((group) =>
-    /^[0-9a-f]{1,4}$/i.test(group) ? Number.parseInt(group, 16) : Number.NaN,
-  );
-  return groups.length === 8 && groups.every((group) => Number.isInteger(group)) ? groups : null;
+  const compressed = text.includes("::");
+  const [headText, tailText = ""] = text.split("::");
+  const head = headText ? headText.split(":") : [];
+  const tail = compressed && tailText ? tailText.split(":") : [];
+  const zeros = compressed ? 8 - head.length - tail.length : 0;
+  return [...head, ...Array<string>(zeros).fill("0"), ...tail].map((group) => Number.parseInt(group, 16));
 }
 
 /**
- * Turns a forwarded-address header value into a rate-limit key, or undefined
- * when it is not a valid IP. Ports, brackets and zone IDs are stripped,
- * IPv4-mapped IPv6 addresses collapse to IPv4, and IPv6 addresses are keyed by
- * their /64 so a single subscriber cannot rotate through addresses to dodge a
- * per-client limit.
+ * Turns an address header value into a rate-limit key, or undefined when it is
+ * not a valid IP. Ports, brackets and zone IDs are stripped, IPv4-mapped IPv6
+ * addresses collapse to IPv4, and IPv6 addresses are keyed by their /64 so a
+ * single subscriber cannot rotate through addresses to dodge the limit.
  */
 export function normalizeIp(raw: string): string | undefined {
   let value = raw.trim().slice(0, MAX_HEADER_ENTRY_LENGTH);
@@ -65,7 +44,6 @@ export function normalizeIp(raw: string): string | undefined {
   if (family !== 6) return undefined;
 
   const groups = expandIpv6(value);
-  if (groups === null) return undefined;
   if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
     return `${groups[6] >> 8}.${groups[6] & 0xff}.${groups[7] >> 8}.${groups[7] & 0xff}`;
   }
@@ -73,48 +51,47 @@ export function normalizeIp(raw: string): string | undefined {
 }
 
 /**
- * Whether X-Real-IP / X-Forwarded-For may be used for client identity.
- *
- * These headers are only trustworthy when a sanitizing reverse proxy in front
- * of this app overwrites them on every request. A directly connected client
- * can otherwise forge arbitrary values and rotate them to evade the per-IP
- * request limiter and the per-IP in-flight limit. Trust is therefore ON by
- * default (unset/empty) and must be disabled with TRUST_PROXY_HEADERS=0 when
- * the app is exposed directly. Evaluated per call (no module-level cache) so
- * tests and runtime configuration changes are honored.
+ * The X-Forwarded-For entry added by the outermost of `hops` trusted proxies:
+ * each proxy appends the peer it saw, so the address `hops` positions from the
+ * right is the first one a client could not have written itself.
  */
-export function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const value = (env[TRUST_PROXY_HEADERS_ENV] ?? "").trim().toLowerCase();
-  if (value === "") return true;
-  if (["0", "false", "no", "off"].includes(value)) return false;
-  return TRUTHY_VALUES.has(value);
+function pickForwarded(value: string, hops: number): string | undefined {
+  const entries = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  return entries[entries.length - hops];
 }
 
 /**
- * Best-effort client identity from headers added by a trusted reverse proxy.
- * Returns undefined when no usable address is present or when forwarding
- * headers are disabled (TRUST_PROXY_HEADERS=0 or another non-truthy value). The deployment must sanitize these headers
- * at its trusted proxy boundary before relying on per-client limits.
+ * TCP peer address recorded by `server/socket-ip-preload.cjs`. The preload
+ * overwrites the header on every request, so it cannot be forged; without the
+ * preload (e.g. on Vercel/Netlify) the header is ignored entirely.
  */
-export function getClientIp(headers: Headers, trusted: boolean = isProxyTrustEnabled()): string | undefined {
-  if (!trusted) return undefined;
+function socketIp(headers: Headers): string | undefined {
+  if ((globalThis as Record<string, unknown>)[SOCKET_IP_PRELOAD_FLAG] !== true) return undefined;
+  const value = headers.get(SOCKET_IP_HEADER);
+  return value ? normalizeIp(value) : undefined;
+}
 
-  // X-Real-IP carries a single address, so there is no client-controlled list.
-  const realIp = headers.get("x-real-ip");
-  if (realIp) {
-    const normalized = normalizeIp(realIp);
-    if (normalized !== undefined) return normalized;
-  }
-
-  // Each proxy appends to X-Forwarded-For, so the LAST entry is the one added
-  // by the sanitizing proxy in front of this app; earlier entries are spoofable.
-  const forwarded = headers.get("x-forwarded-for");
-  if (forwarded) {
-    const entries = forwarded.split(",");
-    for (let i = entries.length - 1; i >= 0; i -= 1) {
-      if (entries[i].trim()) return normalizeIp(entries[i]);
+/**
+ * Client identity used for rate limiting and the per-client in-flight cap.
+ *
+ * - TRUST_PROXY_HEADERS enabled (default): the configured forwarding headers
+ *   (CLIENT_IP_HEADERS, platform default otherwise) are tried in order; for
+ *   X-Forwarded-For the entry TRUSTED_PROXY_HOPS from the right is used. If
+ *   none yields an address, the socket address is used.
+ * - TRUST_PROXY_HEADERS disabled: forwarding headers are ignored and only the
+ *   socket address is used.
+ *
+ * Returns undefined only when no address is available at all.
+ */
+export function getClientIp(headers: Headers, config: ClientIpConfig = CONFIG): string | undefined {
+  if (config.trustProxyHeaders) {
+    for (const name of config.clientIpHeaders) {
+      const value = headers.get(name);
+      if (!value) continue;
+      const candidate = name === "x-forwarded-for" ? pickForwarded(value, config.trustedProxyHops) : value;
+      const normalized = candidate === undefined ? undefined : normalizeIp(candidate);
+      if (normalized !== undefined) return normalized;
     }
   }
-
-  return undefined;
+  return socketIp(headers);
 }
