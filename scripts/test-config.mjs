@@ -86,6 +86,7 @@ test("normalizeIp strips ports, brackets and zones, collapses IPv4-mapped IPv6 a
     ["[2001:db8::1]:443", "2001:db8:0:0::/64"],
     ["2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"],
     ["fe80::1%eth0", "fe80:0:0:0::/64"],
+    ["::", "0:0:0:0::/64"],
     ["garbage", undefined],
     ["999.1.1.1", undefined],
     ["   ", undefined],

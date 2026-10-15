@@ -1,9 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { importTypeScript } from "./lib/transpile-source.mjs";
+// Shared fixtures; id=1 keeps the transaction-ID expectations below unchanged.
+import { validQuery as makeValidQuery, validResponse as makeValidResponse } from "./lib/dns-fixtures.mjs";
 
 const dns = await importTypeScript("../src/lib/dns.ts", import.meta.url);
 const isValidDnsQuery = (message) => dns.parseQuery(message) !== null;
+const validQuery = makeValidQuery(1);
+const validResponse = (query = validQuery) => makeValidResponse(query);
 
 function queryWithName(nameBytes, id = 1) {
   return Uint8Array.from([
@@ -25,73 +29,6 @@ function queryWithName(nameBytes, id = 1) {
     1,
     0,
     1,
-  ]);
-}
-
-const validQuery = Uint8Array.from([
-  0,
-  1,
-  1,
-  0,
-  0,
-  1,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  3,
-  119,
-  119,
-  119,
-  7,
-  101,
-  120,
-  97,
-  109,
-  112,
-  108,
-  101,
-  0,
-  0,
-  1,
-  0,
-  1,
-]);
-
-function validResponse(query = validQuery) {
-  const question = query.slice(12);
-  return Uint8Array.from([
-    query[0],
-    query[1],
-    0x81,
-    0x80,
-    0x00,
-    0x01,
-    0x00,
-    0x01,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    ...question,
-    0xc0,
-    0x0c,
-    0x00,
-    0x01,
-    0x00,
-    0x01,
-    0x00,
-    0x00,
-    0x00,
-    0x3c,
-    0x00,
-    0x04,
-    1,
-    2,
-    3,
-    4,
   ]);
 }
 
@@ -293,4 +230,24 @@ test("parseQuery never modifies its input, even for Buffer views", () => {
   assert.deepEqual(asBuffer, snapshot, "input bytes must be left untouched");
   assert.equal(parsed.key[1], 119, "the match key is lower-cased");
   assert.equal(dns.isValidDnsResponse(validResponse(mixed), parsed), true);
+});
+
+test("accepts a legal QDCOUNT=0 response when the transaction ID matches", () => {
+  // Header with QDCOUNT=0, ANCOUNT=1, followed by one A record whose owner
+  // name is uncompressed (a question section exists in neither message).
+  const owner = [3, 119, 119, 119, 7, 101, 120, 97, 109, 112, 108, 101, 0];
+  const answer = [...owner, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4];
+  const header = [validQuery[0], validQuery[1], 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0];
+  const qd0 = Uint8Array.from([...header, ...answer]);
+  assert.equal(dns.isValidDnsResponse(qd0, validQuery), true, "ID match is enough without a question section");
+  const wrongId = Uint8Array.from(qd0);
+  wrongId[0] = 0x12;
+  wrongId[1] = 0x34;
+  assert.equal(dns.isValidDnsResponse(wrongId, validQuery), false, "transaction ID still enforced");
+});
+
+test("still rejects responses with more than one question", () => {
+  const response = validResponse();
+  response[5] = 2; // QDCOUNT = 2 is never legal
+  assert.equal(dns.isValidDnsResponse(response, validQuery), false);
 });

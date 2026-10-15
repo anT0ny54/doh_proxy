@@ -381,7 +381,77 @@ try {
     }
   });
 
-  await test("PROXY_VERSION matches package.json", async () => {
+  await test("A client disconnect aborts the upstream fetch and does not blame the upstream", async () => {
+  let aborted = false;
+  let calls = 0;
+  globalThis.fetch = (_url, init) => {
+    calls += 1;
+    return new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    });
+  };
+
+  const controller = new AbortController();
+  const request = new Request(getRequest().url, { signal: controller.signal });
+  const pending = doh.proxyRequest(request, {
+    upstreams: [
+      { endpoint: "https://first.test/dns-query" },
+      { endpoint: "https://second.test/dns-query" },
+    ],
+    timeoutMs: 2_000,
+    failover: true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+  const started = Date.now();
+  const response = await pending;
+  assert.equal(aborted, true, "the upstream fetch must be aborted by the client disconnect");
+  assert.ok(Date.now() - started < 500, "must resolve promptly instead of at the deadline");
+  assert.equal(calls, 1, "failover must not contact the next upstream for a disconnected client");
+  assert.equal(response.status, 502);
+
+  // The disconnect must not have counted as an upstream failure: the breaker
+  // is untouched, so a subsequent request to the same upstream is not skipped.
+  globalThis.fetch = async () => new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+  const after = await doh.proxyRequest(getRequest(), {
+    upstreams: [{ endpoint: "https://first.test/dns-query" }],
+    timeoutMs: 1_000,
+    failover: false,
+  });
+  assert.equal(after.status, 200);
+});
+
+await test("A negative upstream Content-Length is rejected and failover continues", async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (calls.length === 1) {
+      return new Response(validResponse(), {
+        status: 200,
+        headers: { "content-type": "application/dns-message", "content-length": "-1" },
+      });
+    }
+    return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+  };
+
+  const response = await doh.proxyRequest(getRequest(), {
+    upstreams: [
+      { endpoint: "https://first.test/dns-query" },
+      { endpoint: "https://second.test/dns-query" },
+    ],
+    timeoutMs: 1_000,
+    failover: true,
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2, "the negative Content-Length response must be skipped");
+  assert.match(calls[1], /second\.test/);
+});
+
+await test("PROXY_VERSION matches package.json", async () => {
     const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
     assert.equal(doh.PROXY_VERSION, pkg.version, "PROXY_VERSION must match package.json");
   });
