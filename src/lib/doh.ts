@@ -11,7 +11,7 @@ import {
 } from "@/lib/dns";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-export const PROXY_VERSION = "2.8.2";
+export const PROXY_VERSION = "2.8.3";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
@@ -287,13 +287,10 @@ function releaseInFlight(ip: string | undefined): void {
 
 function getEarlyMethodResponse(request: NextRequest): NextResponse | null {
   // RFC 9110: a 204 response must not include Content-Length.
+  // Unsupported methods never reach this handler in production: the route
+  // exports only GET/POST/HEAD/OPTIONS, so Next.js's router answers 405
+  // itself. Keeping a handler-level 405 here would be unreachable dead code.
   if (request.method === "OPTIONS" || request.method === "HEAD") return emptyResponse();
-
-  if (request.method !== "GET" && request.method !== "POST") {
-    const result = textResponse("Method Not Allowed", 405);
-    result.headers.set("Allow", "GET, POST, HEAD, OPTIONS");
-    return result;
-  }
 
   return null;
 }
