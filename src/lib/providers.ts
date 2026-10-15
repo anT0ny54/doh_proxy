@@ -1,8 +1,8 @@
-export interface DoHProvider {
+import type { FixedUpstream } from "@/lib/upstreams";
+
+export interface DoHProvider extends FixedUpstream {
   readonly id: string;
   readonly name: string;
-  readonly description: string;
-  readonly endpoint: string;
 }
 
 /** Fixed server-owned upstreams. No arbitrary/custom forwarding is supported. */

@@ -1,5 +1,4 @@
 import { NextResponse, type NextRequest } from "next/server";
-import packageJson from "../../package.json";
 import { CLIENT_KEY_HEADER, CONFIG } from "@/lib/config";
 import { corsHeaders } from "@/lib/cors";
 import {
@@ -13,8 +12,11 @@ import {
 import { DOH_PROVIDERS } from "@/lib/providers";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-/** Single source of truth: package.json. */
-export const PROXY_VERSION: string = packageJson.version;
+/**
+ * Single source of truth: package.json. next.config.ts inlines only the
+ * version string (DOH_PROXY_VERSION) instead of bundling the whole file.
+ */
+export const PROXY_VERSION: string = process.env.DOH_PROXY_VERSION ?? "0.0.0-dev";
 
 const USER_AGENT = `FreeDNS-DoH/${PROXY_VERSION}`;
 const MAX_QUERY_STRING_LENGTH = 8_192;
@@ -33,6 +35,11 @@ const MIN_TIMEOUT_MS = 250;
 const MIN_ATTEMPT_TIMEOUT_MS = 100;
 const BASE64URL = /^[A-Za-z0-9_-]+={0,2}$/;
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+// Statuses that describe the *request* (malformed, too large, unsupported
+// media type), not the upstream: every other upstream would answer the same,
+// so they are relayed at once instead of being replayed across the failover
+// list (which would amplify crafted bad queries).
+const REQUEST_REJECTION_STATUSES = new Set([400, 413, 414, 415]);
 const STREAM_CANCEL_TIMEOUT_MS = 25;
 // A small public instance can be overwhelmed by many simultaneous POST bodies
 // or slow upstream connections. Refuse excess work rather than queueing it in
@@ -69,8 +76,11 @@ interface NormalizedDoHUpstream extends UpstreamInput {
 }
 
 interface DoHOptions {
-  /** Resolved lazily so HEAD/OPTIONS/validation failures never pay for rotation. */
-  readonly upstreams: readonly UpstreamInput[] | (() => readonly UpstreamInput[]);
+  /**
+   * Resolved lazily (with the client key, for per-client rotation) so
+   * HEAD/OPTIONS/validation failures never pay for rotation.
+   */
+  readonly upstreams: readonly UpstreamInput[] | ((clientKey: string | null) => readonly UpstreamInput[]);
   readonly timeoutMs?: number;
   readonly failover?: boolean;
 }
@@ -115,7 +125,21 @@ function isCircuitBreakerOpen(endpoint: string): boolean {
 
   const now = Date.now();
   if (now - cb.lastFailureTime < CIRCUIT_BREAKER_COOLDOWN_MS) return true;
+  return hasActiveProbe(cb, now);
+}
+
+function hasActiveProbe(cb: CircuitBreakerState, now: number): boolean {
   return cb.probeToken !== 0 && now - cb.probeStartedAt < CIRCUIT_BREAKER_PROBE_TTL_MS;
+}
+
+/**
+ * True while another request holds the probe slot of a tripped breaker. Used
+ * when every breaker is open: each upstream is then probed by at most one
+ * request at a time instead of by every concurrent request.
+ */
+function isProbeInFlight(endpoint: string): boolean {
+  const cb = state.circuitBreakers.get(endpoint);
+  return cb !== undefined && cb.failures >= CIRCUIT_BREAKER_THRESHOLD && hasActiveProbe(cb, Date.now());
 }
 
 /**
@@ -174,16 +198,25 @@ function normalize(endpoint: string): NormalizedDoHUpstream {
   return { endpoint, href: url.href, getPrefix: `${url.href}${url.search ? "&" : "?"}` };
 }
 
+// Every endpoint is parsed once. The fixed and operator-set upstreams are
+// seeded at module load, so production requests never parse a URL; only
+// endpoints injected by unit tests are added later.
+const NORMALIZED_BY_ENDPOINT = new Map<string, NormalizedDoHUpstream>();
+
 function normalizeUpstream(upstream: UpstreamInput): NormalizedDoHUpstream {
-  // Fixed upstreams are pre-parsed at module load; only parse injected ones.
-  return "getPrefix" in upstream ? (upstream as NormalizedDoHUpstream) : normalize(upstream.endpoint);
+  let normalized = NORMALIZED_BY_ENDPOINT.get(upstream.endpoint);
+  if (normalized === undefined) {
+    normalized = normalize(upstream.endpoint);
+    NORMALIZED_BY_ENDPOINT.set(upstream.endpoint, normalized);
+  }
+  return normalized;
 }
 
 const NORMALIZED_PROVIDER_UPSTREAMS = new Map(
-  DOH_PROVIDERS.map((provider) => [provider.id, normalize(provider.endpoint)]),
+  DOH_PROVIDERS.map((provider) => [provider.id, normalizeUpstream(provider)]),
 );
 
-const NORMALIZED_HAGEZI_UPSTREAMS = HAGEZI_UPSTREAMS.map((upstream) => normalize(upstream.endpoint));
+const NORMALIZED_HAGEZI_UPSTREAMS = HAGEZI_UPSTREAMS.map(normalizeUpstream);
 
 const ROTATED_HAGEZI_UPSTREAMS: readonly (readonly NormalizedDoHUpstream[])[] = NORMALIZED_HAGEZI_UPSTREAMS.map(
   (_, slot) =>
@@ -194,21 +227,44 @@ const ROTATED_HAGEZI_UPSTREAMS: readonly (readonly NormalizedDoHUpstream[])[] = 
 
 /** Operator override (HAGEZI_UPSTREAM_ENDPOINTS), used as given without rotation. */
 const OVERRIDE_UPSTREAMS: readonly NormalizedDoHUpstream[] | undefined =
-  CONFIG.hageziUpstreamEndpoints.length > 0 ? CONFIG.hageziUpstreamEndpoints.map(normalize) : undefined;
+  CONFIG.hageziUpstreamEndpoints.length > 0
+    ? CONFIG.hageziUpstreamEndpoints.map((endpoint) => normalizeUpstream({ endpoint }))
+    : undefined;
 const ROTATION_SLOT_MS = CONFIG.hageziRotationSeconds * 1_000;
 
+/** FNV-1a (32-bit): a cheap, stable spread of client keys over the resolvers. */
+function hashKey(key: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < key.length; i += 1) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
 /**
- * Failover order for the primary endpoint. By default the first choice changes
- * on a time slot (consistent across instances); with
- * HAGEZI_ROTATION_MODE=request it round-robins per request to spread load. A
- * valid HAGEZI_UPSTREAM_ENDPOINTS override replaces the rotated built-in list.
+ * Failover order for the primary endpoint (HAGEZI_ROTATION_MODE):
+ * - `client` (default): the first choice is derived from the client key, so
+ *   load spreads over every resolver while each client keeps a stable,
+ *   cache-friendly first choice. Requests without a key round-robin.
+ * - `request`: round-robin per request.
+ * - `time`: the first choice changes every HAGEZI_ROTATION_SECONDS
+ *   (consistent across instances, but one resolver takes all traffic).
+ * A valid HAGEZI_UPSTREAM_ENDPOINTS override replaces the rotated list.
  */
-export function getHageziUpstreams(): readonly NormalizedDoHUpstream[] {
+export function getHageziUpstreams(clientKey: string | null = null): readonly NormalizedDoHUpstream[] {
   if (OVERRIDE_UPSTREAMS) return OVERRIDE_UPSTREAMS;
   const count = ROTATED_HAGEZI_UPSTREAMS.length;
-  const slot = CONFIG.hageziRotationPerRequest
-    ? state.rotationCounter++ % count
-    : Math.floor(Date.now() / ROTATION_SLOT_MS) % count;
+  const mode = CONFIG.hageziRotationMode;
+  let slot: number;
+  if (mode === "time") {
+    slot = Math.floor(Date.now() / ROTATION_SLOT_MS) % count;
+  } else if (mode === "client" && clientKey) {
+    slot = hashKey(clientKey) % count;
+  } else {
+    slot = state.rotationCounter;
+    state.rotationCounter = (state.rotationCounter + 1) % count;
+  }
   return ROTATED_HAGEZI_UPSTREAMS[slot];
 }
 
@@ -276,22 +332,27 @@ interface ValidatedQuery {
   readonly parsed: ParsedQuery;
 }
 
-/** Strips optional trailing `=` padding (RFC 8484 omits it, but clients send it). */
+/**
+ * Strips optional trailing `=` padding (RFC 8484 omits it, but clients send
+ * it). BASE64URL already allows at most two.
+ */
 function stripPadding(value: string): string {
   let end = value.length;
-  while (end > 0 && value.charCodeAt(end - 1) === 0x3d && value.length - end < 2) end -= 1;
+  while (end > 0 && value.charCodeAt(end - 1) === 0x3d) end -= 1;
   return value.slice(0, end);
 }
 
-/** Decodes the `dns` parameter; returns the canonical unpadded form with it. */
+/**
+ * Decodes the `dns` parameter; returns the canonical unpadded form with it.
+ * The length check bounds the work up front; parseQuery() is the single gate
+ * for the decoded 4 KiB query cap.
+ */
 function decodeBase64Url(value: string): { readonly unpadded: string; readonly query: ValidatedQuery } | null {
   if (!value || value.length > MAX_ENCODED_QUERY_LENGTH + 2 || !BASE64URL.test(value)) return null;
   const unpadded = stripPadding(value);
-  if (!unpadded || unpadded.length > MAX_ENCODED_QUERY_LENGTH || unpadded.length % 4 === 1) return null;
+  if (unpadded.length % 4 === 1) return null;
 
   const body = Buffer.from(unpadded, "base64url");
-  if (body.byteLength > MAX_DNS_MESSAGE_SIZE) return null;
-
   const parsed = parseQuery(body);
   return parsed === null ? null : { unpadded, query: { body, parsed } };
 }
@@ -521,13 +582,17 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
   if (!tryAcquireInFlight(clientKey)) return busyResponse();
 
   try {
-    return await proxyRequestInternal(request, options);
+    return await proxyRequestInternal(request, options, clientKey);
   } finally {
     releaseInFlight(clientKey);
   }
 }
 
-async function proxyRequestInternal(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
+async function proxyRequestInternal(
+  request: NextRequest,
+  options: DoHOptions,
+  clientKey: string | null,
+): Promise<NextResponse> {
   let query: ValidatedQuery;
   let dnsParam: string | undefined;
   const timeout = Math.max(MIN_TIMEOUT_MS, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
@@ -545,24 +610,25 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
     query = bodyResult;
   }
 
-  const failover = options.failover !== false;
   // The circuit breaker only matters when there is a next upstream to fail
-  // over to; a single fixed upstream is always tried.
-  const useBreaker = failover;
-  const configured = typeof options.upstreams === "function" ? options.upstreams() : options.upstreams;
+  // over to (failover); a single fixed upstream is always tried.
+  const failover = options.failover !== false;
+  const configured = typeof options.upstreams === "function" ? options.upstreams(clientKey) : options.upstreams;
   // Provider routes try exactly one upstream, so only that one is normalized.
   let upstreams = (failover ? configured : configured.slice(0, 1)).map(normalizeUpstream);
 
   // Copy the POST body into a fresh ArrayBuffer once per request, and
   // pre-encode the GET dns parameter once, instead of per attempt.
   const postBody = request.method === "POST" ? toArrayBuffer(query.body) : undefined;
-  const dnsSearch = dnsParam === undefined ? undefined : `dns=${encodeURIComponent(dnsParam)}`;
+  // dnsParam matched BASE64URL ([A-Za-z0-9_-]), so it needs no URL encoding.
+  const dnsSearch = dnsParam === undefined ? undefined : `dns=${dnsParam}`;
 
-  // Skip upstreams whose breaker is open, but never fail fast when *all* of
-  // them are open: a probe request is what lets a recovered upstream close its
-  // breaker sooner, and a dead-looking upstream may still answer.
-  let probeAll = true;
-  if (useBreaker) {
+  // Skip upstreams whose breaker is open. When *all* of them are open, keep
+  // probing (a probe is what lets a recovered upstream close its breaker, and
+  // a dead-looking upstream may still answer), but each upstream is probed by
+  // at most one request at a time instead of by every concurrent request.
+  let probeAll = false;
+  if (failover) {
     const healthy = upstreams.filter((upstream) => !isCircuitBreakerOpen(upstream.endpoint));
     probeAll = healthy.length === 0;
     if (!probeAll) upstreams = healthy;
@@ -577,7 +643,9 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
     const upstream = upstreams[index];
     // An earlier attempt may have taken a while, and another request may have
     // claimed this upstream's half-open probe in the meantime.
-    if (useBreaker && !probeAll && isCircuitBreakerOpen(upstream.endpoint)) continue;
+    if (failover && (probeAll ? isProbeInFlight(upstream.endpoint) : isCircuitBreakerOpen(upstream.endpoint))) {
+      continue;
+    }
     // Share what is left of the budget across the attempts still to come, so
     // time saved by fast failures flows to later upstreams (the last one gets
     // everything that remains).
@@ -588,22 +656,27 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
     const attemptTimeout = Math.min(remaining, share);
     if (attemptTimeout < MIN_ATTEMPT_TIMEOUT_MS) break;
 
-    const probe = useBreaker ? claimProbe(upstream.endpoint) : 0;
+    const probe = failover ? claimProbe(upstream.endpoint) : 0;
     // Kept active until the response body has been consumed (see fetchUpstream).
     const attempt = new AbortController();
     const timer = setTimeout(() => attempt.abort(), attemptTimeout);
     try {
       const result = await fetchUpstream(request, upstream, dnsSearch, postBody, attempt.signal);
 
-      // Only retryable availability problems (timeouts, network errors and
-      // retryable upstream statuses) count toward the breaker. Client-influenced
-      // outcomes (upstream 4xx, oversized or otherwise rejected responses) must
-      // not let one caller take an upstream offline for everybody.
+      // Only availability problems (timeouts, network errors, retryable
+      // upstream statuses and non-DNS 200 answers) count toward the breaker.
+      // Client-influenced outcomes (upstream 4xx, oversized or otherwise
+      // invalid bodies) must not let one caller take an upstream offline for
+      // everybody.
       if (result.status !== 200) {
         cancelResponseBody(result);
         if (RETRYABLE_UPSTREAM_STATUSES.has(result.status)) {
-          if (useBreaker) recordFailure(upstream.endpoint);
+          if (failover) recordFailure(upstream.endpoint);
           continue;
+        }
+        if (REQUEST_REJECTION_STATUSES.has(result.status)) {
+          releaseProbe(upstream.endpoint, probe);
+          return textResponse("DNS upstream rejected request", result.status);
         }
         // A non-retryable status (403 from an egress-IP block, 404 from a
         // misconfigured node, ...) says nothing about the *next* upstream, so
@@ -614,21 +687,26 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
         continue;
       }
 
+      // A 200 that is not a DNS message (captive portal, CDN error page,
+      // misrouted node) does not depend on the client's query, so it counts
+      // as an availability failure.
       const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
       if (contentType !== DNS_MESSAGE) {
         cancelResponseBody(result);
-        releaseProbe(upstream.endpoint, probe);
+        if (failover) recordFailure(upstream.endpoint);
         continue;
       }
 
-      // readResponseBody cancels the stream itself on its early-exit paths.
+      // readResponseBody cancels the stream itself on its early-exit paths. An
+      // invalid body can be provoked by a crafted query, so it never counts
+      // against the breaker.
       const responseBody = await readResponseBody(result);
       if (responseBody === null || !isValidDnsResponse(responseBody, query.parsed)) {
         releaseProbe(upstream.endpoint, probe);
         continue;
       }
 
-      if (useBreaker) recordSuccess(upstream.endpoint);
+      if (failover) recordSuccess(upstream.endpoint);
 
       const headers = baseHeaders();
       headers.set("Content-Type", DNS_MESSAGE);
@@ -648,7 +726,7 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
         break;
       }
       // Network errors and timeouts are retryable; try the next fixed upstream.
-      if (useBreaker) recordFailure(upstream.endpoint);
+      if (failover) recordFailure(upstream.endpoint);
     } finally {
       clearTimeout(timer);
     }
@@ -660,6 +738,8 @@ async function proxyRequestInternal(request: NextRequest, options: DoHOptions): 
 
 export async function handleDoH(request: NextRequest, providerId: string): Promise<NextResponse> {
   const upstream = NORMALIZED_PROVIDER_UPSTREAMS.get(providerId);
+  // Defensive only: the router already answers 404 for unknown ids
+  // (generateStaticParams + dynamicParams = false), so this never runs there.
   if (!upstream) return textResponse("Not Found", 404);
 
   return proxyRequest(request, { upstreams: [upstream], failover: false });

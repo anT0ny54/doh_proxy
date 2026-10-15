@@ -213,6 +213,18 @@ function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8A
   return end;
 }
 
+// Validation is synchronous, so one scratch bitmap sized for the largest
+// accepted response is reused instead of allocating up to 64 KiB per message.
+const SCRATCH_TARGETS = new Uint8Array(MAX_DNS_RESPONSE_SIZE);
+
+/** A zeroed compression-target bitmap for a message of `length` bytes. */
+function compressionTargets(length: number): Uint8Array {
+  if (length > SCRATCH_TARGETS.byteLength) return new Uint8Array(length);
+  const targets = SCRATCH_TARGETS.subarray(0, length);
+  targets.fill(0);
+  return targets;
+}
+
 function validateStructure(message: Uint8Array, expectedResponse: boolean): QuestionRange | null {
   // Responses are size-capped while they are read (see readResponseBody in
   // doh.ts); parseQuery is the only gate for the query cap.
@@ -231,7 +243,7 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
   // relaying for them must not 502 across the whole failover list.
   if (expectedResponse ? counts.questions > 1 : counts.questions !== 1) return null;
 
-  const targets = new Uint8Array(message.byteLength);
+  const targets = compressionTargets(message.byteLength);
   let question: QuestionRange;
   if (counts.questions === 1) {
     // Question QNAME compression stays rejected: a response question is the

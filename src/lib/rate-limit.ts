@@ -6,20 +6,22 @@
  * rolling window. That removes the 2x burst a plain fixed window allows
  * around window boundaries, at the same O(1) cost.
  *
- * Windows are aligned to the epoch, and a bucket is (re)inserted into the Map
- * whenever it moves to a new window, so Map insertion order matches
- * `windowStart` order while the effective clock is monotonic. Stale buckets
- * are therefore dropped from the front in amortised O(1), and the hard size
- * cap evicts the oldest bucket first, keeping memory bounded even if a client
- * rotates identifiers.
+ * Windows are aligned to multiples of the window length on the clock the
+ * caller supplies, and a bucket is (re)inserted into the Map whenever it moves
+ * to a new window, so Map insertion order matches `windowStart` order while the
+ * effective clock is monotonic. Stale buckets are therefore dropped from the
+ * front in amortised O(1), and the hard size cap evicts the oldest bucket
+ * first, keeping memory bounded even if a client rotates identifiers.
  *
- * `check()` clamps backwards clock movement to the last observed timestamp
- * because `Date.now()` is wall-clock time and can move backwards after clock
- * or NTP adjustments.
+ * Callers should pass a monotonic clock (`src/proxy.ts` uses
+ * `performance.now()`). As a safety net `check()` clamps backwards movement to
+ * the last observed timestamp, but it cannot undo a forward step: with a
+ * wall-clock source such as `Date.now()`, a +1 h NTP step followed by a
+ * correction would freeze every window for an hour.
  */
 
-export const WINDOW_SIZE_MS = 60_000;
-export const MAX_BUCKETS = 10_000;
+const WINDOW_SIZE_MS = 60_000;
+const MAX_BUCKETS = 10_000;
 
 interface Bucket {
   windowStart: number;

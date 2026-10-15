@@ -2,7 +2,10 @@ function toOrigin(value: string): string | undefined {
   try {
     const candidate = value.trim();
     if (!candidate) return undefined;
-    const url = new URL(candidate.startsWith("http://") || candidate.startsWith("https://") ? candidate : `https://${candidate}`);
+    // Any explicit scheme is parsed as written (the check below rejects non-http
+    // ones, and the match is case-insensitive); a bare host gets https://.
+    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(candidate);
+    const url = new URL(hasScheme ? candidate : `https://${candidate}`);
     if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
     return url.origin;
   } catch {
@@ -10,7 +13,7 @@ function toOrigin(value: string): string | undefined {
   }
 }
 
-export function getSiteUrl(): string {
+function getSiteUrl(): string {
   const configured = process.env.NEXT_PUBLIC_SITE_URL;
   // Deploy previews and branch deploys get their own origin; URL is always the
   // production one.
@@ -33,6 +36,9 @@ export function getSiteUrl(): string {
     "http://localhost:3000"
   );
 }
+
+/** Public origin, resolved once per module instance (layout and page share it). */
+export const SITE_URL: string = getSiteUrl();
 
 export const REPOSITORY_URL = "https://github.com/anT0ny54/doh_proxy";
 
