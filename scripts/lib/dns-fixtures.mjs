@@ -47,6 +47,20 @@ export function validResponse(query = validQuery()) {
   ]);
 }
 
+/**
+ * Answer to `query` carrying 17 maximum-size TXT records (over 4 KiB), the kind
+ * of DNSSEC/TXT-heavy response that must be relayed although a query may not
+ * be that large.
+ */
+export function oversizedResponse(query = validQuery()) {
+  const records = [];
+  for (let i = 0; i < 17; i += 1) {
+    const rdata = [255, ...new Uint8Array(255).fill(97)];
+    records.push(0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, rdata.length >> 8, rdata.length & 0xff, ...rdata);
+  }
+  return Uint8Array.from([query[0], query[1], 0x81, 0x80, 0, 1, 0, 17, 0, 0, 0, 0, ...query.slice(12), ...records]);
+}
+
 export const DNS_MESSAGE = "application/dns-message";
 
 /** Response init for a successful mocked upstream answer. */

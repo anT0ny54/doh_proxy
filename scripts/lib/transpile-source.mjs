@@ -1,8 +1,9 @@
 /**
  * Shared helper for the node:test suites: transpile TypeScript sources to
  * data-URL modules so the tests exercise the real src/ code without a build
- * step. `@/lib/*` imports are resolved recursively, `next/server` is replaced
- * by a small stub and `../../package.json` by its contents.
+ * step. `@/lib/*` imports are resolved recursively and `next/server` is
+ * replaced by a small stub. DOH_PROXY_VERSION, which next.config.ts inlines
+ * from package.json at build time, is set from package.json here.
  *
  * Configuration (src/lib/config.ts) is read once per module instance, so
  * suites that need a different environment set process.env and then load a
@@ -52,9 +53,7 @@ export class NextResponse {
 `;
 
 const nextServerUrl = toDataUrl(NEXT_SERVER_STUB, "next-server-stub.ts");
-const packageJsonUrl = `data:text/javascript;base64,${Buffer.from(
-  `export default ${await readFile(new URL("../../package.json", import.meta.url), "utf8")};`,
-).toString("base64")}`;
+process.env.DOH_PROXY_VERSION = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")).version;
 
 let generation = 0;
 
@@ -62,10 +61,7 @@ let generation = 0;
 async function moduleUrl(path, cache, tag) {
   if (cache.has(path)) return cache.get(path);
   let source = await readFile(new URL(path, SRC), "utf8");
-  const replacements = new Map([
-    ["next/server", nextServerUrl],
-    ["../../package.json", packageJsonUrl],
-  ]);
+  const replacements = new Map([["next/server", nextServerUrl]]);
   for (const [, name] of source.matchAll(/from "@\/lib\/([\w-]+)"/g)) {
     replacements.set(`@/lib/${name}`, await moduleUrl(`lib/${name}.ts`, cache, tag));
   }
