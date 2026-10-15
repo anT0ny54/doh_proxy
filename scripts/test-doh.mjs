@@ -1,12 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
+import { dnsAnswer, validQuery, validResponse } from "./lib/dns-fixtures.mjs";
 import { importDoh } from "./lib/transpile-source.mjs";
 
-// The suite drives per-IP in-flight limits through x-real-ip headers, so pin
-// forwarding-header trust on explicitly (it is also the default).
-process.env.TRUST_PROXY_HEADERS = "1";
+// Rotation/override settings are exercised in test-config.mjs.
+delete process.env.HAGEZI_UPSTREAM_ENDPOINTS;
+delete process.env.HAGEZI_ROTATION_MODE;
+delete process.env.HAGEZI_ROTATION_SECONDS;
 
 const doh = await importDoh();
 
@@ -119,6 +120,24 @@ try {
     assert.equal(response.status, 502);
     assert.equal(calls, 1);
     assert.ok(Date.now() - started < 500, "timeout path should stay bounded");
+  });
+
+  await test("The upstream deadline still fires after garbage collection", async () => {
+    // Regression guard: AbortSignal.any() over an unreferenced
+    // AbortSignal.timeout() stops firing once the timeout signal is collected.
+    globalThis.fetch = (_url, init) =>
+      new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        globalThis.gc?.();
+      });
+    const started = Date.now();
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://gc-timeout.test/dns-query" }],
+      timeoutMs: 300,
+      failover: false,
+    });
+    assert.equal(response.status, 502);
+    assert.ok(Date.now() - started < 1_000);
   });
 
   await test("DoH POST body cancellation is bounded", async () => {
@@ -328,12 +347,12 @@ try {
       return new Response(null, { status: 400 });
     };
 
-    const options = { upstreams: [{ endpoint: "https://reject-400.test/dns-query" }], timeoutMs: 100, failover: false };
+    const options = { upstreams: [{ endpoint: "https://reject-400.test/dns-query" }, { endpoint: "https://reject-400-b.test/dns-query" }], timeoutMs: 1_000, failover: true };
     for (let i = 0; i < 5; i += 1) {
       const response = await doh.proxyRequest(getRequest(), options);
       assert.equal(response.status, 400);
     }
-    assert.equal(calls, 5, "every request must still reach the upstream");
+    assert.equal(calls, 10, "every request must still reach both upstreams");
   });
 
   await test("Open circuit breaker is bypassed when every upstream is open", async () => {
@@ -345,7 +364,7 @@ try {
       return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
     };
 
-    const options = { upstreams: [{ endpoint: "https://flaky.test/dns-query" }], timeoutMs: 100, failover: false };
+    const options = { upstreams: [{ endpoint: "https://flaky.test/dns-query" }], timeoutMs: 100, failover: true };
     for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 502);
 
     healthy = true;
@@ -364,10 +383,11 @@ try {
     assert.equal(resolved, 0);
   });
 
-  await test("HaGeZi upstream set is pre-parsed and rotated", () => {
+  await test("HaGeZi upstream set is pre-normalized and complete", () => {
     const hageziUpstreams = doh.getHageziUpstreams();
     assert.equal(hageziUpstreams.length, 3);
-    assert.ok(hageziUpstreams.every((upstream) => upstream.url instanceof URL));
+    assert.equal(new Set(hageziUpstreams.map((upstream) => upstream.endpoint)).size, 3);
+    assert.ok(hageziUpstreams.every((upstream) => upstream.getPrefix === `${upstream.href}?`));
   });
 
   await test("Application timeout stays below the route execution ceiling", async () => {
@@ -382,78 +402,85 @@ try {
   });
 
   await test("A client disconnect aborts the upstream fetch and does not blame the upstream", async () => {
-  let aborted = false;
-  let calls = 0;
-  globalThis.fetch = (_url, init) => {
-    calls += 1;
-    return new Promise((_, reject) => {
-      init.signal.addEventListener("abort", () => {
-        aborted = true;
-        reject(new DOMException("aborted", "AbortError"));
-      }, { once: true });
-    });
-  };
-
-  const controller = new AbortController();
-  const request = new Request(getRequest().url, { signal: controller.signal });
-  const pending = doh.proxyRequest(request, {
-    upstreams: [
-      { endpoint: "https://first.test/dns-query" },
-      { endpoint: "https://second.test/dns-query" },
-    ],
-    timeoutMs: 2_000,
-    failover: true,
-  });
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  controller.abort();
-  const started = Date.now();
-  const response = await pending;
-  assert.equal(aborted, true, "the upstream fetch must be aborted by the client disconnect");
-  assert.ok(Date.now() - started < 500, "must resolve promptly instead of at the deadline");
-  assert.equal(calls, 1, "failover must not contact the next upstream for a disconnected client");
-  assert.equal(response.status, 502);
-
-  // The disconnect must not have counted as an upstream failure: the breaker
-  // is untouched, so a subsequent request to the same upstream is not skipped.
-  globalThis.fetch = async () => new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
-  const after = await doh.proxyRequest(getRequest(), {
-    upstreams: [{ endpoint: "https://first.test/dns-query" }],
-    timeoutMs: 1_000,
-    failover: false,
-  });
-  assert.equal(after.status, 200);
-});
-
-await test("A negative upstream Content-Length is rejected and failover continues", async () => {
-  const calls = [];
-  globalThis.fetch = async (url) => {
-    calls.push(String(url));
-    if (calls.length === 1) {
-      return new Response(validResponse(), {
-        status: 200,
-        headers: { "content-type": "application/dns-message", "content-length": "-1" },
+    let aborted = false;
+    let calls = 0;
+    globalThis.fetch = (_url, init) => {
+      calls += 1;
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => {
+          aborted = true;
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
       });
-    }
-    return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
-  };
+    };
 
-  const response = await doh.proxyRequest(getRequest(), {
-    upstreams: [
-      { endpoint: "https://first.test/dns-query" },
-      { endpoint: "https://second.test/dns-query" },
-    ],
-    timeoutMs: 1_000,
-    failover: true,
+    const controller = new AbortController();
+    const request = new Request(getRequest().url, { signal: controller.signal });
+    const pending = doh.proxyRequest(request, {
+      upstreams: [
+        { endpoint: "https://first.test/dns-query" },
+        { endpoint: "https://second.test/dns-query" },
+      ],
+      timeoutMs: 2_000,
+      failover: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    const started = Date.now();
+    const response = await pending;
+    assert.equal(aborted, true, "the upstream fetch must be aborted by the client disconnect");
+    assert.ok(Date.now() - started < 500, "must resolve promptly instead of at the deadline");
+    assert.equal(calls, 1, "failover must not contact the next upstream for a disconnected client");
+    assert.equal(response.status, 502);
+
+    // The disconnect must not have counted as an upstream failure: the breaker
+    // is untouched, so a subsequent request to the same upstream is not skipped.
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(new URL(String(url)).hostname);
+      return dnsAnswer();
+    };
+    for (let i = 0; i < 3; i += 1) {
+      const after = await doh.proxyRequest(getRequest(), {
+        upstreams: [{ endpoint: "https://first.test/dns-query" }, { endpoint: "https://second.test/dns-query" }],
+        timeoutMs: 1_000,
+        failover: true,
+      });
+      assert.equal(after.status, 200);
+    }
+    assert.deepEqual(seen, ["first.test", "first.test", "first.test"]);
   });
 
-  assert.equal(response.status, 200);
-  assert.equal(calls.length, 2, "the negative Content-Length response must be skipped");
-  assert.match(calls[1], /second\.test/);
-});
+  await test("A negative upstream Content-Length is rejected and failover continues", async () => {
+    const calls = [];
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      if (calls.length === 1) {
+        return new Response(validResponse(), {
+          status: 200,
+          headers: { "content-type": "application/dns-message", "content-length": "-1" },
+        });
+      }
+      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+    };
 
-await test("PROXY_VERSION matches package.json", async () => {
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [
+        { endpoint: "https://first.test/dns-query" },
+        { endpoint: "https://second.test/dns-query" },
+      ],
+      timeoutMs: 1_000,
+      failover: true,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 2, "the negative Content-Length response must be skipped");
+    assert.match(calls[1], /second\.test/);
+  });
+
+  await test("PROXY_VERSION is read from package.json", async () => {
     const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-    assert.equal(doh.PROXY_VERSION, pkg.version, "PROXY_VERSION must match package.json");
+    assert.equal(doh.PROXY_VERSION, pkg.version);
   });
 
   await test("Copyright year is a fixed constant, not computed at render time", async () => {
@@ -507,23 +534,6 @@ await test("PROXY_VERSION matches package.json", async () => {
     }
   });
 
-  await test("Blank HAGEZI_ROTATION_SECONDS falls back to the default interval", async () => {
-    const saved = process.env.HAGEZI_ROTATION_SECONDS;
-    const realNow = Date.now;
-    try {
-      // Pick a time where the 60 s slot and the 1800 s slot map to different upstreams.
-      Date.now = () => 1_800_000 * 7 + 60_000 * 2; // 1800 s slot = 7 % 3 = 1; 60 s slot = 212 % 3 = 2
-      process.env.HAGEZI_ROTATION_SECONDS = "";
-      const blank = doh.getHageziUpstreams()[0].endpoint;
-      delete process.env.HAGEZI_ROTATION_SECONDS;
-      const unset = doh.getHageziUpstreams()[0].endpoint;
-      assert.equal(blank, unset);
-    } finally {
-      Date.now = realNow;
-      if (saved === undefined) delete process.env.HAGEZI_ROTATION_SECONDS;
-      else process.env.HAGEZI_ROTATION_SECONDS = saved;
-    }
-  });
   await test("DoH GET tolerates padded base64url dns parameter", async () => {
     globalThis.fetch = async () =>
       new Response(validResponse(), {
@@ -643,7 +653,8 @@ await test("PROXY_VERSION matches package.json", async () => {
     const options = { upstreams: [{ endpoint: "https://per-ip.test/dns-query" }], timeoutMs: 2_000, failover: false };
     const withIp = (ip) => {
       const base = getRequest();
-      return new Request(base.url, { headers: { "x-real-ip": ip } });
+      // src/proxy.ts sets this header from the resolved client address.
+      return new Request(base.url, { headers: { "x-doh-client-key": ip } });
     };
     const held = Array.from({ length: doh.MAX_IN_FLIGHT_PER_IP }, () => doh.proxyRequest(withIp("192.0.2.50"), options));
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -793,47 +804,122 @@ await test("PROXY_VERSION matches package.json", async () => {
     assert.deepEqual(seen, ["big-declared.test", "big-streamed.test", "small.test"]);
   });
 
-  await test("HAGEZI_ROTATION_MODE=request round-robins the primary resolver per request", () => {
-    const saved = process.env.HAGEZI_ROTATION_MODE;
+  await test("A probe slot is only released by the attempt that owns it", async () => {
+    // A opens; once half-open, request 1 probes A and hangs, request 2 skips A.
+    // Request 1's inconclusive end (403) must release its own probe only.
+    const hits = { a: 0, b: 0 };
+    let aMode = "fail";
+    let releaseA;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("owner-a.test")) {
+        hits.a += 1;
+        if (aMode === "fail") return new Response(null, { status: 503 });
+        if (aMode === "hang") await new Promise((resolve) => (releaseA = resolve));
+        return new Response(null, { status: 403 });
+      }
+      hits.b += 1;
+      return dnsAnswer();
+    };
+    const options = {
+      upstreams: [{ endpoint: "https://owner-a.test/dns-query" }, { endpoint: "https://owner-b.test/dns-query" }],
+      timeoutMs: 2_000,
+      failover: true,
+    };
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
     try {
-      process.env.HAGEZI_ROTATION_MODE = " Request "; // trimmed and case-insensitive
-      const firsts = Array.from({ length: 4 }, () => doh.getHageziUpstreams()[0].endpoint);
-      assert.equal(new Set(firsts.slice(0, 3)).size, 3, "three consecutive requests start on three different resolvers");
-      assert.equal(firsts[3], firsts[0], "the cycle repeats after one full round");
-      assert.equal(new Set(doh.getHageziUpstreams().map((upstream) => upstream.endpoint)).size, 3, "every rotation keeps all upstreams");
+      for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options);
+      now += 31_000;
+      aMode = "hang";
+      const first = doh.proxyRequest(getRequest(), options); // claims A's probe
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(hits.a, 4);
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 4, "A is skipped while its probe is in flight");
+      aMode = "reject";
+      releaseA();
+      assert.equal((await first).status, 200);
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 5, "the owner released its probe after the inconclusive answer");
     } finally {
-      if (saved === undefined) delete process.env.HAGEZI_ROTATION_MODE;
-      else process.env.HAGEZI_ROTATION_MODE = saved;
+      Date.now = realNow;
     }
   });
 
-  await test("HAGEZI_ROTATION_SECONDS is clamped to 60-86400 seconds and bad values use the default", () => {
-    const savedSeconds = process.env.HAGEZI_ROTATION_SECONDS;
-    const savedMode = process.env.HAGEZI_ROTATION_MODE;
-    const realNow = Date.now;
-    const firstAt = (seconds, now) => {
-      process.env.HAGEZI_ROTATION_SECONDS = seconds;
-      Date.now = () => now;
-      return doh.getHageziUpstreams()[0].endpoint;
+  await test("Isolated failures further apart than the failure window do not open the breaker", async () => {
+    let hits = 0;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("sporadic-a.test")) {
+        hits += 1;
+        return new Response(null, { status: 503 });
+      }
+      return dnsAnswer();
     };
+    const options = {
+      upstreams: [{ endpoint: "https://sporadic-a.test/dns-query" }, { endpoint: "https://sporadic-b.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: true,
+    };
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
     try {
-      delete process.env.HAGEZI_ROTATION_MODE;
-      const minute = 60_000 * 300; // slot 300 (% 3 === 0) at 60 s
-      assert.equal(firstAt("1", minute), firstAt("1", minute + 59_000), "1 s is raised to 60 s");
-
-      const day = 86_400_000 * 3;
-      assert.equal(firstAt("999999", day), firstAt("999999", day + 86_399_000), "huge values are capped at 86400 s");
-      assert.notEqual(firstAt("999999", day), firstAt("999999", day + 86_400_000));
-
-      const half = 1_800_000 * 3;
-      assert.equal(firstAt("abc", half), firstAt("abc", half + 1_799_000), "non-numeric falls back to 1800 s");
-      assert.notEqual(firstAt("abc", half), firstAt("abc", half + 1_800_000));
+      for (let i = 0; i < 5; i += 1) {
+        await doh.proxyRequest(getRequest(), options);
+        now += 31_000;
+      }
+      assert.equal(hits, 5, "spread-out failures never trip the breaker");
     } finally {
       Date.now = realNow;
-      if (savedSeconds === undefined) delete process.env.HAGEZI_ROTATION_SECONDS;
-      else process.env.HAGEZI_ROTATION_SECONDS = savedSeconds;
-      if (savedMode !== undefined) process.env.HAGEZI_ROTATION_MODE = savedMode;
     }
+  });
+
+  await test("Provider routes (no failover) keep no circuit-breaker state", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(null, { status: 503 });
+    };
+    const options = { upstreams: [{ endpoint: "https://single.test/dns-query" }], timeoutMs: 1_000, failover: false };
+    for (let i = 0; i < 5; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 502);
+    assert.equal(calls, 5);
+
+    // The same endpoint in a failover list is not considered open afterwards.
+    globalThis.fetch = async (url) => {
+      calls += 1;
+      return String(url).includes("single.test") ? dnsAnswer() : new Response(null, { status: 500 });
+    };
+    calls = 0;
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://single.test/dns-query" }, { endpoint: "https://other.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: true,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(calls, 1);
+  });
+
+  await test("Relayed max-age subtracts the upstream Age", async () => {
+    const options = { upstreams: [{ endpoint: "https://age.test/dns-query" }], timeoutMs: 500, failover: false };
+    globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "public, max-age=120", age: "100" });
+    assert.equal((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), "private, max-age=20");
+    globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=60", age: "90" });
+    assert.match((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), /no-store/);
+  });
+
+  await test("GET upstream URLs drop a fragment and append dns= correctly", async () => {
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      return dnsAnswer();
+    };
+    await doh.proxyRequest(getRequest(), {
+      upstreams: [{ endpoint: "https://frag.test/dns-query#ignored" }],
+      timeoutMs: 500,
+      failover: false,
+    });
+    assert.match(seen[0], /^https:\/\/frag\.test\/dns-query\?dns=[A-Za-z0-9_-]+$/);
   });
 } finally {
   globalThis.fetch = originalFetch;

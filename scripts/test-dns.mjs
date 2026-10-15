@@ -1,57 +1,42 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { importTypeScript } from "./lib/transpile-source.mjs";
-// Shared fixtures; id=1 keeps the transaction-ID expectations below unchanged.
-import { validQuery as makeValidQuery, validResponse as makeValidResponse } from "./lib/dns-fixtures.mjs";
+import { buildQuery, validQuery as makeValidQuery, validResponse as makeValidResponse } from "./lib/dns-fixtures.mjs";
+import { importSource } from "./lib/transpile-source.mjs";
 
-const dns = await importTypeScript("../src/lib/dns.ts", import.meta.url);
+const dns = await importSource("lib/dns.ts");
 const isValidDnsQuery = (message) => dns.parseQuery(message) !== null;
+/** Response validation against a raw query (parsed the way doh.ts does). */
+const matches = (response, query) => dns.isValidDnsResponse(response, dns.parseQuery(query));
+// id=1 keeps the transaction-ID expectations below unchanged.
 const validQuery = makeValidQuery(1);
 const validResponse = (query = validQuery) => makeValidResponse(query);
 
+/** Query whose QNAME is the given raw label bytes (root label appended). */
 function queryWithName(nameBytes, id = 1) {
-  return Uint8Array.from([
-    id >>> 8,
-    id & 0xff,
-    0x01,
-    0x00,
-    0x00,
-    0x01,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    ...nameBytes,
-    0,
-    0,
-    1,
-    0,
-    1,
-  ]);
+  const query = buildQuery(id, "");
+  return Uint8Array.from([...query.slice(0, 12), ...nameBytes, ...query.slice(12)]);
 }
 
-await test("accepts a normal DNS query", () => {
+test("accepts a normal DNS query", () => {
   assert.equal(isValidDnsQuery(validQuery), true);
 });
 
-await test("rejects a response presented as a query", () => {
+test("rejects a response presented as a query", () => {
   const response = Uint8Array.from(validQuery);
   response[2] |= 0x80;
   assert.equal(isValidDnsQuery(response), false);
 });
 
-await test("rejects a compressed first-question QNAME without a prior name", () => {
+test("rejects a compressed first-question QNAME without a prior name", () => {
   const query = Uint8Array.from([0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x0c, 0, 1, 0, 1]);
   assert.equal(isValidDnsQuery(query), false);
 });
 
-await test("accepts backward compression in a resource-record owner name", () => {
-  assert.equal(dns.isValidDnsResponse(validResponse(), validQuery), true);
+test("accepts backward compression in a resource-record owner name", () => {
+  assert.equal(matches(validResponse(), validQuery), true);
 });
 
-await test("rejects forward compression pointers", () => {
+test("rejects forward compression pointers", () => {
   const response = validResponse();
   const answerNameOffset = validQuery.length;
   response[answerNameOffset] = 0xc0;
@@ -59,59 +44,25 @@ await test("rejects forward compression pointers", () => {
   assert.equal(dns.isValidDnsResponse(response), false);
 });
 
-await test("rejects compression pointers into unrelated question fields", () => {
+test("rejects compression pointers into unrelated question fields", () => {
   const response = validResponse();
   const answerNameOffset = validQuery.length;
   // Offset 26 is the first byte of QTYPE, not the start of a domain name.
   response[answerNameOffset] = 0xc0;
   response[answerNameOffset + 1] = 26;
-  assert.equal(dns.isValidDnsResponse(response, validQuery), false);
+  assert.equal(matches(response, validQuery), false);
 });
 
-await test("rejects compression pointers that point before the DNS message", () => {
+test("rejects compression pointers that point before the DNS message", () => {
   const response = Uint8Array.from([
-    0,
-    1,
-    0x80,
-    0,
-    0,
-    1,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    3,
-    119,
-    119,
-    119,
-    0,
-    0,
-    1,
-    0,
-    1,
-    0xc0,
-    0x00,
-    0,
-    1,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    4,
-    1,
-    2,
-    3,
-    4,
+    0, 1, 0x80, 0, 0, 1, 0, 1, 0, 0, 0, 0, // header: QR, QDCOUNT=1, ANCOUNT=1
+    3, 119, 119, 119, 0, 0, 1, 0, 1, // question www. A IN
+    0xc0, 0x00, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 1, 2, 3, 4, // owner points into the header
   ]);
   assert.equal(dns.isValidDnsResponse(response), false);
 });
 
-await test("rejects names longer than 255 octets", () => {
+test("rejects names longer than 255 octets", () => {
   const labels = [];
   let remaining = 256;
   while (remaining > 0) {
@@ -122,30 +73,30 @@ await test("rejects names longer than 255 octets", () => {
   assert.equal(isValidDnsQuery(queryWithName(labels)), false);
 });
 
-await test("accepts a structurally valid DNS response", () => {
+test("accepts a structurally valid DNS response", () => {
   assert.equal(dns.isValidDnsResponse(validResponse()), true);
 });
 
-await test("matches response transaction ID and question", () => {
+test("matches response transaction ID and question", () => {
   const query = validQuery;
   const response = validResponse(query);
-  assert.equal(dns.isValidDnsResponse(response, query), true);
+  assert.equal(matches(response, query), true);
 
   const wrongId = validResponse(Uint8Array.from(query));
   wrongId[0] = 0x12;
   wrongId[1] = 0x34;
-  assert.equal(dns.isValidDnsResponse(wrongId, query), false);
+  assert.equal(matches(wrongId, query), false);
 
   const differentName = queryWithName([3, 119, 101, 98, 7, 101, 120, 97, 109, 112, 108, 101]);
-  assert.equal(dns.isValidDnsResponse(validResponse(differentName), query), false);
+  assert.equal(matches(validResponse(differentName), query), false);
 });
 
-await test("DNS question name matching is case-insensitive", () => {
+test("DNS question name matching is case-insensitive", () => {
   const response = validResponse();
   const qnameStart = 12;
   response[qnameStart + 1] = 87;
   response[qnameStart + 2] = 87;
-  assert.equal(dns.isValidDnsResponse(response, validQuery), true);
+  assert.equal(matches(response, validQuery), true);
 });
 
 test("accepts a CNAME chain whose next owner name points into earlier RDATA", () => {
@@ -157,7 +108,7 @@ test("accepts a CNAME chain whose next owner name points into earlier RDATA", ()
   const cname = [0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, rdata.length, ...rdata];
   const a = [0xc0 | (rdataOffset >> 8), rdataOffset & 0xff, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4];
   const response = Uint8Array.from([0, 1, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0, ...question, ...cname, ...a]);
-  assert.equal(dns.isValidDnsResponse(response, query), true);
+  assert.equal(matches(response, query), true);
 });
 
 test("rejects a compressed name whose expanded form exceeds 255 octets", () => {
@@ -193,7 +144,7 @@ test("rejects a compressed name whose expanded form exceeds 255 octets", () => {
     ...question,
     ...answer,
   ]);
-  assert.equal(dns.isValidDnsResponse(response, query), false);
+  assert.equal(matches(response, query), false);
 });
 
 test("responses may exceed 4 KiB but queries may not", () => {
@@ -205,7 +156,7 @@ test("responses may exceed 4 KiB but queries may not", () => {
   }
   const big = Uint8Array.from([validQuery[0], validQuery[1], 0x81, 0x80, 0, 1, 0, 17, 0, 0, 0, 0, ...question, ...records]);
   assert.ok(big.byteLength > 4_096);
-  assert.equal(dns.isValidDnsResponse(big, validQuery), true);
+  assert.equal(matches(big, validQuery), true);
 
   // Structurally valid query (EDNS0 padding option) that only violates the size cap.
   const padded = (padLength) => {
@@ -239,15 +190,15 @@ test("accepts a legal QDCOUNT=0 response when the transaction ID matches", () =>
   const answer = [...owner, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4];
   const header = [validQuery[0], validQuery[1], 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0];
   const qd0 = Uint8Array.from([...header, ...answer]);
-  assert.equal(dns.isValidDnsResponse(qd0, validQuery), true, "ID match is enough without a question section");
+  assert.equal(matches(qd0, validQuery), true, "ID match is enough without a question section");
   const wrongId = Uint8Array.from(qd0);
   wrongId[0] = 0x12;
   wrongId[1] = 0x34;
-  assert.equal(dns.isValidDnsResponse(wrongId, validQuery), false, "transaction ID still enforced");
+  assert.equal(matches(wrongId, validQuery), false, "transaction ID still enforced");
 });
 
 test("still rejects responses with more than one question", () => {
   const response = validResponse();
   response[5] = 2; // QDCOUNT = 2 is never legal
-  assert.equal(dns.isValidDnsResponse(response, validQuery), false);
+  assert.equal(matches(response, validQuery), false);
 });

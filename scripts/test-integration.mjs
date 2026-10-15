@@ -1,15 +1,14 @@
 /**
  * End-to-end integration tests. Launches the PRODUCTION build with
- * `next start` against a local mock DoH upstream and exercises real HTTP:
- * GET/POST, invalid content types, oversized bodies, slow clients, upstream
- * failures and response headers. (Processes are only terminated in teardown;
+ * `next start` (plus server/socket-ip-preload.cjs, exactly like `npm start`)
+ * against a local mock DoH upstream and exercises real HTTP: GET/POST,
+ * invalid content types, oversized bodies, slow clients, upstream failures,
+ * response headers, routing and the per-client rate limit in both
+ * TRUST_PROXY_HEADERS modes. (Processes are only terminated in teardown;
  * graceful shutdown itself is not asserted.)
  *
  * Requires `npm run build` first (CI runs build before this script).
- * Hermetic via HAGEZI_UPSTREAM_ENDPOINTS (see src/lib/doh.ts).
- *
- * DNS wire-format builders are shared with the unit suites via
- * scripts/lib/dns-fixtures.mjs.
+ * Hermetic via HAGEZI_UPSTREAM_ENDPOINTS (see src/lib/config.ts).
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -17,9 +16,8 @@ import { existsSync } from "node:fs";
 import http from "node:http";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
-
-const DNS_MESSAGE = "application/dns-message";
+import { DNS_MESSAGE, validQuery } from "./lib/dns-fixtures.mjs";
+import { startMockUpstream } from "./lib/mock-upstream.mjs";
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -32,31 +30,29 @@ function freePort() {
   });
 }
 
-function startMockUpstream() {
-  const server = http.createServer((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      let query;
-      const url = new URL(req.url, "http://localhost");
-      if (req.method === "GET") query = Buffer.from(url.searchParams.get("dns") ?? "", "base64url");
-      else query = Buffer.concat(chunks);
-      res.writeHead(200, {
-        "content-type": DNS_MESSAGE,
-        "cache-control": "max-age=120",
-      });
-      res.end(Buffer.from(validResponse(query)));
+/** Raw GET via node:http so the source address and headers are fully controlled. */
+function rawGet(base, path, { headers = {}, localAddress } = {}) {
+  const { port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path, headers, localAddress, agent: false }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
     });
+    req.on("error", reject);
+    req.end();
   });
-  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
 }
 
 async function startApp(env) {
   const port = await freePort();
-  const child = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-p", String(port)], {
-    env: { ...process.env, HOSTNAME: "127.0.0.1", ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const child = spawn(
+    process.execPath,
+    ["--require", "./server/socket-ip-preload.cjs", "node_modules/next/dist/bin/next", "start", "-p", String(port)],
+    {
+      env: { ...process.env, HOSTNAME: "127.0.0.1", ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   let logs = "";
   child.stdout.on("data", (d) => (logs += d));
   child.stderr.on("data", (d) => (logs += d));
@@ -90,22 +86,31 @@ async function stopApp(app) {
 const VALID_QUERY = Buffer.from(validQuery());
 const VALID_QUERY_B64 = VALID_QUERY.toString("base64url");
 
+const LIMIT = 3;
+const DOH_PATH = `/api/doh/dns-query?dns=${VALID_QUERY_B64}`;
+
 let mock;
 let app;
 let failingApp;
+let trustedApp;
+let untrustedApp;
 
 before(async () => {
   assert.ok(existsSync(".next/BUILD_ID"), "run `npm run build` before the integration tests");
   mock = await startMockUpstream();
-  app = await startApp({ HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${mock.address().port}/dns-query` });
+  const upstream = { HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${mock.address().port}/dns-query` };
   // Upstream that refuses connections, to exercise the failure path.
   const deadPort = await freePort();
-  failingApp = await startApp({ HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${deadPort}/dns-query` });
+  [app, failingApp, trustedApp, untrustedApp] = await Promise.all([
+    startApp(upstream),
+    startApp({ HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${deadPort}/dns-query` }),
+    startApp({ ...upstream, TRUST_PROXY_HEADERS: "1", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
+    startApp({ ...upstream, TRUST_PROXY_HEADERS: "0", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
+  ]);
 });
 
 after(async () => {
-  await stopApp(failingApp);
-  await stopApp(app);
+  await Promise.all([stopApp(untrustedApp), stopApp(trustedApp), stopApp(failingApp), stopApp(app)]);
   // Guarded: when setup fails before the mock exists (e.g. missing BUILD_ID),
   // an unconditional mock?.close(resolve) would never settle and hang teardown.
   if (mock) await new Promise((resolve) => mock.close(resolve));
@@ -117,6 +122,7 @@ test("GET with a valid dns parameter proxies a matching response", async () => {
   assert.equal(res.headers.get("content-type"), DNS_MESSAGE);
   assert.match(res.headers.get("cache-control") ?? "", /max-age=120/); // upstream max-age relayed for GET
   const body = new Uint8Array(await res.arrayBuffer());
+  assert.equal(Number(res.headers.get("content-length")), body.length, "Content-Length is set by the server");
   assert.equal(body.length > 12, true);
   assert.equal((body[0] << 8) | body[1], 0x1234); // transaction ID preserved
   assert.equal(body[2] & 0x80, 0x80); // QR bit set
@@ -213,4 +219,37 @@ test("a slow client uploading a POST body gets a bounded terminal response", asy
 test("unreachable upstream surfaces a generic 502", async () => {
   const res = await fetch(`${failingApp.base}/api/doh/dns-query?dns=${VALID_QUERY_B64}`);
   assert.equal(res.status, 502);
+});
+
+test("unknown provider ids get 404 from the router", async () => {
+  const res = await fetch(`${app.base}/api/doh/not-a-provider/dns-query?dns=${VALID_QUERY_B64}`);
+  assert.equal(res.status, 404);
+});
+
+test("TRUST_PROXY_HEADERS=1: the limit applies per X-Forwarded-For client", async () => {
+  for (let i = 0; i < LIMIT; i += 1) {
+    assert.equal(await rawGet(trustedApp.base, DOH_PATH, { headers: { "x-forwarded-for": "203.0.113.1" } }), 200);
+  }
+  assert.equal(await rawGet(trustedApp.base, DOH_PATH, { headers: { "x-forwarded-for": "203.0.113.1" } }), 429);
+  assert.equal(await rawGet(trustedApp.base, DOH_PATH, { headers: { "x-forwarded-for": "203.0.113.2" } }), 200);
+});
+
+test("TRUST_PROXY_HEADERS=0: the limit applies per socket address and forged headers do not help", async () => {
+  for (let i = 0; i < LIMIT; i += 1) {
+    const headers = { "x-forwarded-for": `198.51.100.${i}`, "x-real-ip": `192.0.2.${i}`, "x-doh-socket-ip": `10.9.9.${i}` };
+    assert.equal(await rawGet(untrustedApp.base, DOH_PATH, { headers, localAddress: "127.0.0.1" }), 200);
+  }
+  const forged = { "x-forwarded-for": "198.51.100.200", "x-doh-socket-ip": "10.9.9.200" };
+  assert.equal(await rawGet(untrustedApp.base, DOH_PATH, { headers: forged, localAddress: "127.0.0.1" }), 429);
+  assert.equal(await rawGet(untrustedApp.base, DOH_PATH, { localAddress: "127.0.0.2" }), 200, "another source address has its own bucket");
+});
+
+test("a 429 carries Retry-After and CORS headers; preflights are never limited", async () => {
+  const headers = { "x-forwarded-for": "203.0.113.1" };
+  const limited = await fetch(`${trustedApp.base}${DOH_PATH}`, { headers });
+  assert.equal(limited.status, 429);
+  assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+  assert.equal(limited.headers.get("access-control-allow-origin"), "*");
+  const preflight = await fetch(`${trustedApp.base}/api/doh/dns-query`, { method: "OPTIONS", headers });
+  assert.equal(preflight.status, 204);
 });
