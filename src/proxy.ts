@@ -1,12 +1,14 @@
 /**
  * Node.js proxy for the DoH endpoints: per-client rate limiting.
  *
- * Limit: 100 requests per rolling 60 seconds per client (RATE_LIMIT_PER_MINUTE),
- * in BOTH trust modes:
+ * Limit: RATE_LIMIT_PER_MINUTE requests (default 100) per rolling 60 seconds
+ * per client, in BOTH trust modes:
  *
  * - TRUST_PROXY_HEADERS=1 (default): the client is identified by the trusted
  *   forwarding header (CLIENT_IP_HEADERS / TRUSTED_PROXY_HOPS; platform default
- *   otherwise), falling back to the socket address.
+ *   otherwise), falling back to the socket address. When the socket address
+ *   is known, the header is honored only if the TCP peer matches
+ *   TRUSTED_PROXIES (default: loopback and private ranges).
  * - TRUST_PROXY_HEADERS=0: forwarding headers are ignored and the TCP socket
  *   address recorded by `server/socket-ip-preload.cjs` is used (the Docker
  *   image and `npm start` load it).
@@ -45,12 +47,18 @@ function tooManyRequests(retryAfterSeconds: number): NextResponse {
 }
 
 export default function proxy(request: NextRequest) {
-  // CORS preflights do no upstream work, and browsers cannot read a non-2xx
-  // preflight answer, so they are not rate limited.
-  if (request.method === "OPTIONS") return NextResponse.next();
+  // OPTIONS (CORS preflight) and HEAD (health checks) are answered with a 204
+  // before any upstream work, so they are not rate limited: browsers cannot
+  // read a non-2xx preflight answer, and a monitor sharing a NAT/edge address
+  // with real users must not consume their budget.
+  if (request.method === "OPTIONS" || request.method === "HEAD") return NextResponse.next();
 
   const ip = getClientIp(request.headers);
-  const result = limiter.check(ip ?? UNKNOWN_CLIENT_KEY, Date.now());
+  // Monotonic clock, not Date.now(): a wall-clock step (NTP correction, VM
+  // resume) must neither reset the budgets nor freeze the windows. The limiter
+  // can only clamp a clock that moves backwards, so a forward step would stall
+  // every window until real time caught up.
+  const result = limiter.check(ip ?? UNKNOWN_CLIENT_KEY, Math.floor(performance.now()));
   if (result.limited) return tooManyRequests(result.retryAfterSeconds);
 
   const headers = new Headers(request.headers);
