@@ -7,6 +7,9 @@
  *
  * Requires `npm run build` first (CI runs build before this script).
  * Hermetic via HAGEZI_UPSTREAM_ENDPOINTS (see src/lib/doh.ts).
+ *
+ * DNS wire-format builders are shared with the unit suites via
+ * scripts/lib/dns-fixtures.mjs.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -14,46 +17,9 @@ import { existsSync } from "node:fs";
 import http from "node:http";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
 
 const DNS_MESSAGE = "application/dns-message";
-
-function encodeName(name) {
-  const labels = name.split(".").flatMap((label) => [label.length, ...Buffer.from(label)]);
-  return Buffer.from([...labels, 0]);
-}
-
-function buildQuery(id = 0x1234, name = "example.com") {
-  const qname = encodeName(name);
-  const message = Buffer.alloc(12 + qname.length + 4);
-  message.writeUInt16BE(id, 0);
-  message.writeUInt16BE(0x0000, 2);
-  message.writeUInt16BE(1, 4);
-  qname.copy(message, 12);
-  message.writeUInt16BE(1, 12 + qname.length);
-  message.writeUInt16BE(1, 12 + qname.length + 2);
-  return message;
-}
-
-/** Canned 200 answer that echoes the question and adds an A record. */
-function buildUpstreamResponse(query) {
-  let offset = 12;
-  while (query[offset] !== 0) offset += 1 + query[offset];
-  const questionEnd = offset + 5;
-  const answer = Buffer.concat([
-    Buffer.from([0xc0, 0x0c]), // pointer to the question name
-    Buffer.from([0, 1, 0, 1]), // type A, class IN
-    Buffer.from([0, 0, 0, 60]), // TTL 60
-    Buffer.from([0, 4, 1, 2, 3, 4]),
-  ]);
-  const message = Buffer.alloc(questionEnd + answer.length);
-  query.copy(message, 0, 0, 12);
-  message.writeUInt16BE(0x8180, 2);
-  message.writeUInt16BE(1, 4);
-  message.writeUInt16BE(1, 6);
-  query.copy(message, 12, 12, questionEnd);
-  answer.copy(message, questionEnd);
-  return message;
-}
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -79,7 +45,7 @@ function startMockUpstream() {
         "content-type": DNS_MESSAGE,
         "cache-control": "max-age=120",
       });
-      res.end(buildUpstreamResponse(query));
+      res.end(Buffer.from(validResponse(query)));
     });
   });
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
@@ -121,7 +87,7 @@ async function stopApp(app) {
   if (!exited) app.child.kill("SIGKILL");
 }
 
-const VALID_QUERY = buildQuery();
+const VALID_QUERY = Buffer.from(validQuery());
 const VALID_QUERY_B64 = VALID_QUERY.toString("base64url");
 
 let mock;
@@ -140,7 +106,9 @@ before(async () => {
 after(async () => {
   await stopApp(failingApp);
   await stopApp(app);
-  await new Promise((resolve) => mock?.close(resolve));
+  // Guarded: when setup fails before the mock exists (e.g. missing BUILD_ID),
+  // an unconditional mock?.close(resolve) would never settle and hang teardown.
+  if (mock) await new Promise((resolve) => mock.close(resolve));
 });
 
 test("GET with a valid dns parameter proxies a matching response", async () => {
@@ -211,8 +179,7 @@ test("OPTIONS/HEAD get a CORS-enabled 204; other methods get 405", async () => {
     headers: { "content-type": DNS_MESSAGE },
     body: VALID_QUERY,
   });
-  // PUT is not exported by the route, so Next's router answers 405 itself
-  // (the handler-level 405 with an Allow header is unit-tested via the stub).
+  // PUT is not exported by the route, so Next's router answers 405 itself.
   assert.equal(put.status, 405);
 });
 

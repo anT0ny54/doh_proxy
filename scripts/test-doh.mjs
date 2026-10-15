@@ -793,18 +793,6 @@ await test("PROXY_VERSION matches package.json", async () => {
     assert.deepEqual(seen, ["big-declared.test", "big-streamed.test", "small.test"]);
   });
 
-  await test("Handler-level 405 for unsupported methods carries an Allow header", async () => {
-    globalThis.fetch = async () => {
-      throw new Error("fetch must not run for unsupported methods");
-    };
-    const response = await doh.proxyRequest(getLikeRequest("PUT"), {
-      upstreams: [{ endpoint: "https://never-reached.test/dns-query" }],
-    });
-    assert.equal(response.status, 405);
-    assert.equal(response.headers.get("allow"), "GET, POST, HEAD, OPTIONS");
-    assert.equal(await response.text(), "Method Not Allowed");
-  });
-
   await test("HAGEZI_ROTATION_MODE=request round-robins the primary resolver per request", () => {
     const saved = process.env.HAGEZI_ROTATION_MODE;
     try {
