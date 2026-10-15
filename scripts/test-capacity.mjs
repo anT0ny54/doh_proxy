@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validQuery, validResponse } from "./lib/dns-fixtures.mjs";
+import { dnsAnswer, validQuery } from "./lib/dns-fixtures.mjs";
 import { importDoh } from "./lib/transpile-source.mjs";
 
 const doh = await importDoh();
@@ -18,7 +18,7 @@ try {
     let released = false;
     globalThis.fetch = async () => {
       calls += 1;
-      if (released) return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      if (released) return dnsAnswer();
       return new Promise((resolve) => pending.push(resolve));
     };
 
@@ -46,10 +46,7 @@ try {
 
     released = true;
     for (const resolve of pending) {
-      resolve(new Response(validResponse(), {
-        status: 200,
-        headers: { "content-type": "application/dns-message" },
-      }));
+      resolve(dnsAnswer());
     }
     const results = await Promise.all(requests);
     assert.ok(results.every((response) => response.status === 200));

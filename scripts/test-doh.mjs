@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dnsAnswer, validQuery, validResponse } from "./lib/dns-fixtures.mjs";
+import { dnsAnswer, oversizedResponse, validQuery, validResponse } from "./lib/dns-fixtures.mjs";
 import { importDoh } from "./lib/transpile-source.mjs";
 
 // Rotation/override settings are exercised in test-config.mjs.
@@ -36,10 +36,7 @@ try {
     const calls = [];
     globalThis.fetch = async (url, init) => {
       calls.push({ url: String(url), method: init.method });
-      return new Response(validResponse(), {
-        status: 200,
-        headers: { "content-type": "application/dns-message" },
-      });
+      return dnsAnswer();
     };
 
     const response = await doh.proxyRequest(getRequest(), {
@@ -79,10 +76,7 @@ try {
     globalThis.fetch = async (url) => {
       calls.push(String(url));
       if (calls.length === 1) return new Response(null, { status: 503 });
-      return new Response(validResponse(), {
-        status: 200,
-        headers: { "content-type": "application/dns-message" },
-      });
+      return dnsAnswer();
     };
 
     const response = await doh.proxyRequest(getRequest(), {
@@ -248,7 +242,7 @@ try {
     globalThis.fetch = async (url) => {
       seen.push(String(url));
       if (String(url).includes("blocked.test")) return new Response(null, { status: 403 });
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
 
     const recovered = await doh.proxyRequest(getRequest(), {
@@ -274,14 +268,7 @@ try {
   });
 
   await test("Upstream responses larger than 4 KiB (DNSSEC/TXT) are relayed", async () => {
-    const query = validQuery();
-    const question = query.slice(12);
-    const records = [];
-    for (let i = 0; i < 17; i += 1) {
-      const rdata = [255, ...new Uint8Array(255).fill(97)];
-      records.push(0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, rdata.length >> 8, rdata.length & 0xff, ...rdata);
-    }
-    const big = Uint8Array.from([query[0], query[1], 0x81, 0x80, 0, 1, 0, 17, 0, 0, 0, 0, ...question, ...records]);
+    const big = oversizedResponse();
     assert.ok(big.byteLength > 4_096);
 
     let calls = 0;
@@ -324,7 +311,7 @@ try {
     let calls = 0;
     globalThis.fetch = async () => {
       calls += 1;
-      return new Response(validResponse(query), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer(validResponse(query));
     };
     const options = { upstreams: [{ endpoint: "https://slow-client.test/dns-query" }], timeoutMs: 250, failover: false };
 
@@ -340,19 +327,28 @@ try {
     assert.equal(calls, 1);
   });
 
-  await test("Client-influenced failures never open the circuit breaker", async () => {
-    let calls = 0;
-    globalThis.fetch = async () => {
-      calls += 1;
-      return new Response(null, { status: 400 });
-    };
+  await test("Request-rejection statuses are relayed at once and never open the circuit breaker", async () => {
+    for (const status of [400, 413, 414, 415]) {
+      const seen = [];
+      globalThis.fetch = async (url) => {
+        seen.push(new URL(String(url)).hostname);
+        return new Response(null, { status });
+      };
 
-    const options = { upstreams: [{ endpoint: "https://reject-400.test/dns-query" }, { endpoint: "https://reject-400-b.test/dns-query" }], timeoutMs: 1_000, failover: true };
-    for (let i = 0; i < 5; i += 1) {
-      const response = await doh.proxyRequest(getRequest(), options);
-      assert.equal(response.status, 400);
+      const options = {
+        upstreams: [{ endpoint: `https://reject-${status}.test/dns-query` }, { endpoint: `https://reject-${status}-b.test/dns-query` }],
+        timeoutMs: 1_000,
+        failover: true,
+      };
+      for (let i = 0; i < 5; i += 1) {
+        const response = await doh.proxyRequest(getRequest(), options);
+        assert.equal(response.status, status);
+        assert.equal(await response.text(), "DNS upstream rejected request");
+      }
+      // No failover replay of a bad request, and the first upstream is still
+      // contacted every time (its breaker never opened).
+      assert.deepEqual(seen, Array(5).fill(`reject-${status}.test`), `status ${status}`);
     }
-    assert.equal(calls, 10, "every request must still reach both upstreams");
   });
 
   await test("Open circuit breaker is bypassed when every upstream is open", async () => {
@@ -361,7 +357,7 @@ try {
     globalThis.fetch = async () => {
       calls += 1;
       if (!healthy) return new Response(null, { status: 503 });
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
 
     const options = { upstreams: [{ endpoint: "https://flaky.test/dns-query" }], timeoutMs: 100, failover: true };
@@ -456,12 +452,9 @@ try {
     globalThis.fetch = async (url) => {
       calls.push(String(url));
       if (calls.length === 1) {
-        return new Response(validResponse(), {
-          status: 200,
-          headers: { "content-type": "application/dns-message", "content-length": "-1" },
-        });
+        return dnsAnswer(validResponse(), { "content-length": "-1" });
       }
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
 
     const response = await doh.proxyRequest(getRequest(), {
@@ -509,7 +502,7 @@ try {
         return new Response(null, { status: 503 });
       }
       hits.b += 1;
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const options = {
       upstreams: [{ endpoint: "https://half-open-a.test/dns-query" }, { endpoint: "https://half-open-b.test/dns-query" }],
@@ -536,10 +529,7 @@ try {
 
   await test("DoH GET tolerates padded base64url dns parameter", async () => {
     globalThis.fetch = async () =>
-      new Response(validResponse(), {
-        status: 200,
-        headers: { "content-type": "application/dns-message" },
-      });
+      dnsAnswer();
 
     const base64url = Buffer.from(validQuery()).toString("base64url");
     const padding = "=".repeat((4 - (base64url.length % 4)) % 4);
@@ -577,10 +567,7 @@ try {
 
   await test("GET relays a capped upstream max-age as private; POST stays no-store", async () => {
     globalThis.fetch = async () =>
-      new Response(validResponse(), {
-        status: 200,
-        headers: { "content-type": "application/dns-message", "cache-control": "max-age=86400" },
-      });
+      dnsAnswer(validResponse(), { "cache-control": "max-age=86400" });
     const options = { upstreams: [{ endpoint: "https://cache-hint.test/dns-query" }], timeoutMs: 500, failover: false };
     const get = await doh.proxyRequest(getRequest(), options);
     assert.equal(get.headers.get("cache-control"), "private, max-age=300");
@@ -622,7 +609,7 @@ try {
       hits += 1;
       if (!healthy) return new Response("x", { status: 503 });
       await gate;
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const options = { upstreams: [{ endpoint: "https://probe-once.test/dns-query" }, { endpoint: "https://probe-other.test/dns-query" }], timeoutMs: 500, failover: true };
     const realNow = Date.now;
@@ -633,11 +620,13 @@ try {
       now += 31_000;
       healthy = true;
       hits = 0;
+      // Both upstreams tripped above, so both are half-open now.
       const inflight = [doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options)];
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(hits, 3, "one probe on the recovering upstream plus one call each on the healthy fallback");
+      assert.equal(hits, 2, "exactly one probe per half-open upstream; the third request does not pile on");
       release();
-      await Promise.all(inflight);
+      const statuses = (await Promise.all(inflight)).map((response) => response.status);
+      assert.deepEqual(statuses, [200, 200, 502]);
     } finally {
       Date.now = realNow;
     }
@@ -648,7 +637,7 @@ try {
     const gate = new Promise((resolve) => (release = resolve));
     globalThis.fetch = async () => {
       await gate;
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const options = { upstreams: [{ endpoint: "https://per-ip.test/dns-query" }], timeoutMs: 2_000, failover: false };
     const withIp = (ip) => {
@@ -674,7 +663,7 @@ try {
       } else {
         hits.b += 1;
       }
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const a = { endpoint: "https://probe-leak-a.test/dns-query" };
     const b = { endpoint: "https://probe-leak-b.test/dns-query" };
@@ -711,7 +700,7 @@ try {
         return new Response(null, { status: aStatus });
       }
       hits.b += 1;
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const options = {
       upstreams: [{ endpoint: "https://probe-release-a.test/dns-query" }, { endpoint: "https://probe-release-b.test/dns-query" }],
@@ -741,7 +730,7 @@ try {
     const seen = [];
     globalThis.fetch = async (url) => {
       seen.push(String(url));
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const response = await doh.proxyRequest(getRequest(), {
       upstreams: [{ endpoint: "https://query-keep.test/dns-query?token=abc" }],
@@ -756,14 +745,14 @@ try {
     assert.equal(seen[0].split("?").length, 2, "exactly one '?' separator");
   });
 
-  await test("A wrong upstream content type fails over without tripping the breaker", async () => {
+  await test("A wrong upstream content type fails over and counts against the breaker", async () => {
     let wrongCalls = 0;
     globalThis.fetch = async (url) => {
       if (String(url).includes("wrong-ct.test")) {
         wrongCalls += 1;
         return new Response(validResponse(), { status: 200, headers: { "content-type": "text/html" } });
       }
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const options = {
       upstreams: [{ endpoint: "https://wrong-ct.test/dns-query" }, { endpoint: "https://right-ct.test/dns-query" }],
@@ -771,7 +760,7 @@ try {
       failover: true,
     };
     for (let i = 0; i < 5; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
-    assert.equal(wrongCalls, 5, "client-independent invalid responses must not open the breaker");
+    assert.equal(wrongCalls, 3, "a non-DNS 200 is client-independent: three of them open the breaker");
 
     const sole = await doh.proxyRequest(getRequest(), { ...options, upstreams: [options.upstreams[0]], failover: false });
     assert.equal(sole.status, 502);
@@ -789,7 +778,7 @@ try {
       if (host === "big-streamed.test") {
         return new Response(oversized, { status: 200, headers: { "content-type": "application/dns-message" } });
       }
-      return new Response(validResponse(), { status: 200, headers: { "content-type": "application/dns-message" } });
+      return dnsAnswer();
     };
     const response = await doh.proxyRequest(getRequest(), {
       upstreams: [
@@ -873,6 +862,33 @@ try {
     } finally {
       Date.now = realNow;
     }
+  });
+
+  await test("With every breaker open, each upstream is probed by at most one request at a time", async () => {
+    const hits = { a: 0, b: 0 };
+    const pending = [];
+    let hang = false;
+    globalThis.fetch = (url) => {
+      const key = String(url).includes("storm-a.test") ? "a" : "b";
+      hits[key] += 1;
+      if (!hang) return Promise.resolve(new Response(null, { status: 503 }));
+      return new Promise((resolve) => pending.push(() => resolve(new Response(null, { status: 503 }))));
+    };
+    const options = {
+      upstreams: [{ endpoint: "https://storm-a.test/dns-query" }, { endpoint: "https://storm-b.test/dns-query" }],
+      timeoutMs: 2_000,
+      failover: true,
+    };
+    for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options); // opens both
+    assert.deepEqual(hits, { a: 3, b: 3 });
+
+    hang = true;
+    const concurrent = Array.from({ length: 6 }, () => doh.proxyRequest(getRequest(), options));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(hits, { a: 4, b: 4 }, "one probe per upstream, not one per request");
+    while (pending.length > 0) pending.shift()();
+    const statuses = (await Promise.all(concurrent)).map((response) => response.status);
+    assert.ok(statuses.every((status) => status === 502));
   });
 
   await test("Provider routes (no failover) keep no circuit-breaker state", async () => {

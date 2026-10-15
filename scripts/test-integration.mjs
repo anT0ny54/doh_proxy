@@ -3,8 +3,9 @@
  * `next start` (plus server/socket-ip-preload.cjs, exactly like `npm start`)
  * against a local mock DoH upstream and exercises real HTTP: GET/POST,
  * invalid content types, oversized bodies, slow clients, upstream failures,
- * response headers, routing and the per-client rate limit in both
- * TRUST_PROXY_HEADERS modes. (Processes are only terminated in teardown;
+ * response headers, routing, the per-client rate limit in both
+ * TRUST_PROXY_HEADERS modes, the TRUSTED_PROXIES peer check, the buffered
+ * body cap and the transport-level request timeout. (Processes are only terminated in teardown;
  * graceful shutdown itself is not asserted.)
  *
  * Requires `npm run build` first (CI runs build before this script).
@@ -94,6 +95,7 @@ let app;
 let failingApp;
 let trustedApp;
 let untrustedApp;
+let noProxyApp;
 
 before(async () => {
   assert.ok(existsSync(".next/BUILD_ID"), "run `npm run build` before the integration tests");
@@ -101,16 +103,19 @@ before(async () => {
   const upstream = { HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${mock.address().port}/dns-query` };
   // Upstream that refuses connections, to exercise the failure path.
   const deadPort = await freePort();
-  [app, failingApp, trustedApp, untrustedApp] = await Promise.all([
+  [app, failingApp, trustedApp, untrustedApp, noProxyApp] = await Promise.all([
     startApp(upstream),
     startApp({ HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${deadPort}/dns-query` }),
     startApp({ ...upstream, TRUST_PROXY_HEADERS: "1", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
     startApp({ ...upstream, TRUST_PROXY_HEADERS: "0", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
+    // Default trust, but no peer is a trusted proxy: models a directly
+    // exposed instance (the test client connects from loopback).
+    startApp({ ...upstream, TRUSTED_PROXIES: "none", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
   ]);
 });
 
 after(async () => {
-  await Promise.all([stopApp(untrustedApp), stopApp(trustedApp), stopApp(failingApp), stopApp(app)]);
+  await Promise.all([stopApp(noProxyApp), stopApp(untrustedApp), stopApp(trustedApp), stopApp(failingApp), stopApp(app)]);
   // Guarded: when setup fails before the mock exists (e.g. missing BUILD_ID),
   // an unconditional mock?.close(resolve) would never settle and hang teardown.
   if (mock) await new Promise((resolve) => mock.close(resolve));
@@ -216,6 +221,39 @@ test("a slow client uploading a POST body gets a bounded terminal response", asy
   assert.ok([200, 408].includes(status), `expected 200 or 408, got ${status}`);
 });
 
+test("a POST body still incomplete after the 10 s transport request timeout gets 408", { timeout: 30_000 }, async () => {
+  const port = Number(new URL(app.base).port);
+  const started = Date.now();
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, path: "/api/doh/dns-query", method: "POST", headers: { "content-type": DNS_MESSAGE, "content-length": String(VALID_QUERY.length) } },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      },
+    );
+    // The server may close the socket right after its 408.
+    req.on("error", (error) => (error.code === "ECONNRESET" || error.code === "EPIPE" ? resolve("reset") : reject(error)));
+    req.write(VALID_QUERY.subarray(0, 4)); // ...and never the rest
+  });
+  const elapsed = Date.now() - started;
+  assert.ok(status === 408 || status === "reset", `expected 408, got ${status}`);
+  assert.ok(elapsed >= 9_000 && elapsed < 20_000, `bounded by the preload's request timeout, took ${elapsed} ms`);
+});
+
+test("a chunked body over the buffered cap is still rejected (413), even when it starts with a valid query", async () => {
+  const res = await fetch(`${app.base}/api/doh/dns-query`, {
+    method: "POST",
+    headers: { "content-type": DNS_MESSAGE },
+    duplex: "half",
+    body: (async function* () {
+      yield VALID_QUERY;
+      yield Buffer.alloc(8_192);
+    })(),
+  });
+  assert.equal(res.status, 413);
+});
+
 test("unreachable upstream surfaces a generic 502", async () => {
   const res = await fetch(`${failingApp.base}/api/doh/dns-query?dns=${VALID_QUERY_B64}`);
   assert.equal(res.status, 502);
@@ -252,4 +290,22 @@ test("a 429 carries Retry-After and CORS headers; preflights are never limited",
   assert.equal(limited.headers.get("access-control-allow-origin"), "*");
   const preflight = await fetch(`${trustedApp.base}/api/doh/dns-query`, { method: "OPTIONS", headers });
   assert.equal(preflight.status, 204);
+});
+
+test("HEAD health checks never consume the rate limit", async () => {
+  const headers = { "x-forwarded-for": "203.0.113.77" };
+  for (let i = 0; i < LIMIT + 3; i += 1) {
+    const head = await fetch(`${trustedApp.base}/api/doh/dns-query`, { method: "HEAD", headers });
+    assert.equal(head.status, 204);
+  }
+  assert.equal(await rawGet(trustedApp.base, DOH_PATH, { headers }), 200);
+});
+
+test("TRUSTED_PROXIES: forged X-Forwarded-For from an untrusted peer does not mint identities", async () => {
+  for (let i = 0; i < LIMIT; i += 1) {
+    const headers = { "x-forwarded-for": `198.51.100.${i}` };
+    assert.equal(await rawGet(noProxyApp.base, DOH_PATH, { headers, localAddress: "127.0.0.1" }), 200);
+  }
+  const forged = { "x-forwarded-for": "198.51.100.250" };
+  assert.equal(await rawGet(noProxyApp.base, DOH_PATH, { headers: forged, localAddress: "127.0.0.1" }), 429);
 });

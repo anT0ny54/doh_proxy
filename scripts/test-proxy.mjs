@@ -5,6 +5,7 @@ import { importSource } from "./lib/transpile-source.mjs";
 delete process.env.RATE_LIMIT_PER_MINUTE;
 delete process.env.CLIENT_IP_HEADERS;
 delete process.env.TRUSTED_PROXY_HOPS;
+delete process.env.TRUSTED_PROXIES;
 
 const SOCKET_HEADER = "x-doh-socket-ip";
 const KEY_HEADER = "x-doh-client-key";
@@ -71,10 +72,48 @@ test("an injected client key is removed when no address is known", async () => {
   }
 });
 
-test("CORS preflights are not rate limited", async () => {
+test("CORS preflights and HEAD health checks are not rate limited", async () => {
   const proxy = await loadProxy("1");
-  for (let i = 0; i < LIMIT + 5; i += 1) {
-    assert.equal(proxy(request({ "x-forwarded-for": "203.0.113.40" }, "OPTIONS")).status, 200);
+  for (const method of ["OPTIONS", "HEAD"]) {
+    for (let i = 0; i < LIMIT + 5; i += 1) {
+      assert.equal(proxy(request({ "x-forwarded-for": "203.0.113.40" }, method)).status, 200, method);
+    }
   }
-  assert.equal(proxy(request({ "x-forwarded-for": "203.0.113.40" })).status, 200);
+  assert.equal(proxy(request({ "x-forwarded-for": "203.0.113.40" })).status, 200, "GET budget untouched");
+});
+
+test("TRUST_PROXY_HEADERS=1: a directly connected client cannot bypass the limit by rotating X-Forwarded-For", async () => {
+  const proxy = await loadProxy("1");
+  for (let i = 0; i < LIMIT; i += 1) {
+    const response = proxy(request({ "x-forwarded-for": `198.51.100.${i % 250}`, [SOCKET_HEADER]: "203.0.113.50" }));
+    assert.equal(response.status, 200);
+    assert.equal(response.requestHeaders.get(KEY_HEADER), "203.0.113.50", "public peer: its own address is the key");
+  }
+  assert.equal(proxy(request({ "x-forwarded-for": "198.51.100.251", [SOCKET_HEADER]: "203.0.113.50" })).status, 429);
+});
+
+test("the limiter runs on a monotonic clock: a wall-clock step neither resets nor freezes it", async () => {
+  const proxy = await loadProxy("1");
+  const wallNow = Date.now;
+  const monotonicNow = performance.now;
+  let monotonic = monotonicNow.call(performance);
+  performance.now = () => monotonic;
+  const headers = { "x-forwarded-for": "203.0.113.90" };
+  try {
+    for (let i = 0; i < LIMIT; i += 1) assert.equal(proxy(request(headers)).status, 200);
+    assert.equal(proxy(request(headers)).status, 429);
+
+    // An NTP step in either direction must not change the verdict...
+    Date.now = () => wallNow() + 2 * 3_600_000;
+    assert.equal(proxy(request(headers)).status, 429, "forward step does not reset the budget");
+    Date.now = () => wallNow() - 2 * 3_600_000;
+    assert.equal(proxy(request(headers)).status, 429, "backward step does not reset the budget");
+
+    // ...and real elapsed time still frees it, whatever the wall clock says.
+    monotonic += 120_000;
+    assert.equal(proxy(request(headers)).status, 200, "two real windows later the budget is back");
+  } finally {
+    Date.now = wallNow;
+    performance.now = monotonicNow;
+  }
 });

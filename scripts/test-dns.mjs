@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildQuery, validQuery as makeValidQuery, validResponse as makeValidResponse } from "./lib/dns-fixtures.mjs";
+import { buildQuery, oversizedResponse, validQuery as makeValidQuery, validResponse as makeValidResponse } from "./lib/dns-fixtures.mjs";
 import { importSource } from "./lib/transpile-source.mjs";
 
 const dns = await importSource("lib/dns.ts");
@@ -148,13 +148,7 @@ test("rejects a compressed name whose expanded form exceeds 255 octets", () => {
 });
 
 test("responses may exceed 4 KiB but queries may not", () => {
-  const question = validQuery.slice(12);
-  const records = [];
-  for (let i = 0; i < 17; i += 1) {
-    const rdata = [255, ...new Uint8Array(255).fill(97)];
-    records.push(0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, rdata.length >> 8, rdata.length & 0xff, ...rdata);
-  }
-  const big = Uint8Array.from([validQuery[0], validQuery[1], 0x81, 0x80, 0, 1, 0, 17, 0, 0, 0, 0, ...question, ...records]);
+  const big = oversizedResponse(validQuery);
   assert.ok(big.byteLength > 4_096);
   assert.equal(matches(big, validQuery), true);
 
