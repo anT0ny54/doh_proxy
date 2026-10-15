@@ -21,12 +21,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 1
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -60,33 +60,7 @@ jobs:
       # and performs a real DoH query, so a broken standalone bundle or a
       # missing socket-IP preload fails CI (not just "the home page loads").
       - name: Docker container smoke test
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          node scripts/lib/mock-upstream.mjs 18053 &
-          mock_pid=$!
-          docker run -d --name doh-proxy --network host \
-            -e PORT=18367 \
-            -e HAGEZI_UPSTREAM_ENDPOINTS=http://127.0.0.1:18053/dns-query \
-            doh-proxy:ci
-
-          query="$(node --input-type=module -e 'import { validQuery } from "./scripts/lib/dns-fixtures.mjs"; process.stdout.write(Buffer.from(validQuery()).toString("base64url"))')"
-          result=""
-          for _ in $(seq 1 60); do
-            result="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' \
-              "http://127.0.0.1:18367/api/doh/dns-query?dns=${query}" 2>/dev/null || true)"
-            [ "$result" = "200 application/dns-message" ] && break
-            sleep 1
-          done
-
-          docker logs doh-proxy
-          docker rm -f doh-proxy
-          kill "$mock_pid" || true
-
-          if [ "$result" != "200 application/dns-message" ]; then
-            echo "Container did not answer a DoH query (got: ${result:-no response})" >&2
-            exit 1
-          fi
+        run: node scripts/docker-smoke-test.mjs doh-proxy:ci
 
   audit:
     name: Dependency security audit
@@ -95,12 +69,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 1
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
