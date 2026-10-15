@@ -41,4 +41,3 @@
 - The dev-only `braces@3.0.3` advisory (no patched release; vulnerable range
   "*") remains tracked. Production `npm audit --omit=dev` stays the blocking CI
   gate; the full audit remains advisory.
-
