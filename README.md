@@ -49,7 +49,7 @@ scripts/test-*.mjs                 node:test suites. `npm test` runs all but tes
 scripts/lib/transpile-source.mjs   Test helper: transpiles src/ TypeScript on the fly, provides the
                                    `next/server` stub and `importDoh()` loader shared by the suites
 scripts/lib/dns-fixtures.mjs       Test helper: shared valid DNS query/response builders (used by the
-                                   doh, capacity and config suites)
+                                   dns, doh, capacity, config and integration suites)
 .github/workflows/ci.yml           CI: lint, unit tests, build, integration tests, Docker smoke test, audit
 .github/workflows/docker-publish.yml  Manual image build/publish to GHCR
 .github/workflows/Keep-Alive.yml   Keep-alive commit on the 1st and 15th of each month (updates keep-alive.txt)
@@ -74,7 +74,7 @@ Client
   +--> Node.js `src/proxy.ts`
   |      |
   |      +--> match `/api/doh/*` (all methods, including HEAD/OPTIONS)
-  |      +--> skip limiting when TRUST_PROXY_HEADERS disables trust or no usable client IP header is present
+  |      +--> fall back to a shared global bucket (same limit) when TRUST_PROXY_HEADERS disables trust or no usable client IP header is present
   |      +--> enforce 100 requests / 60 seconds per identified source IP (RATE_LIMIT_PER_MINUTE)
   |      +--> return 429 when the process-local rate window is exceeded
   |      |
@@ -180,8 +180,10 @@ empty or truthy ("1", "true", "yes", "on") enables them, while "0", "false",
 exposed directly (for example a container with a published port and no proxy
 in front), set `TRUST_PROXY_HEADERS=0`; otherwise a client can mint a fresh
 rate-limit/in-flight identity by forging the headers. With trust disabled,
-requests are not attributed to a client IP; put a sanitizing reverse proxy or
-WAF in front to enforce per-client limits. Rate limits and in-flight ceilings
+requests are not attributed to a client IP; they share a single global
+rate-limit bucket (same limit) instead of a per-IP one, and only the global
+in-flight ceiling applies. Put a sanitizing reverse proxy or WAF in front to
+enforce per-client limits. Rate limits and in-flight ceilings
 remain per-instance; use a shared gateway or WAF for global limits in
 multi-instance deployments.
 
@@ -193,14 +195,14 @@ The second is a **32-request in-flight ceiling** (at most 8 per identified clien
 
 The in-flight ceilings, circuit breakers and request-rate limiter are process-local (on serverless hosts such as Vercel or Netlify each instance has its own copy, so treat them as best-effort and use a platform WAF for hard limits). Platform-level WAF, firewall, connection, or traffic controls can still provide cross-instance protection when required.
 
-Requests without a usable `X-Real-IP` / `X-Forwarded-For` header, or any request while trust is disabled (`TRUST_PROXY_HEADERS=0`), have an unknown client address: they are **not** rate limited and only count against the global in-flight ceiling. Put a reverse proxy or WAF in front for per-client limiting. `X-Real-IP` is preferred; otherwise the **last** `X-Forwarded-For` entry (the one added by the nearest proxy) is used, so with several proxies in a chain make sure the outermost trusted one is the last to append (or sets `X-Real-IP`), or all clients will share the identity of an intermediate hop.
+Requests without a usable `X-Real-IP` / `X-Forwarded-For` header, or any request while trust is disabled (`TRUST_PROXY_HEADERS=0`), have an unknown client address: they are counted against a shared global rate-limit bucket (same limit as the per-IP one) instead of being unlimited, and also count against the global in-flight ceiling. Put a reverse proxy or WAF in front for per-client limiting. `X-Real-IP` is preferred; otherwise the **last** `X-Forwarded-For` entry (the one added by the nearest proxy) is used, so with several proxies in a chain make sure the outermost trusted one is the last to append (or sets `X-Real-IP`), or all clients will share the identity of an intermediate hop.
 
 ## Configuration
 
 | Variable | Description | Default |
 |---|---|---|
 | `RATE_LIMIT_PER_MINUTE` | Per-source-IP request limit per 60 s window enforced by `proxy.ts`. Read once at startup; a value that is not a positive integer is ignored. | `100` |
-| `TRUST_PROXY_HEADERS` | Whether to trust `X-Real-IP` / `X-Forwarded-For` for client identity. Unset, empty, `1`, `true`, `yes` or `on` (case-insensitive) trust them; `0`, `false`, `no`, `off` and any unrecognized value disable trust (no per-IP rate limit or in-flight cap). Evaluated on every request. Keep it enabled only behind a reverse proxy that overwrites or sanitizes the headers on every request; set `0` when the app is directly exposed. | enabled (trusted) |
+| `TRUST_PROXY_HEADERS` | Whether to trust `X-Real-IP` / `X-Forwarded-For` for client identity. Unset, empty, `1`, `true`, `yes` or `on` (case-insensitive) trust them; `0`, `false`, `no`, `off` and any unrecognized value disable trust (falls back to a shared global rate-limit bucket; no per-IP in-flight cap). Evaluated on every request. Keep it enabled only behind a reverse proxy that overwrites or sanitizes the headers on every request; set `0` when the app is directly exposed. | enabled (trusted) |
 | `HAGEZI_UPSTREAM_ENDPOINTS` | Comma-separated DoH endpoint URLs that replace the built-in HaGeZi list (operator-set, never request-controlled). Entries are trimmed, and ones that are not valid `http(s)` URLs are ignored; with no valid entry the built-in list is used. The list is used as given (no rotation) and is read once, on first use. A query string on an entry (e.g. `?token=...`) is preserved on GET requests. The homepage still lists the compiled-in resolvers. Used by the integration suite. | built-in list |
 | `HAGEZI_ROTATION_MODE` | Set to `request` (case-insensitive) to round-robin the primary HaGeZi resolver per request instead of per time slot. Any other value keeps time-slot rotation. | time slot |
 | `HAGEZI_ROTATION_SECONDS` | Primary HaGeZi rotation interval. Values are clamped to 60–86400 seconds; non-numeric values fall back to the default. | `1800` |
