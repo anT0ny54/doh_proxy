@@ -1,33 +1,28 @@
 /**
  * Shared helper for the node:test suites: transpile TypeScript sources to
- * data-URL modules so the tests exercise the real src/lib code without a
- * build step or path-alias resolution.
+ * data-URL modules so the tests exercise the real src/ code without a build
+ * step. `@/lib/*` imports are resolved recursively, `next/server` is replaced
+ * by a small stub and `../../package.json` by its contents.
+ *
+ * Configuration (src/lib/config.ts) is read once per module instance, so
+ * suites that need a different environment set process.env and then load a
+ * FRESH instance with `{ fresh: true }`, which re-evaluates the whole import
+ * graph instead of reusing cached modules.
  */
 import { readFile } from "node:fs/promises";
 import ts from "typescript";
 
-export function toDataUrl(source, filename) {
+const SRC = new URL("../../src/", import.meta.url);
+
+function toDataUrl(source, filename) {
   const { outputText } = ts.transpileModule(source, {
     fileName: filename,
     compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
+      target: ts.ScriptTarget.ES2022,
       module: ts.ModuleKind.ESNext,
     },
   });
   return `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
-}
-
-/**
- * Read a TypeScript source file relative to `baseUrl`, rewrite its import
- * specifiers according to `importMap` ({ importSpecifier: replacementUrl }),
- * transpile, and import the result as a data-URL module.
- */
-export async function importTypeScript(path, baseUrl, importMap = {}, filename = path) {
-  let source = await readFile(new URL(path, baseUrl), "utf8");
-  for (const [from, to] of Object.entries(importMap)) {
-    source = source.replaceAll(`from "${from}"`, `from "${to}"`);
-  }
-  return import(toDataUrl(source, filename));
 }
 
 /** Minimal stand-in for `next/server`, enough for src/lib/doh.ts and src/proxy.ts. */
@@ -38,8 +33,10 @@ export class NextResponse {
     this.status = init.status ?? 200;
     this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
   }
-  static next() {
-    return new NextResponse(null, { status: 200 });
+  static next(init = {}) {
+    const response = new NextResponse(null, { status: 200 });
+    response.requestHeaders = init.request?.headers;
+    return response;
   }
   async text() {
     if (this.body === null || this.body === undefined) return "";
@@ -54,26 +51,45 @@ export class NextResponse {
 }
 `;
 
-export const nextServerUrl = toDataUrl(NEXT_SERVER_STUB, "next-server-stub.ts");
+const nextServerUrl = toDataUrl(NEXT_SERVER_STUB, "next-server-stub.ts");
+const packageJsonUrl = `data:text/javascript;base64,${Buffer.from(
+  `export default ${await readFile(new URL("../../package.json", import.meta.url), "utf8")};`,
+).toString("base64")}`;
 
-/** Data-URL module for src/lib/<name>.ts (transpiled as-is, no import rewriting). */
-export async function libUrl(name) {
-  const source = await readFile(new URL(`../../src/lib/${name}.ts`, import.meta.url), "utf8");
-  return toDataUrl(source, `${name}.ts`);
+let generation = 0;
+
+/** Builds the data URL for a src/ file, resolving its imports first. */
+async function moduleUrl(path, cache, tag) {
+  if (cache.has(path)) return cache.get(path);
+  let source = await readFile(new URL(path, SRC), "utf8");
+  const replacements = new Map([
+    ["next/server", nextServerUrl],
+    ["../../package.json", packageJsonUrl],
+  ]);
+  for (const [, name] of source.matchAll(/from "@\/lib\/([\w-]+)"/g)) {
+    replacements.set(`@/lib/${name}`, await moduleUrl(`lib/${name}.ts`, cache, tag));
+  }
+  for (const [from, to] of replacements) source = source.replaceAll(`from "${from}"`, `from "${to}"`);
+  // The tag gives fresh graphs distinct URLs, so Node evaluates them anew.
+  const url = toDataUrl(`${source}\n// instance ${tag}\n`, path);
+  cache.set(path, url);
+  return url;
 }
 
-/** Loads the real src/lib/doh.ts with its `@/lib/*` and `next/server` imports rewired. */
-export async function importDoh() {
-  return importTypeScript(
-    "../src/lib/doh.ts",
-    new URL("../", import.meta.url),
-    {
-      "next/server": nextServerUrl,
-      "@/lib/providers": await libUrl("providers"),
-      "@/lib/dns": await libUrl("dns"),
-      "@/lib/client-ip": await libUrl("client-ip"),
-      "@/lib/upstreams": await libUrl("upstreams"),
-    },
-    "doh.ts",
-  );
+const sharedCache = new Map();
+
+/**
+ * Imports src/<path> (e.g. "lib/dns.ts", "proxy.ts"). With `fresh: true` the
+ * module and everything it imports are re-evaluated, picking up the current
+ * process.env.
+ */
+export async function importSource(path, { fresh = false } = {}) {
+  const cache = fresh ? new Map() : sharedCache;
+  const tag = fresh ? `fresh-${(generation += 1)}` : "shared";
+  return import(await moduleUrl(path, cache, tag));
+}
+
+/** Loads the real src/lib/doh.ts. */
+export function importDoh(options) {
+  return importSource("lib/doh.ts", options);
 }
