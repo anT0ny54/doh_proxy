@@ -87,7 +87,7 @@ Client
   |      |      +--> return 503 when a ceiling is reached
   |      +--> validate DNS wire message
   |      +--> select rotated HaGeZi order
-  |      +--> sequential upstream fetch
+  |      +--> sequential upstream fetch (aborted immediately if the client disconnects)
   |      +--> skip upstreams whose circuit breaker is open
   |      +--> validate response + match ID/Question
   |      +--> return application/dns-message
@@ -99,7 +99,7 @@ Client
          +--> enforce 32-request (8 per client IP) in-flight ceiling
          |      +--> return 503 when a ceiling is reached
          +--> validate DNS wire message
-         +--> use one fixed provider upstream (no failover)
+         +--> use one fixed provider upstream (no failover; aborted immediately if the client disconnects)
          +--> validate response + match ID/Question
          +--> return application/dns-message
 ```
@@ -141,7 +141,9 @@ Request handling is bounded:
 - Client queries are capped at **4 KiB** (`MAX_DNS_MESSAGE_SIZE = 4096`); upstream responses at **64 KiB** (`MAX_DNS_RESPONSE_SIZE = 65535`, the RFC 8484 maximum) so DNSSEC and large TXT answers, which routinely exceed 4 KiB, still work. Anything larger is rejected instead of being buffered without a bound.
 - GET query strings are capped at **8192 characters**.
 - POST bodies are read as a stream with a running 4 KiB cap; the read is aborted as soon as the cap or the request deadline is exceeded. A body stream that errors (for example because the client aborted the upload) is answered with `400` rather than escaping the handler as an unhandled error.
-- Upstream response bodies are read the same way (64 KiB cap plus the upstream deadline).
+- Upstream response bodies are read the same way (64 KiB cap plus the upstream deadline), and a negative or non-integer declared `Content-Length` is rejected outright.
+- Client disconnects abort the upstream fetch immediately: each attempt combines its deadline `AbortController` with `request.signal` via `AbortSignal.any`, so a gone client frees its in-flight slot at once instead of at the deadline, and the failover loop stops without counting the disconnect as an upstream failure.
+- Responses are structurally validated (backward-only compression pointers, per-type RDATA name decoding, transaction-ID matching). Rare-but-legal QDCOUNT=0 responses are accepted — the transaction ID is still verified — while question QNAME compression in responses is rejected (there is no earlier name to point at).
 - With `src/proxy.ts` in front of the route, Next.js may buffer a request body before the handler runs (the integration suite's slow-upload case accepts either `200` or `408` for that reason), so the streaming cap and the 1 second body deadline are the handler's own guard rather than a guarantee about the transport. Also cap request bodies at the reverse proxy (for example nginx `client_max_body_size`).
 - Both routes use a **2.5 second** application deadline (`DEFAULT_TIMEOUT_MS`), inside the 5 second route `maxDuration`.
 - Per-attempt upstream timeouts are bounded so one failed resolver cannot consume the whole request indefinitely.

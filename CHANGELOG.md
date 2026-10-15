@@ -1,11 +1,6 @@
 # Changelog
 
-## Unreleased
-
-`package.json`, `package-lock.json` and `PROXY_VERSION` (`src/lib/doh.ts`) are
-all still `2.8.1`; the entries below are not yet assigned to a tagged release.
-When releasing, bump all three together (`npm test` enforces that
-`PROXY_VERSION` matches `package.json`).
+## [2.8.2] - 2026-10-16
 
 ### Security
 - **`TRUST_PROXY_HEADERS` switch for client identity.** `X-Real-IP` /
@@ -62,6 +57,17 @@ When releasing, bump all three together (`npm test` enforces that
   `HAGEZI_ROTATION_SECONDS` clamping and fallback.
 
 ### Changed
+- Optimization: the POST body is copied into a fresh `ArrayBuffer` once per
+  request instead of once per failover attempt (up to 3x fewer copies), and the
+  GET `dns` parameter is base64url-encoded once per request and merged into
+  each upstream URL instead of rebuilding `searchParams` on every attempt.
+- Test code: `scripts/test-dns.mjs` now also uses the shared
+  `scripts/lib/dns-fixtures.mjs` builders (`id=1` keeps its transaction-ID
+  expectations unchanged) instead of defining its own `validQuery` /
+  `validResponse` copies. New regression tests: QDCOUNT=0 response acceptance
+  (`test-dns.mjs`), client-disconnect propagation and negative upstream
+  Content-Length (`test-doh.mjs`), and `"::"` normalization (`test-config.mjs`).
+  `npm test` now runs 83 tests.
 - `src/lib/dns.ts`: `skipName()` took an optional `targets` bitmap, but every
   caller passes one, so the `if (targets)` / `targets &&` guards were dead
   branches. The parameter is now required and the guards are gone. No behavior
@@ -102,6 +108,35 @@ When releasing, bump all three together (`npm test` enforces that
   default "untrusted" or "opt in". No behavior change.
 
 ### Fixed
+- **Client disconnects were not propagated upstream.** `proxyRequestInternal`
+  never observed `request.signal`, so a client going away mid-request left the
+  upstream fetch running until it finished or the deadline expired, holding an
+  in-flight slot and burning an upstream attempt. `fetchUpstream` now races the
+  per-attempt `AbortController` against `request.signal` via `AbortSignal.any`
+  (Node 22+), a disconnect stops the failover loop without recording an
+  upstream failure or holding a half-open circuit-breaker probe slot, and the
+  slot is freed immediately. Covered by a new regression test in
+  `scripts/test-doh.mjs`.
+- **`expandIpv6("::")` returned null, misclassifying the unspecified address.**
+  `"::".split("::")` produces three empty segments, so the parser rejected an
+  address `isIP()` considers valid; `normalizeIp` then returned `undefined` and
+  the request got no identity, escaping per-IP limiting (fail-open). `"::"` now
+  expands to eight zero groups (`0:0:0:0::/64`). Multi-`::` strings such as
+  `a::b::c` are still rejected.
+- **Negative upstream `Content-Length` passed the declared-size check** in
+  `readResponseBody` (`Number.isInteger(-1)` is true and `-1 > 65535` is
+  false). Not exploitable — the body reader is stream-based — but the check is
+  now `size < 0 || size > MAX_DNS_RESPONSE_SIZE`, mirroring `readPostBody`.
+- **Strict question-section validation false-rejected rare-but-legal
+  responses.** `validateStructure` required QDCOUNT exactly 1 for responses
+  too, so upstreams that send QDCOUNT=0 got a 502 across the whole failover
+  list. Responses now accept QDCOUNT 0 or 1 (queries stay strict); a
+  QDCOUNT=0 response is matched on the transaction ID alone. Question QNAME
+  compression in responses remains rejected: a response question is the first
+  name in the message, so there is no earlier name for a pointer to target.
+- **GET query-string cap off-by-one.** `url.search.length` counts the leading
+  `?`, so the effective cap was 8 191 characters. The limit is now the
+  documented 8 192.
 - **A failing POST body stream escaped the handler as an unhandled error.** If
   the request body stream rejected mid-read (for example the client aborted the
   upload), `readPostBody` cancelled the reader and then re-threw, so the route
@@ -155,14 +190,15 @@ When releasing, bump all three together (`npm test` enforces that
 - The homepage lists the compiled-in HaGeZi resolvers even when
   `HAGEZI_UPSTREAM_ENDPOINTS` overrides them at runtime.
 - Dead-code review: apart from the optional `targets` guards removed above, no
-  unused code was found in `src/`. `WINDOW_SIZE_MS`, `MAX_BUCKETS` and
-  `TRUST_PROXY_HEADERS_ENV` are exported but only used inside their modules and
-  tests, which is harmless; the `Uint8Array`/omitted-query forms of
-  `isValidDnsResponse()` are exercised only by tests (production passes a
-  `ParsedQuery`) and were kept as part of its public contract.
-- The handler does not observe `request.signal`, so an upstream attempt for a
-  client that has already disconnected runs until it finishes or the 2.5 s
-  deadline expires, holding its in-flight slot meanwhile.
+  unused code was found in `src/`. The 405 branch of
+  `getEarlyMethodResponse()` is unreachable in production (the route files only
+  export GET/POST/HEAD/OPTIONS, so Next.js answers other methods itself) but is
+  kept as deliberate, unit-tested defense-in-depth. `WINDOW_SIZE_MS`,
+  `MAX_BUCKETS` and `TRUST_PROXY_HEADERS_ENV` are exported but only used
+  inside their modules and tests, which is harmless; the
+  `Uint8Array`/omitted-query forms of `isValidDnsResponse()` are exercised only
+  by tests (production passes a `ParsedQuery`) and were kept as part of its
+  public contract.
 - DNS compression pointers into RDATA that the parser treats as opaque are
   rejected. That covers every type other than NS/CNAME/PTR/DNAME, MX, SOA, SRV
   and SVCB/HTTPS, including legacy name-bearing types such as RP, AFSDB and
