@@ -1,69 +1,62 @@
 /**
- * Node.js proxy for the public DoH endpoint.
+ * Node.js proxy for the DoH endpoints: per-client rate limiting.
  *
- * The limiter is enforced in-process before the request reaches the
- * Next.js route. For multi-instance deployments, use a shared reverse-proxy
- * or WAF rate limiter so the limit is shared across instances.
+ * Limit: 100 requests per rolling 60 seconds per client (RATE_LIMIT_PER_MINUTE),
+ * in BOTH trust modes:
  *
- * Limit: 100 requests per 60 seconds per source IP by default (override with
- * RATE_LIMIT_PER_MINUTE). IPv6 clients are keyed by /64.
+ * - TRUST_PROXY_HEADERS=1 (default): the client is identified by the trusted
+ *   forwarding header (CLIENT_IP_HEADERS / TRUSTED_PROXY_HOPS; platform default
+ *   otherwise), falling back to the socket address.
+ * - TRUST_PROXY_HEADERS=0: forwarding headers are ignored and the TCP socket
+ *   address recorded by `server/socket-ip-preload.cjs` is used (the Docker
+ *   image and `npm start` load it).
  *
- * TRUSTED-PROXY BOUNDARY: client identity comes from X-Real-IP /
- * X-Forwarded-For, which a direct client can forge. These headers are trusted
- * BY DEFAULT (TRUST_PROXY_HEADERS unset or truthy), so deploy behind a reverse
- * proxy (nginx, Caddy, a platform front end, ...) that overwrites or sanitizes
- * them on every request, and set TRUST_PROXY_HEADERS=0 when the app is exposed
- * directly. See src/lib/client-ip.ts. When trust is disabled, or when no
- * usable header is present, the client address is unknown and the request is
- * counted against a SHARED GLOBAL bucket (same limit) instead of being
- * unlimited, so identity cannot be evaded simply by omitting the headers.
+ * Only when no address is available at all (trust disabled on a platform
+ * without the preload) is the request counted against one shared bucket.
+ * IPv6 clients are keyed by /64. State is per process; use a shared WAF for
+ * cross-instance limits.
+ *
+ * The resolved client key is handed to the route in CLIENT_KEY_HEADER (always
+ * overwritten or removed here, so a client cannot inject it); the route uses it
+ * for the per-client in-flight cap without re-parsing headers.
  *
  * LOCATION: this file must live in `src/` because the app uses `src/app`.
- * Next.js only detects proxy.ts/middleware.ts next to the `app` directory, so
- * a copy at the repository root is silently ignored (no rate limiting at all).
+ * Next.js only detects proxy.ts next to the `app` directory.
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { getClientIp, isProxyTrustEnabled } from "./lib/client-ip";
-import { RateLimiter, WINDOW_LIMIT } from "./lib/rate-limit";
+import { getClientIp } from "@/lib/client-ip";
+import { CLIENT_KEY_HEADER, CONFIG } from "@/lib/config";
+import { corsHeaders } from "@/lib/cors";
+import { RateLimiter } from "@/lib/rate-limit";
 
-function readLimit(): number {
-  const configured = Number(process.env.RATE_LIMIT_PER_MINUTE?.trim());
-  return Number.isInteger(configured) && configured > 0 ? configured : WINDOW_LIMIT;
-}
+const limiter = new RateLimiter(CONFIG.rateLimitPerMinute);
 
-const limiter = new RateLimiter(readLimit());
-
-// Bucket key for requests without a trusted identity (TRUST_PROXY_HEADERS=0
-// or no usable X-Real-IP / X-Forwarded-For). One shared bucket means the
-// per-IP limit cannot be dodged by forging or omitting forwarding headers.
-// Deliberately distinct from any normalized IP shape (no ":" or "/64").
+// Bucket for requests whose client address is unknown. Deliberately distinct
+// from any normalized IP shape (no "." / ":" / "/64").
 const UNKNOWN_CLIENT_KEY = "unknown-client";
 
 function tooManyRequests(retryAfterSeconds: number): NextResponse {
-  return new NextResponse("Too Many Requests", {
-    status: 429,
-    headers: {
-      "Cache-Control": "no-store",
-      "Retry-After": String(retryAfterSeconds),
-      // Browser-based DoH clients need CORS headers to read the 429.
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Expose-Headers": "Retry-After",
-    },
-  });
+  const headers = corsHeaders();
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Type", "text/plain; charset=utf-8");
+  headers.set("Retry-After", String(retryAfterSeconds));
+  return new NextResponse("Too Many Requests", { status: 429, headers });
 }
 
 export default function proxy(request: NextRequest) {
-  const ip = getClientIp(request.headers, isProxyTrustEnabled());
+  // CORS preflights do no upstream work, and browsers cannot read a non-2xx
+  // preflight answer, so they are not rate limited.
+  if (request.method === "OPTIONS") return NextResponse.next();
 
-  // Rate-limit strictly by source IP. Including Host lets one client fragment
-  // its quota across arbitrary Host values while adding no protection value.
-  // Requests without a trusted identity share one global bucket.
+  const ip = getClientIp(request.headers);
   const result = limiter.check(ip ?? UNKNOWN_CLIENT_KEY, Date.now());
-
   if (result.limited) return tooManyRequests(result.retryAfterSeconds);
 
-  return NextResponse.next();
+  const headers = new Headers(request.headers);
+  if (ip === undefined) headers.delete(CLIENT_KEY_HEADER);
+  else headers.set(CLIENT_KEY_HEADER, ip);
+  return NextResponse.next({ request: { headers } });
 }
 
 export const config = {
