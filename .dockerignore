@@ -7,3 +7,15 @@ node_modules
 Dockerfile
 .dockerignore
 npm-debug.log*
+# Not used by any COPY in the Dockerfile.
+scripts
+coverage
+out
+build
+*.tsbuildinfo
+eslint.config.mjs
+netlify.toml
+keep-alive.txt
+LICENSE
+.gitattributes
+.gitignore
