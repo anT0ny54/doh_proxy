@@ -1,8 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
-import { getSiteUrl, REPOSITORY_URL } from "@/lib/site";
-
-const SITE_URL = getSiteUrl();
+import { REPOSITORY_URL, SITE_URL } from "@/lib/site";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

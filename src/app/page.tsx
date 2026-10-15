@@ -1,9 +1,8 @@
 import CopyButton from "@/components/CopyButton";
 import { DOH_PROVIDERS } from "@/lib/providers";
-import { COPYRIGHT_YEAR, getSiteUrl, REPOSITORY_URL } from "@/lib/site";
+import { COPYRIGHT_YEAR, REPOSITORY_URL, SITE_URL } from "@/lib/site";
 import { HAGEZI_UPSTREAMS } from "@/lib/upstreams";
 
-const SITE_URL = getSiteUrl();
 const PUBLIC_DOH_ENDPOINT = `${SITE_URL}/api/doh/dns-query`;
 
 const PROVIDER_ENDPOINTS = DOH_PROVIDERS.map((provider) => ({
