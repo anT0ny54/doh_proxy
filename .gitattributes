@@ -1,5 +1,6 @@
 # Normalize text files to LF.
 * text=auto
+*.cjs text eol=lf
 *.css text eol=lf
 *.json text eol=lf
 *.md text eol=lf
@@ -11,3 +12,5 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.svg text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
