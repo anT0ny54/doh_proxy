@@ -2,6 +2,68 @@
 
 ## [Unreleased]
 
+One documentation bug fixed and two timing-sensitive tests hardened. Found in a
+fourth full read of the repository (every source, test, workflow, configuration
+and documentation file, except that `package-lock.json` was checked structurally
+and against `package.json` rather than line by line and `LICENSE`, the standard
+AGPL-3.0 text, was only skimmed). Unlike the previous rounds, this review ran
+with the project's dependencies installed, so the whole unit suite, lint, type
+check and build were executed. Dead-code, conflict and optimization checks are
+listed under "Review notes".
+
+### Fixed
+- **README documented a file that no longer exists.** The project-layout table
+  still listed `SERVICES.md` after the file was deleted from the repository.
+  The line is removed. No code or other documentation referenced it.
+
+### Changed
+- Tests: two timing-sensitive tests in `test-doh.mjs` no longer fail on a
+  heavily loaded runner, where both were observed to fail while the code under
+  test behaved correctly.
+  - "A slow POST body that leaves no upstream budget neither fetches nor trips
+    the breaker" asserted exactly `502`, but when the 200 ms chunk arrives
+    after the 250 ms deadline the legitimate result is the `408`
+    body-timeout path. The assertion now accepts both and still requires that
+    no upstream fetch happens and the breaker stays untouched.
+  - "DoH POST body cancellation is bounded" allowed 400 ms of wall clock for a
+    path that includes a 25 ms cancel timeout plus event-loop overhead; on a
+    loaded runner that occasionally exceeded the allowance. The bound is now
+    1 second, still far below the request deadline being tested.
+
+### Review notes
+- Run in this review (dependencies installed in the environment): the 106 unit
+  tests, `npm run lint`, `npm run typecheck` and `npm run build` (all pass;
+  the two test changes above are assertion-only). Not run: the integration
+  suite (needs a prior production build and starts real servers) and the Docker
+  build and smoke test (no Docker daemon in the review environment).
+- Dead or redundant code: none. The exports that no other `src/` module imports
+  are consumed by the tests (`normalizeIp`, `parseTrust`, `loadConfig`,
+  `PROXY_VERSION`, `getHageziUpstreams`, the in-flight constants,
+  `RateLimiter#size`) and the `timeoutMs` option of `proxyRequest()` is set
+  only by tests; all are deliberate seams. Defensive branches that cannot run
+  in production and are kept on purpose: the `404` in `handleDoH()` (the router
+  answers first) and the oversized-input allocation in `compressionTargets()`
+  (responses are capped at 65535 bytes before validation).
+- Conflicts: none between `README.md`, `package.json`, `Dockerfile`, the
+  workflows, `next.config.ts` and the code. The stale `SERVICES.md` row was the
+  only README/reference mismatch found. The test-count claims (106 unit), the
+  Keep-Alive schedule, the published image tags, the 4097-byte body cap in
+  `next.config.ts` and the preload, and the `maxDuration` versus
+  `DEFAULT_TIMEOUT_MS` relation were re-checked.
+- Optimization: nothing worth changing. The hot path already avoids
+  per-request URL parsing, rotation-list allocation and per-message scratch
+  allocation. Building the fixed `Accept`/`User-Agent` `Headers` once instead
+  of per attempt would save about 1 microsecond per upstream call (measured in
+  an earlier review), which is negligible next to the network round trip.
+- Left alone, by design and already documented in the README: a single shared
+  limiter bucket when no client address exists (`TRUST_PROXY_HEADERS=0` on a
+  platform without the preload); eviction of the oldest bucket once 10,000 keys
+  are tracked; relaying an upstream `400`/`413`/`414`/`415` without failover;
+  and `200` bodies that fail validation not counting toward the circuit
+  breaker, since a crafted query can provoke them.
+
+## 2.10.0
+
 Two runtime bugs fixed in `src/`, one unreferenced code path removed, tests and
 documentation updated. Found in a third full read of the repository (every
 source, test, workflow, configuration and documentation file, except that
@@ -94,4 +156,3 @@ Dead-code, conflict and optimization checks are listed under "Review notes".
   ignored, because the address collapses to IPv4 and the prefix no longer fits
   (verified; a mapped single address such as `::ffff:10.1.2.3` does work).
   Write the range as `10.0.0.0/8`.
-
