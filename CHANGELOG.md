@@ -11,6 +11,18 @@ with the project's dependencies installed, so the whole unit suite, lint, type
 check and build were executed. Dead-code, conflict and optimization checks are
 listed under "Review notes".
 
+A fifth full read (same scope and caveats) re-verified the repository after the
+changes above were pushed and found nothing further to fix: no dead or
+redundant code, no conflicts, no bugs and no optimizations worth making. It ran
+with the dependencies installed: the 106 unit tests, `npm run lint`,
+`npm run typecheck`, `npm run build` and the 16 integration tests all pass.
+(The build also made the integration suite runnable in this environment for the
+first time.) The double read of `DOH_BUILD_PLATFORM` in `detectPlatform()`
+(`env.DOH_BUILD_PLATFORM ?? process.env.DOH_BUILD_PLATFORM`) was considered as
+a possible redundancy and kept: when `env` is a custom object (the config
+tests), the fallback still lets Next.js' build-time inlining of the literal
+`process.env.DOH_BUILD_PLATFORM` reference work.
+
 ### Fixed
 - **README documented a file that no longer exists.** The project-layout table
   still listed `SERVICES.md` after the file was deleted from the repository.
