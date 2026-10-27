@@ -64,30 +64,40 @@ if (globalThis[FLAG] !== true) {
   globalThis[FLAG] = true;
 
   const emit = http.Server.prototype.emit;
-  http.Server.prototype.emit = function emitWithSocketIp(event, request, ...rest) {
+  http.Server.prototype.emit = function emitWithSocketIp(event, ...args) {
+    const request = args[0];
     if (event === "request" && request && request.headers) {
       const address = request.socket && request.socket.remoteAddress;
       if (address) request.headers[HEADER] = address;
       else delete request.headers[HEADER];
       if (request.method === "POST") splitBodyAtCap(request);
     }
-    return emit.call(this, event, request, ...rest);
+    // Preserve the original event argument list for every event. In particular,
+    // `listening` and `close` are emitted without arguments by Node.js.
+    return emit.call(this, event, ...args);
   };
 
   const createServer = http.createServer;
   http.createServer = function createServerWithTimeouts(options, listener) {
-    if (typeof options === "function" || options === undefined || options === null) {
+    if (typeof options === "function") {
       listener = options;
+      options = {};
+    } else if (options === undefined || options === null) {
+      // Keep a second-argument listener intact for createServer(undefined, fn).
       options = {};
     }
     const merged = {
-      requestTimeout: REQUEST_TIMEOUT_MS,
-      headersTimeout: HEADERS_TIMEOUT_MS,
-      connectionsCheckingInterval: CONNECTIONS_CHECKING_INTERVAL_MS,
       ...options,
+      // An own property whose value is undefined still overrides the defaults
+      // during a spread. Normalize the three managed timeout options so explicit
+      // undefined behaves exactly like an absent option (null remains an invalid
+      // caller-supplied value and is intentionally passed through).
+      requestTimeout: options.requestTimeout ?? REQUEST_TIMEOUT_MS,
+      headersTimeout: options.headersTimeout ?? HEADERS_TIMEOUT_MS,
+      connectionsCheckingInterval: options.connectionsCheckingInterval ?? CONNECTIONS_CHECKING_INTERVAL_MS,
     };
     // Node requires headersTimeout <= requestTimeout (0 disables the latter).
-    if (options.headersTimeout === undefined && merged.requestTimeout > 0) {
+    if (merged.requestTimeout > 0) {
       merged.headersTimeout = Math.min(merged.headersTimeout, merged.requestTimeout);
     }
     return createServer.call(this, merged, listener);
