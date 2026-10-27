@@ -167,6 +167,35 @@ try {
     assert.ok(Date.now() - started < 1_000, "body cancellation must not extend the deadline indefinitely");
   });
 
+  await test("A synchronous POST-body cancellation error does not hide the 413 response", async () => {
+    const oversizedBody = {
+      getReader() {
+        return {
+          read() {
+            return Promise.resolve({ done: false, value: new Uint8Array(4_097) });
+          },
+          cancel() {
+            throw new Error("stream cancellation failed synchronously");
+          },
+          releaseLock() {},
+        };
+      },
+    };
+
+    globalThis.fetch = async () => {
+      throw new Error("fetch must not run for an oversized request body");
+    };
+
+    const response = await doh.proxyRequest(postRequest(oversizedBody), {
+      upstreams: [{ endpoint: "https://never-reached.test/dns-query" }],
+      timeoutMs: 1_000,
+      failover: false,
+    });
+
+    assert.equal(response.status, 413);
+    assert.equal(await response.text(), "Payload too large");
+  });
+
   await test("A failing POST body stream gets 400 instead of escaping the handler", async () => {
     globalThis.fetch = async () => {
       throw new Error("fetch must not run after a body read error");
@@ -452,6 +481,100 @@ try {
     assert.deepEqual(seen, ["first.test", "first.test", "first.test"]);
   });
 
+  await test("Wall-clock jumps do not truncate the request deadline or skip failover", async () => {
+    const realNow = Date.now;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        // The request deadline is elapsed-time based, not wall-clock based.
+        Date.now = () => realNow() + 60 * 60 * 1_000;
+        return new Response(null, { status: 403 });
+      }
+      return dnsAnswer();
+    };
+
+    try {
+      const response = await doh.proxyRequest(getRequest(), {
+        upstreams: [
+          { endpoint: "https://clock-jump-first.test/dns-query" },
+          { endpoint: "https://clock-jump-second.test/dns-query" },
+        ],
+        timeoutMs: 1_000,
+        failover: true,
+      });
+      assert.equal(response.status, 200);
+      assert.equal(calls, 2, "a wall-clock step must not consume the remaining request budget");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test("Wall-clock jumps do not prematurely time out a completed POST body", async () => {
+    const realNow = Date.now;
+    const query = validQuery();
+    let step = 0;
+    const body = {
+      getReader() {
+        return {
+          read() {
+            step += 1;
+            if (step === 1) {
+              Date.now = () => realNow() + 60 * 60 * 1_000;
+              return Promise.resolve({ done: false, value: query });
+            }
+            return Promise.resolve({ done: true, value: undefined });
+          },
+          cancel() { return Promise.resolve(); },
+          releaseLock() {},
+        };
+      },
+    };
+    globalThis.fetch = async () => dnsAnswer(validResponse(query));
+
+    try {
+      const response = await doh.proxyRequest(postRequest(body), {
+        upstreams: [{ endpoint: "https://clock-jump-post.test/dns-query" }],
+        timeoutMs: 1_000,
+        failover: false,
+      });
+      assert.equal(response.status, 200);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test("An errored upstream response stream releases its reader lock before failover", async () => {
+    let upstreamBody;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        upstreamBody = new ReadableStream({
+          start(controller) { controller.error(new Error("upstream body interrupted")); },
+        });
+        return new Response(upstreamBody, {
+          status: 200,
+          headers: { "content-type": "application/dns-message" },
+        });
+      }
+      return dnsAnswer();
+    };
+
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [
+        { endpoint: "https://stream-error.test/dns-query" },
+        { endpoint: "https://stream-recovery.test/dns-query" },
+      ],
+      timeoutMs: 1_000,
+      failover: true,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(calls, 2);
+    assert.equal(upstreamBody.locked, false, "an errored but settled stream must not remain locked");
+  });
+
   await test("A negative upstream Content-Length is rejected and failover continues", async () => {
     const calls = [];
     globalThis.fetch = async (url) => {
@@ -514,9 +637,10 @@ try {
       timeoutMs: 1_000,
       failover: true,
     };
-    const realNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
     let now = realNow();
-    Date.now = () => now;
+    performance.now = () => now;
     try {
       for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200); // opens A
       assert.equal(hits.a, 3);
@@ -528,7 +652,103 @@ try {
       await doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 4, "one failed probe must re-open the breaker immediately");
     } finally {
-      Date.now = realNow;
+      performance.now = originalPerformanceNow;
+    }
+  });
+
+  await test("Circuit-breaker cooldown uses monotonic time, not wall-clock jumps", async () => {
+    const realWallNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realMonotonicNow = originalPerformanceNow.bind(performance);
+    let monotonic = realMonotonicNow();
+    let wallOffset = 0;
+    performance.now = () => monotonic;
+    Date.now = () => realWallNow() + wallOffset;
+
+    const hits = { a: 0, b: 0 };
+    let aHealthy = false;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("clock-breaker-a.test")) {
+        hits.a += 1;
+        return aHealthy ? dnsAnswer() : new Response(null, { status: 503 });
+      }
+      hits.b += 1;
+      return dnsAnswer();
+    };
+    const options = {
+      upstreams: [
+        { endpoint: "https://clock-breaker-a.test/dns-query" },
+        { endpoint: "https://clock-breaker-b.test/dns-query" },
+      ],
+      timeoutMs: 1_000,
+      failover: true,
+    };
+
+    try {
+      for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 3, "three failures trip the breaker");
+
+      wallOffset += 60 * 60 * 1_000;
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 3, "a forward wall-clock jump must not expire the cooldown");
+
+      monotonic += 31_000;
+      aHealthy = true;
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 4, "elapsed monotonic time permits a half-open recovery probe");
+    } finally {
+      Date.now = realWallNow;
+      performance.now = originalPerformanceNow;
+    }
+  });
+
+  await test("A wall-clock jump does not expire an active half-open probe", async () => {
+    const realWallNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realMonotonicNow = originalPerformanceNow.bind(performance);
+    let monotonic = realMonotonicNow();
+    performance.now = () => monotonic;
+
+    const hits = { a: 0, b: 0 };
+    let hangProbe = false;
+    let releaseProbe;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("clock-probe-a.test")) {
+        hits.a += 1;
+        if (hangProbe) {
+          await new Promise((resolve) => { releaseProbe = resolve; });
+        }
+        return new Response(null, { status: 503 });
+      }
+      hits.b += 1;
+      return dnsAnswer();
+    };
+    const options = {
+      upstreams: [
+        { endpoint: "https://clock-probe-a.test/dns-query" },
+        { endpoint: "https://clock-probe-b.test/dns-query" },
+      ],
+      timeoutMs: 2_000,
+      failover: true,
+    };
+
+    try {
+      for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      monotonic += 31_000;
+      hangProbe = true;
+      const pendingProbe = doh.proxyRequest(getRequest(), options);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(hits.a, 4, "the first half-open probe has started");
+
+      Date.now = () => realWallNow() + 60 * 60 * 1_000;
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 4, "a wall-clock jump must not expire the active probe lease");
+
+      releaseProbe();
+      assert.equal((await pendingProbe).status, 200);
+    } finally {
+      Date.now = realWallNow;
+      performance.now = originalPerformanceNow;
     }
   });
 
@@ -544,6 +764,24 @@ try {
     );
 
     assert.equal(response.status, 200);
+  });
+
+  await test("DoH GET rejects incorrectly padded base64url before fetching", async () => {
+    let fetches = 0;
+    globalThis.fetch = async () => {
+      fetches += 1;
+      return dnsAnswer();
+    };
+
+    const base64url = Buffer.from(validQuery()).toString("base64url");
+    const padding = "=".repeat((4 - (base64url.length % 4)) % 4);
+    const response = await doh.proxyRequest(
+      new Request(`https://proxy.test/api/doh/dns-query?dns=${base64url}${padding}=`, { method: "GET" }),
+      { upstreams: [{ endpoint: "https://upstream.test/dns-query" }], timeoutMs: 100, failover: false },
+    );
+
+    assert.equal(response.status, 400);
+    assert.equal(fetches, 0);
   });
 
   await test("DoH relays an upstream rejection even when a later upstream fails", async () => {
@@ -617,9 +855,10 @@ try {
       return dnsAnswer();
     };
     const options = { upstreams: [{ endpoint: "https://probe-once.test/dns-query" }, { endpoint: "https://probe-other.test/dns-query" }], timeoutMs: 500, failover: true };
-    const realNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
     let now = realNow();
-    Date.now = () => now;
+    performance.now = () => now;
     try {
       for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options);
       now += 31_000;
@@ -633,7 +872,7 @@ try {
       const statuses = (await Promise.all(inflight)).map((response) => response.status);
       assert.deepEqual(statuses, [200, 200, 502]);
     } finally {
-      Date.now = realNow;
+      performance.now = originalPerformanceNow;
     }
   });
 
@@ -674,9 +913,10 @@ try {
     const b = { endpoint: "https://probe-leak-b.test/dns-query" };
     const aFirst = { upstreams: [a, b], timeoutMs: 1_000, failover: true };
     const bFirst = { upstreams: [b, a], timeoutMs: 1_000, failover: true };
-    const realNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
     let now = realNow();
-    Date.now = () => now;
+    performance.now = () => now;
     try {
       for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200); // opens A
       assert.equal(hits.a, 3);
@@ -692,7 +932,7 @@ try {
       assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200);
       assert.equal(hits.a, 5, "a successful probe closes the breaker");
     } finally {
-      Date.now = realNow;
+      performance.now = originalPerformanceNow;
     }
   });
 
@@ -712,9 +952,10 @@ try {
       timeoutMs: 1_000,
       failover: true,
     };
-    const realNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
     let now = realNow();
-    Date.now = () => now;
+    performance.now = () => now;
     try {
       for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200); // opens A
       assert.equal(hits.a, 3);
@@ -727,7 +968,7 @@ try {
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 5, "an inconclusive probe must not block A for the whole probe TTL");
     } finally {
-      Date.now = realNow;
+      performance.now = originalPerformanceNow;
     }
   });
 
@@ -819,9 +1060,10 @@ try {
       timeoutMs: 2_000,
       failover: true,
     };
-    const realNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
     let now = realNow();
-    Date.now = () => now;
+    performance.now = () => now;
     try {
       for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options);
       now += 31_000;
@@ -837,7 +1079,139 @@ try {
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 5, "the owner released its probe after the inconclusive answer");
     } finally {
-      Date.now = realNow;
+      performance.now = originalPerformanceNow;
+    }
+  });
+
+  await test("A late non-probe failure cannot clear another request's half-open probe", async () => {
+    const hits = { a: 0, b: 0 };
+    let releaseStaleFailure;
+    let releaseProbeFailure;
+    let aMode = "fail";
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("late-failure-a.test")) {
+        hits.a += 1;
+        if (hits.a === 1) {
+          await new Promise((resolve) => (releaseStaleFailure = resolve));
+          return new Response(null, { status: 503 });
+        }
+        if (aMode === "probe-hang") {
+          await new Promise((resolve) => (releaseProbeFailure = resolve));
+          return new Response(null, { status: 503 });
+        }
+        return new Response(null, { status: 503 });
+      }
+      hits.b += 1;
+      return dnsAnswer();
+    };
+
+    const endpoint = "https://late-failure-a.test/dns-query";
+    const options = {
+      upstreams: [{ endpoint }, { endpoint: "https://late-failure-b.test/dns-query" }],
+      timeoutMs: 2_000,
+      failover: true,
+    };
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
+    let now = realNow();
+    performance.now = () => now;
+    try {
+      const stale = doh.proxyRequest(getRequest(), options);
+      assert.equal(hits.a, 1, "the older request has started and is still pending");
+
+      for (let i = 0; i < 3; i += 1) {
+        assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      }
+      assert.equal(hits.a, 4, "three concurrent failures trip A while the older request is pending");
+
+      now += 31_000;
+      aMode = "probe-hang";
+      const probe = doh.proxyRequest(getRequest(), options);
+      assert.equal(hits.a, 5, "a new request owns A's half-open probe");
+      const breaker = globalThis.__dohProxyState.circuitBreakers.get(endpoint);
+      assert.ok(breaker?.probeToken, "the half-open probe has an ownership token");
+      const token = breaker.probeToken;
+
+      releaseStaleFailure();
+      await stale;
+      assert.equal(
+        globalThis.__dohProxyState.circuitBreakers.get(endpoint)?.probeToken,
+        token,
+        "the late failure from a non-probe request must not release the active probe",
+      );
+
+      releaseProbeFailure();
+      assert.equal((await probe).status, 200);
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 5, "the failed probe re-opens the breaker without a duplicate request");
+    } finally {
+      performance.now = originalPerformanceNow;
+    }
+  });
+
+  await test("A late non-probe success cannot close another request's half-open breaker", async () => {
+    const hits = { a: 0, b: 0 };
+    let releaseStaleSuccess;
+    let releaseProbeFailure;
+    let aMode = "fail";
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("late-success-a.test")) {
+        hits.a += 1;
+        if (hits.a === 1) {
+          await new Promise((resolve) => (releaseStaleSuccess = resolve));
+          return dnsAnswer();
+        }
+        if (aMode === "probe-hang") {
+          await new Promise((resolve) => (releaseProbeFailure = resolve));
+          return new Response(null, { status: 503 });
+        }
+        return new Response(null, { status: 503 });
+      }
+      hits.b += 1;
+      return dnsAnswer();
+    };
+
+    const endpoint = "https://late-success-a.test/dns-query";
+    const options = {
+      upstreams: [{ endpoint }, { endpoint: "https://late-success-b.test/dns-query" }],
+      timeoutMs: 2_000,
+      failover: true,
+    };
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
+    let now = realNow();
+    performance.now = () => now;
+    try {
+      const stale = doh.proxyRequest(getRequest(), options);
+      assert.equal(hits.a, 1, "the older request has started and is still pending");
+
+      for (let i = 0; i < 3; i += 1) {
+        assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      }
+      assert.equal(hits.a, 4, "three concurrent failures trip A while the older request is pending");
+
+      now += 31_000;
+      aMode = "probe-hang";
+      const probe = doh.proxyRequest(getRequest(), options);
+      assert.equal(hits.a, 5, "a new request owns A's half-open probe");
+      const breaker = globalThis.__dohProxyState.circuitBreakers.get(endpoint);
+      assert.ok(breaker?.probeToken, "the half-open probe has an ownership token");
+      const token = breaker.probeToken;
+
+      releaseStaleSuccess();
+      assert.equal((await stale).status, 200);
+      assert.equal(
+        globalThis.__dohProxyState.circuitBreakers.get(endpoint)?.probeToken,
+        token,
+        "the late success from a non-probe request must not close the breaker or clear its active probe",
+      );
+
+      releaseProbeFailure();
+      assert.equal((await probe).status, 200);
+      assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
+      assert.equal(hits.a, 5, "the failed probe re-opens the breaker without a duplicate request");
+    } finally {
+      performance.now = originalPerformanceNow;
     }
   });
 
@@ -855,9 +1229,10 @@ try {
       timeoutMs: 1_000,
       failover: true,
     };
-    const realNow = Date.now;
+    const originalPerformanceNow = performance.now;
+    const realNow = originalPerformanceNow.bind(performance);
     let now = realNow();
-    Date.now = () => now;
+    performance.now = () => now;
     try {
       for (let i = 0; i < 5; i += 1) {
         await doh.proxyRequest(getRequest(), options);
@@ -865,7 +1240,7 @@ try {
       }
       assert.equal(hits, 5, "spread-out failures never trip the breaker");
     } finally {
-      Date.now = realNow;
+      performance.now = originalPerformanceNow;
     }
   });
 
