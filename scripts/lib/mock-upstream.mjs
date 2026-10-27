@@ -18,5 +18,17 @@ export function startMockUpstream(port = 0, host = "127.0.0.1") {
       res.end(Buffer.from(validResponse(query)));
     });
   });
-  return new Promise((resolve) => server.listen(port, host, () => resolve(server)));
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve(server);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
 }
