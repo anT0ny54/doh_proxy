@@ -415,6 +415,19 @@ function validateGet(url: QueryUrl): { readonly dnsParam: string; readonly query
   return { dnsParam: decoded.unpadded, query: decoded.query };
 }
 
+/** Parse the HTTP Content-Length grammar (decimal digits only). */
+function parseContentLength(value: string): number | undefined {
+  const digits = value.trim();
+  if (!/^\d+$/.test(digits)) return undefined;
+
+  // The body caps are small. Avoid numeric overflow for enormous decimal
+  // values while preserving their only relevant property: they exceed either
+  // permitted body size. Leading zeroes remain valid and are normalized first.
+  const canonical = digits.replace(/^0+(?=\d)/, "");
+  if (canonical.length > 15) return Number.MAX_SAFE_INTEGER;
+  return Number(canonical);
+}
+
 function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
   const body = new Uint8Array(total);
   let offset = 0;
@@ -431,8 +444,8 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
 
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {
-    const size = Number(contentLength);
-    if (!Number.isInteger(size) || size < 12) return textResponse("Invalid DNS message", 400);
+    const size = parseContentLength(contentLength);
+    if (size === undefined || size < 12) return textResponse("Invalid DNS message", 400);
     if (size > MAX_DNS_MESSAGE_SIZE) return textResponse("Payload too large", 413);
   }
 
@@ -501,8 +514,8 @@ function cancelResponseBody(response: Response): void {
 async function readResponseBody(response: Response): Promise<Uint8Array | null> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
-    const size = Number(contentLength);
-    if (!Number.isInteger(size) || size < 0 || size > MAX_DNS_RESPONSE_SIZE) {
+    const size = parseContentLength(contentLength);
+    if (size === undefined || size > MAX_DNS_RESPONSE_SIZE) {
       cancelResponseBody(response);
       return null;
     }

@@ -131,6 +131,9 @@ function skipName(
       ) {
         return null;
       }
+      // The pointer's first byte is itself the start of a valid encoded
+      // suffix, so a later name may legally point here as well.
+      targets[lengthOffset] = 1;
       if (!jumped) {
         nextOffset = offset + 2;
         jumped = true;

@@ -30,24 +30,44 @@ function expandIpv6(ip: string): number[] {
 }
 
 /**
- * Parses an address header value or socket address. Ports, brackets and zone
- * IDs are stripped and IPv4-mapped IPv6 addresses collapse to IPv4. Returns
- * undefined when the value is not a valid IP.
+ * Parses an address header value or socket address. Valid port/bracket
+ * wrappers are removed; a valid, nonempty scope ID is accepted only on IPv6.
+ * IPv4-mapped IPv6 addresses collapse to IPv4. Invalid decorations return
+ * undefined instead of being silently stripped from a valid-looking prefix.
  */
 function canonicalIp(raw: string): CanonicalIp | undefined {
-  let value = raw.trim().slice(0, MAX_HEADER_ENTRY_LENGTH);
+  let value = raw.trim();
+  // Reject oversized and malformed values rather than truncating or accepting
+  // a valid-looking address prefix followed by arbitrary trailing characters.
+  if (value.length === 0 || value.length > MAX_HEADER_ENTRY_LENGTH) return undefined;
+
   if (value.startsWith("[")) {
     const close = value.indexOf("]");
     if (close === -1) return undefined;
+    const suffix = value.slice(close + 1);
+    if (suffix !== "") {
+      const port = /^:(\d{1,5})$/.exec(suffix);
+      if (!port || Number(port[1]) > 65_535) return undefined;
+    }
     value = value.slice(1, close);
   } else if (/^\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}$/.test(value)) {
-    value = value.slice(0, value.lastIndexOf(":"));
+    const separator = value.lastIndexOf(":");
+    if (Number(value.slice(separator + 1)) > 65_535) return undefined;
+    value = value.slice(0, separator);
   }
   const zone = value.indexOf("%");
-  if (zone !== -1) value = value.slice(0, zone);
+  let hasZone = false;
+  if (zone !== -1) {
+    const zoneId = value.slice(zone + 1);
+    // Scope identifiers are only meaningful on IPv6 literals. Do not silently
+    // turn malformed suffixes (or IPv4 decorated with `%...`) into an address.
+    if (value.indexOf("%", zone + 1) !== -1 || !/^[A-Za-z0-9_.~-]+$/.test(zoneId)) return undefined;
+    value = value.slice(0, zone);
+    hasZone = true;
+  }
 
   const family = isIP(value);
-  if (family === 4) return { address: value, family: 4 };
+  if (family === 4) return hasZone ? undefined : { address: value, family: 4 };
   if (family !== 6) return undefined;
 
   const groups = expandIpv6(value);
@@ -65,9 +85,10 @@ function keyOf(ip: CanonicalIp): string {
 
 /**
  * Turns an address header value into a rate-limit key, or undefined when it is
- * not a valid IP. Ports, brackets and zone IDs are stripped, IPv4-mapped IPv6
- * addresses collapse to IPv4, and IPv6 addresses are keyed by their /64 so a
- * single subscriber cannot rotate through addresses to dodge the limit.
+ * not a valid IP. Valid ports/brackets and IPv6 scope IDs are normalized,
+ * IPv4-mapped IPv6 addresses collapse to IPv4, and IPv6 addresses are keyed
+ * by their /64 so a single subscriber cannot rotate through addresses to
+ * dodge the limit.
  */
 export function normalizeIp(raw: string): string | undefined {
   const ip = canonicalIp(raw);
@@ -108,10 +129,16 @@ function compileTrustedProxies(entries: readonly string[]): TrustedProxyMatcher 
       continue;
     }
     const slash = entry.lastIndexOf("/");
-    const ip = canonicalIp(slash === -1 ? entry : entry.slice(0, slash));
+    const address = slash === -1 ? entry : entry.slice(0, slash);
+    // TRUSTED_PROXIES accepts only bare IP/CIDR literals, never socket-header
+    // decorations such as ports, brackets, or IPv6 scope IDs.
+    if (isIP(address) === 0) continue;
+    const ip = canonicalIp(address);
     if (!ip) continue;
     const max = ip.family === 4 ? 32 : 128;
-    const prefix = slash === -1 ? max : Number(entry.slice(slash + 1));
+    const prefixText = slash === -1 ? undefined : entry.slice(slash + 1);
+    if (prefixText !== undefined && !/^\d+$/.test(prefixText)) continue;
+    const prefix = prefixText === undefined ? max : Number(prefixText);
     if (!Number.isInteger(prefix) || prefix < 0 || prefix > max) continue;
     list.addSubnet(ip.address, prefix, ip.family === 4 ? "ipv4" : "ipv6");
   }

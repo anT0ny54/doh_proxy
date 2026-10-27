@@ -71,15 +71,18 @@ export function parseTrust(value: string | undefined): boolean {
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
-  const parsed = Number(value?.trim() || Number.NaN);
+  const raw = value?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
+  const parsed = Number(raw);
   return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
 }
 
 function parseRotationSeconds(value: string | undefined): number {
   const raw = value?.trim();
-  const parsed = raw ? Number(raw) : Number.NaN;
+  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_HAGEZI_ROTATION_SECONDS;
+  const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return DEFAULT_HAGEZI_ROTATION_SECONDS;
-  return Math.min(Math.max(Math.floor(parsed), MIN_HAGEZI_ROTATION_SECONDS), MAX_HAGEZI_ROTATION_SECONDS);
+  return Math.min(Math.max(parsed, MIN_HAGEZI_ROTATION_SECONDS), MAX_HAGEZI_ROTATION_SECONDS);
 }
 
 /** `time` and `request` select those modes; anything else is the `client` default. */
@@ -110,15 +113,19 @@ function parseTrustedProxies(value: string | undefined): readonly string[] {
   return entries.length > 0 ? Object.freeze(entries) : DEFAULT_TRUSTED_PROXIES;
 }
 
-function detectPlatform(env: NodeJS.ProcessEnv): Platform {
-  // DOH_BUILD_PLATFORM is inlined at build time (and in `next dev`) by
-  // next.config.ts, so every Next.js-run process has a valid value here.
-  const platform = env.DOH_BUILD_PLATFORM ?? process.env.DOH_BUILD_PLATFORM;
+function detectPlatform(env: NodeJS.ProcessEnv, buildPlatform?: string): Platform {
+  // Next.js replaces direct `process.env.DOH_BUILD_PLATFORM` references at
+  // build time; it cannot replace access through the `env` parameter above.
+  // The fallback is supplied only when using the process environment itself.
+  const platform = buildPlatform ?? env.DOH_BUILD_PLATFORM;
   return platform === "vercel" || platform === "netlify" ? platform : "self-hosted";
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ProxyConfig {
-  const platform = detectPlatform(env);
+  // Keep explicit env objects isolated, but preserve Next.js's build-time
+  // substitution for the normal loadConfig() call that initializes CONFIG.
+  const buildPlatform = env === process.env ? process.env.DOH_BUILD_PLATFORM : undefined;
+  const platform = detectPlatform(env, buildPlatform);
   const headers = parseList(env.CLIENT_IP_HEADERS).map((name) => name.toLowerCase());
   return Object.freeze({
     platform,
