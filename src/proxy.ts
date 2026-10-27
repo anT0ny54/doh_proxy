@@ -54,10 +54,9 @@ export default function proxy(request: NextRequest) {
   if (request.method === "OPTIONS" || request.method === "HEAD") return NextResponse.next();
 
   const ip = getClientIp(request.headers);
-  // Monotonic clock, not Date.now(): a wall-clock step (NTP correction, VM
-  // resume) must neither reset the budgets nor freeze the windows. The limiter
-  // can only clamp a clock that moves backwards, so a forward step would stall
-  // every window until real time caught up.
+  // Monotonic clock, not Date.now(): wall-clock corrections (NTP, VM resume)
+  // must neither reset budgets nor freeze windows. RateLimiter also clamps
+  // backwards input defensively, though performance.now() should not regress.
   const result = limiter.check(ip ?? UNKNOWN_CLIENT_KEY, Math.floor(performance.now()));
   if (result.limited) return tooManyRequests(result.retryAfterSeconds);
 
