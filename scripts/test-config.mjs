@@ -53,16 +53,33 @@ test("platform defaults pick the header the platform edge sets itself", () => {
   );
 });
 
+test("loadConfig platform detection uses only the supplied environment", () => {
+  const previous = process.env.DOH_BUILD_PLATFORM;
+  try {
+    process.env.DOH_BUILD_PLATFORM = "vercel";
+    assert.equal(config.loadConfig().platform, "vercel", "the default config retains the process/build platform");
+    assert.equal(config.loadConfig({}).platform, "self-hosted", "an explicit empty environment stays isolated");
+    assert.equal(config.loadConfig({ DOH_BUILD_PLATFORM: "netlify" }).platform, "netlify");
+  } finally {
+    if (previous === undefined) delete process.env.DOH_BUILD_PLATFORM;
+    else process.env.DOH_BUILD_PLATFORM = previous;
+  }
+});
+
 test("numeric settings are validated and clamped", () => {
   const load = (env) => config.loadConfig(env);
   assert.equal(load({ RATE_LIMIT_PER_MINUTE: "250" }).rateLimitPerMinute, 250);
-  for (const bad of ["0", "-5", "1.5", "abc", " "]) assert.equal(load({ RATE_LIMIT_PER_MINUTE: bad }).rateLimitPerMinute, 100, bad);
+  for (const bad of ["0", "-5", "1.5", "0x10", "1e2", "+100", "abc", " "]) assert.equal(load({ RATE_LIMIT_PER_MINUTE: bad }).rateLimitPerMinute, 100, bad);
   assert.equal(load({ TRUSTED_PROXY_HOPS: "2" }).trustedProxyHops, 2);
   assert.equal(load({ TRUSTED_PROXY_HOPS: "999" }).trustedProxyHops, 16);
   assert.equal(load({ TRUSTED_PROXY_HOPS: "x" }).trustedProxyHops, 1);
+  assert.equal(load({ TRUSTED_PROXY_HOPS: "0x8" }).trustedProxyHops, 1);
+  assert.equal(load({ TRUSTED_PROXY_HOPS: "1e1" }).trustedProxyHops, 1);
   assert.equal(load({ HAGEZI_ROTATION_SECONDS: "1" }).hageziRotationSeconds, 60);
   assert.equal(load({ HAGEZI_ROTATION_SECONDS: "999999" }).hageziRotationSeconds, 86_400);
   assert.equal(load({ HAGEZI_ROTATION_SECONDS: "abc" }).hageziRotationSeconds, 1_800);
+  assert.equal(load({ HAGEZI_ROTATION_SECONDS: "0x3c" }).hageziRotationSeconds, 1_800);
+  assert.equal(load({ HAGEZI_ROTATION_SECONDS: "1e2" }).hageziRotationSeconds, 1_800);
   assert.equal(load({ HAGEZI_ROTATION_SECONDS: "" }).hageziRotationSeconds, 1_800);
   assert.equal(load({ HAGEZI_ROTATION_MODE: " Request " }).hageziRotationMode, "request");
   assert.equal(load({ HAGEZI_ROTATION_MODE: "TIME" }).hageziRotationMode, "time");
@@ -135,12 +152,19 @@ test("TRUSTED_PROXIES: forwarding headers from a peer outside the list are ignor
     assert.equal(get("203.0.113.9", ["*"]), "6.6.6.6", "* trusts every peer (pre-2.10 behavior)");
     assert.equal(get("127.0.0.1", ["none"]), "127.0.0.1");
     assert.equal(get("127.0.0.1", ["not-an-ip", "10.0.0.0/99"]), "127.0.0.1", "invalid entries are ignored");
+    assert.equal(get("10.1.2.3", ["10.0.0.0/0x8"]), "10.1.2.3", "CIDR prefixes must be decimal digits");
+    assert.equal(get("10.1.2.3", ["10.0.0.0/1e1"]), "10.1.2.3", "CIDR prefixes are not JS numbers");
+    assert.equal(
+      get("203.0.113.9", ["203.0.113.9:443", "[203.0.113.9]", "203.0.113.9%eth0", "fe80::1%eth0/128"]),
+      "203.0.113.9",
+      "trusted-proxy entries must be bare IP/CIDR literals",
+    );
   } finally {
     delete globalThis.__dohSocketIpPreload;
   }
 });
 
-test("normalizeIp strips ports, brackets and zones, collapses IPv4-mapped IPv6 and keys IPv6 by /64", () => {
+test("normalizeIp validates address decorations, collapses IPv4-mapped IPv6 and keys IPv6 by /64", () => {
   const cases = new Map([
     ["1.2.3.4", "1.2.3.4"],
     ["1.2.3.4:8080", "1.2.3.4"],
@@ -151,8 +175,19 @@ test("normalizeIp strips ports, brackets and zones, collapses IPv4-mapped IPv6 a
     ["2001:db8::", "2001:db8:0:0::/64"],
     ["::1", "0:0:0:0::/64"],
     ["fe80::1%eth0", "fe80:0:0:0::/64"],
+    ["[fe80::1%eth0]:443", "fe80:0:0:0::/64"],
     ["64:ff9b::192.0.2.1", "64:ff9b:0:0::/64"],
     ["::", "0:0:0:0::/64"],
+    ["[2001:db8::1]junk", undefined],
+    ["[2001:db8::1]:443junk", undefined],
+    ["[2001:db8::1]:70000", undefined],
+    ["1.2.3.4:70000", undefined],
+    ["1.2.3.4%eth0", undefined],
+    ["2001:db8::1%", undefined],
+    ["2001:db8::1%eth0%extra", undefined],
+    ["2001:db8::1%eth0/64", undefined],
+    ["2001:db8::1%eth 0", undefined],
+    [`2001:db8::1${"x".repeat(129)}`, undefined],
     ["garbage", undefined],
     ["999.1.1.1", undefined],
     ["::::", undefined],
@@ -281,15 +316,53 @@ test("next.config.ts caps the buffered request body one byte above MAX_DNS_MESSA
   assert.equal(split, cap, "the preload splits body chunks at the same cap");
 });
 
-test("the preload gives http.createServer() tight request/header timeouts; explicit options win", () => {
+test("the preload preserves createServer overloads and event signatures while tightening timeouts", () => {
   // fileURLToPath, not URL#pathname: the latter keeps percent-encoding (spaces) and breaks on Windows.
   const preload = fileURLToPath(new URL("../server/socket-ip-preload.cjs", import.meta.url));
   const script = `
     const http = require("node:http");
     const a = http.createServer(() => {});
     const b = http.createServer({ requestTimeout: 1234 }, () => {});
-    process.stdout.write(JSON.stringify([a.requestTimeout, a.headersTimeout, b.requestTimeout, b.headersTimeout, globalThis.__dohSocketIpPreload]));
+    const c = http.createServer(
+      { requestTimeout: undefined, headersTimeout: undefined, connectionsCheckingInterval: undefined },
+      () => {},
+    );
+    const report = {
+      a: [a.requestTimeout, a.headersTimeout],
+      b: [b.requestTimeout, b.headersTimeout],
+      c: [c.requestTimeout, c.headersTimeout, c.connectionsCheckingInterval],
+      preload: globalThis.__dohSocketIpPreload,
+      listeningArgs: null,
+      closeArgs: null,
+      body: null,
+    };
+    const server = http.createServer(undefined, (_req, res) => res.end("ok"));
+    server.on("listening", (...args) => { report.listeningArgs = args.length; });
+    server.on("close", (...args) => {
+      report.closeArgs = args.length;
+      process.stdout.write(JSON.stringify(report));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      http.get({ host: "127.0.0.1", port: server.address().port }, (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => { report.body = body; server.close(); });
+      }).on("error", (error) => {
+        console.error(error);
+        process.exitCode = 1;
+        server.close();
+      });
+    });
   `;
-  const output = execFileSync(process.execPath, ["--require", preload, "-e", script], { encoding: "utf8" });
-  assert.deepEqual(JSON.parse(output), [10_000, 5_000, 1234, 1234, true], "headersTimeout is clamped to a shorter requestTimeout");
+  const output = execFileSync(process.execPath, ["--require", preload, "-e", script], { encoding: "utf8", timeout: 5_000 });
+  assert.deepEqual(JSON.parse(output), {
+    a: [10_000, 5_000],
+    b: [1234, 1234],
+    c: [10_000, 5_000, 1_000],
+    preload: true,
+    listeningArgs: 0,
+    closeArgs: 0,
+    body: "ok",
+  }, "timeouts are clamped while native listener overloads and event argument lists stay intact");
 });

@@ -83,6 +83,18 @@ test("CNAME RDATA as a bare compression pointer still validates", () => {
   assert.equal(valid(response), true);
 });
 
+test("later compression pointers may target an earlier pointer suffix", () => {
+  // edge.example.com is encoded as a literal `edge` label and then a pointer
+  // to example.com. That pointer byte is itself a valid name-suffix target.
+  const cnameRdata = Buffer.from([4, ...Buffer.from("edge"), 0xc0, 0x0c]);
+  const cname = resourceRecord(PTR_QUESTION, 5, cnameRdata);
+  const suffixPointerOffset = answerStart(QUERY) + PTR_QUESTION.length + 10 + 5;
+  const ownerPointer = Buffer.from([0xc0 | (suffixPointerOffset >> 8), suffixPointerOffset & 0xff]);
+  const a = resourceRecord(ownerPointer, 1, Buffer.from([1, 2, 3, 4]));
+  const response = buildResponse(QUERY, [cname, a]);
+  assert.equal(valid(response), true);
+});
+
 test("MX exchange name bytes become valid compression targets", () => {
   const mxOwner = encodeName("example.com");
   const mx = resourceRecord(mxOwner, 15, Buffer.concat([u16(10), encodeName("mail.example.com")]));

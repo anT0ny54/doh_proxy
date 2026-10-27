@@ -134,6 +134,24 @@ try {
     assert.ok(Date.now() - started < 1_000);
   });
 
+  await test("POST rejects non-decimal Content-Length values before reading or forwarding the body", async () => {
+    globalThis.fetch = async () => {
+      throw new Error("fetch must not run for an invalid Content-Length");
+    };
+
+    for (const value of ["0x10", "+12", "1e2", "12.0"]) {
+      const request = postRequest();
+      request.headers.set("content-length", value);
+      const response = await doh.proxyRequest(request, {
+        upstreams: [{ endpoint: "https://invalid-length.test/dns-query" }],
+        timeoutMs: 100,
+        failover: false,
+      });
+      assert.equal(response.status, 400, value);
+      assert.equal(await response.text(), "Invalid DNS message", value);
+    }
+  });
+
   await test("DoH POST body cancellation is bounded", async () => {
     const pendingBody = {
       getReader() {
@@ -573,6 +591,28 @@ try {
     assert.equal(response.status, 200);
     assert.equal(calls, 2);
     assert.equal(upstreamBody.locked, false, "an errored but settled stream must not remain locked");
+  });
+
+  await test("A non-decimal upstream Content-Length is rejected and failover continues", async () => {
+    const calls = [];
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      if (calls.length === 1) return dnsAnswer(validResponse(), { "content-length": "0x20" });
+      return dnsAnswer();
+    };
+
+    const response = await doh.proxyRequest(getRequest(), {
+      upstreams: [
+        { endpoint: "https://first-invalid-length.test/dns-query" },
+        { endpoint: "https://second-valid-length.test/dns-query" },
+      ],
+      timeoutMs: 1_000,
+      failover: true,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 2, "the non-decimal Content-Length response must be skipped");
+    assert.match(calls[1], /second-valid-length\.test/);
   });
 
   await test("A negative upstream Content-Length is rejected and failover continues", async () => {
