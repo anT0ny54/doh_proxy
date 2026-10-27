@@ -54,7 +54,8 @@ const MAX_RELAYED_MAX_AGE_SECONDS = 300;
 
 // Circuit breaker configuration (failover endpoint only). State is per
 // runtime instance (best effort), which is enough to avoid hammering an
-// upstream that is clearly down.
+// upstream that is clearly down. Duration tracking uses performance.now();
+// only time-slot-based resolver rotation needs the wall clock.
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
 // Failures further apart than this do not accumulate toward the threshold.
@@ -123,7 +124,7 @@ function isCircuitBreakerOpen(endpoint: string): boolean {
   const cb = state.circuitBreakers.get(endpoint);
   if (!cb || cb.failures < CIRCUIT_BREAKER_THRESHOLD) return false;
 
-  const now = Date.now();
+  const now = performance.now();
   if (now - cb.lastFailureTime < CIRCUIT_BREAKER_COOLDOWN_MS) return true;
   return hasActiveProbe(cb, now);
 }
@@ -139,7 +140,7 @@ function hasActiveProbe(cb: CircuitBreakerState, now: number): boolean {
  */
 function isProbeInFlight(endpoint: string): boolean {
   const cb = state.circuitBreakers.get(endpoint);
-  return cb !== undefined && cb.failures >= CIRCUIT_BREAKER_THRESHOLD && hasActiveProbe(cb, Date.now());
+  return cb !== undefined && cb.failures >= CIRCUIT_BREAKER_THRESHOLD && hasActiveProbe(cb, performance.now());
 }
 
 /**
@@ -152,7 +153,7 @@ function claimProbe(endpoint: string): number {
   if (!cb || cb.failures < CIRCUIT_BREAKER_THRESHOLD) return 0;
   state.probeCounter += 1;
   cb.probeToken = state.probeCounter;
-  cb.probeStartedAt = Date.now();
+  cb.probeStartedAt = performance.now();
   return cb.probeToken;
 }
 
@@ -170,13 +171,26 @@ function releaseProbe(endpoint: string, token: number): void {
   }
 }
 
-function recordFailure(endpoint: string): void {
-  const now = Date.now();
+function recordFailure(endpoint: string, probeToken = 0): void {
+  const now = performance.now();
   let cb = state.circuitBreakers.get(endpoint);
   if (!cb) {
     cb = { failures: 0, lastFailureTime: 0, probeToken: 0, probeStartedAt: 0 };
     state.circuitBreakers.set(endpoint, cb);
   }
+
+  // Once a breaker is tripped, the active half-open probe owns its next
+  // verdict. An older, non-probe request may finish after that probe starts;
+  // it must not clear the probe token or restart the cooldown. The probe's
+  // own result will either close the breaker or re-open it immediately.
+  if (
+    cb.failures >= CIRCUIT_BREAKER_THRESHOLD &&
+    hasActiveProbe(cb, now) &&
+    cb.probeToken !== probeToken
+  ) {
+    return;
+  }
+
   // Isolated, old failures expire; a tripped breaker keeps its count so that a
   // failed half-open probe re-opens it immediately.
   if (cb.failures < CIRCUIT_BREAKER_THRESHOLD && now - cb.lastFailureTime > CIRCUIT_BREAKER_FAILURE_WINDOW_MS) {
@@ -184,11 +198,25 @@ function recordFailure(endpoint: string): void {
   }
   cb.failures += 1;
   cb.lastFailureTime = now;
-  cb.probeToken = 0;
-  cb.probeStartedAt = 0;
+  // Only the attempt that reserved a half-open probe may release it.
+  if (probeToken !== 0 && cb.probeToken === probeToken) {
+    cb.probeToken = 0;
+    cb.probeStartedAt = 0;
+  }
 }
 
-function recordSuccess(endpoint: string): void {
+function recordSuccess(endpoint: string, probeToken = 0): void {
+  const cb = state.circuitBreakers.get(endpoint);
+  // A success from an older attempt is not the verdict for a newer active
+  // half-open probe. Only that probe's owner may close a tripped breaker.
+  if (
+    cb &&
+    cb.failures >= CIRCUIT_BREAKER_THRESHOLD &&
+    hasActiveProbe(cb, performance.now()) &&
+    cb.probeToken !== probeToken
+  ) {
+    return;
+  }
   state.circuitBreakers.delete(endpoint);
 }
 
@@ -313,8 +341,17 @@ function releaseInFlight(clientKey: string | null): void {
 async function cancelBestEffort(target: { cancel(): Promise<void> }): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    let cancellation: Promise<void>;
+    try {
+      cancellation = Promise.resolve(target.cancel());
+    } catch {
+      // A custom or already-invalid stream can throw before returning a promise.
+      // Cancellation is best effort; the caller must still return its response.
+      return false;
+    }
+
     return await Promise.race([
-      target.cancel().then(
+      cancellation.then(
         () => true,
         () => true,
       ),
@@ -350,7 +387,9 @@ function stripPadding(value: string): string {
 function decodeBase64Url(value: string): { readonly unpadded: string; readonly query: ValidatedQuery } | null {
   if (!value || value.length > MAX_ENCODED_QUERY_LENGTH + 2 || !BASE64URL.test(value)) return null;
   const unpadded = stripPadding(value);
-  if (unpadded.length % 4 === 1) return null;
+  const padding = value.length - unpadded.length;
+  const requiredPadding = (4 - (unpadded.length % 4)) % 4;
+  if (unpadded.length % 4 === 1 || (padding > 0 && padding !== requiredPadding)) return null;
 
   const body = Buffer.from(unpadded, "base64url");
   const parsed = parseQuery(body);
@@ -405,7 +444,7 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
 
   try {
     for (;;) {
-      const remaining = deadline - Date.now();
+      const remaining = deadline - performance.now();
       if (remaining <= 0) {
         await cancelBestEffort(reader);
         return textResponse("Request body timeout", 408);
@@ -495,6 +534,12 @@ async function readResponseBody(response: Response): Promise<Uint8Array | null> 
       chunks.push(value);
       total = nextTotal;
     }
+  } catch (error) {
+    // A rejected read has settled too: there is no pending read left to protect
+    // from releaseLock(). The caller records the upstream failure and fails
+    // over, but the errored stream must not remain locked until garbage collection.
+    settled = true;
+    throw error;
   } finally {
     if (settled) {
       try {
@@ -596,7 +641,8 @@ async function proxyRequestInternal(
   let query: ValidatedQuery;
   let dnsParam: string | undefined;
   const timeout = Math.max(MIN_TIMEOUT_MS, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const startedAt = Date.now();
+  // Wall-clock corrections must not extend or truncate an in-flight request.
+  const startedAt = performance.now();
   const deadline = startedAt + timeout;
 
   if (request.method === "GET") {
@@ -649,7 +695,7 @@ async function proxyRequestInternal(
     // Share what is left of the budget across the attempts still to come, so
     // time saved by fast failures flows to later upstreams (the last one gets
     // everything that remains).
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     const share = failover
       ? Math.max(MIN_FAILOVER_SLICE_MS, Math.floor(remaining / (upstreams.length - index)))
       : remaining;
@@ -671,7 +717,7 @@ async function proxyRequestInternal(
       if (result.status !== 200) {
         cancelResponseBody(result);
         if (RETRYABLE_UPSTREAM_STATUSES.has(result.status)) {
-          if (failover) recordFailure(upstream.endpoint);
+          if (failover) recordFailure(upstream.endpoint, probe);
           continue;
         }
         if (REQUEST_REJECTION_STATUSES.has(result.status)) {
@@ -693,7 +739,7 @@ async function proxyRequestInternal(
       const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
       if (contentType !== DNS_MESSAGE) {
         cancelResponseBody(result);
-        if (failover) recordFailure(upstream.endpoint);
+        if (failover) recordFailure(upstream.endpoint, probe);
         continue;
       }
 
@@ -706,7 +752,7 @@ async function proxyRequestInternal(
         continue;
       }
 
-      if (failover) recordSuccess(upstream.endpoint);
+      if (failover) recordSuccess(upstream.endpoint, probe);
 
       const headers = baseHeaders();
       headers.set("Content-Type", DNS_MESSAGE);
@@ -726,7 +772,7 @@ async function proxyRequestInternal(
         break;
       }
       // Network errors and timeouts are retryable; try the next fixed upstream.
-      if (failover) recordFailure(upstream.endpoint);
+      if (failover) recordFailure(upstream.endpoint, probe);
     } finally {
       clearTimeout(timer);
     }
