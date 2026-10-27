@@ -2,169 +2,31 @@
 
 ## [Unreleased]
 
-One documentation bug fixed and two timing-sensitive tests hardened. Found in a
-fourth full read of the repository (every source, test, workflow, configuration
-and documentation file, except that `package-lock.json` was checked structurally
-and against `package.json` rather than line by line and `LICENSE`, the standard
-AGPL-3.0 text, was only skimmed). Unlike the previous rounds, this review ran
-with the project's dependencies installed, so the whole unit suite, lint, type
-check and build were executed. Dead-code, conflict and optimization checks are
-listed under "Review notes".
-
-A fifth full read (same scope and caveats) re-verified the repository after the
-changes above were pushed and found nothing further to fix: no dead or
-redundant code, no conflicts, no bugs and no optimizations worth making. It ran
-with the dependencies installed: the 106 unit tests, `npm run lint`,
-`npm run typecheck`, `npm run build` and the 16 integration tests all pass.
-(The build also made the integration suite runnable in this environment for the
-first time.) The double read of `DOH_BUILD_PLATFORM` in `detectPlatform()`
-(`env.DOH_BUILD_PLATFORM ?? process.env.DOH_BUILD_PLATFORM`) was considered as
-a possible redundancy and kept: when `env` is a custom object (the config
-tests), the fallback still lets Next.js' build-time inlining of the literal
-`process.env.DOH_BUILD_PLATFORM` reference work.
-
 ### Fixed
-- **README documented a file that no longer exists.** The project-layout table
-  still listed `SERVICES.md` after the file was deleted from the repository.
-  The line is removed. No code or other documentation referenced it.
+- Request deadlines, POST-body read deadlines, and circuit-breaker cooldown,
+  failure-window, and probe-lease timing now use a monotonic clock. Wall-clock
+  corrections can no longer prematurely stop failover, extend request handling,
+  expire a cooldown early, or expire an active probe lease.
+- Release the upstream response reader lock when a body read errors. The
+  upstream still counts as a failed attempt and failover continues, but the
+  errored stream is no longer left locked until garbage collection.
+- Make best-effort cancellation tolerate a synchronous `cancel()` throw so it
+  cannot replace an intended request-body error or produce an unhandled rejection.
+- Removed a redundant reduced-motion `scroll-behavior` override; the same media
+  query still disables nonessential transitions and animations.
+- Corrected the rate-limiter clock comment to describe its defensive handling
+  of backward input without incorrectly implying that `performance.now()` can
+  normally move backward.
 
-### Changed
-- Tests: two timing-sensitive tests in `test-doh.mjs` no longer fail on a
-  heavily loaded runner, where both were observed to fail while the code under
-  test behaved correctly.
-  - "A slow POST body that leaves no upstream budget neither fetches nor trips
-    the breaker" asserted exactly `502`, but when the 200 ms chunk arrives
-    after the 250 ms deadline the legitimate result is the `408`
-    body-timeout path. The assertion now accepts both and still requires that
-    no upstream fetch happens and the breaker stays untouched.
-  - "DoH POST body cancellation is bounded" allowed 400 ms of wall clock for a
-    path that includes a 25 ms cancel timeout plus event-loop overhead; on a
-    loaded runner that occasionally exceeded the allowance. The bound is now
-    1 second, still far below the request deadline being tested.
+### Tests
+- Added regression coverage for forward wall-clock jumps during request and
+  POST-body deadlines, circuit-breaker cooldowns and active probe leases, plus
+  reader-lock cleanup after an upstream stream error, and preservation of a
+  `413` response when body cancellation throws synchronously.
+- All 115 unit tests pass on Node.js 22.16.0 using the environment's global
+  TypeScript 5.8.3 transpiler. Installing the locked dependencies timed out, so
+  lint, type checking, production build, integration tests, and Docker checks
+  could not be run in this environment.
 
-### Review notes
-- Run in this review (dependencies installed in the environment): the 106 unit
-  tests, `npm run lint`, `npm run typecheck` and `npm run build` (all pass;
-  the two test changes above are assertion-only). Not run: the integration
-  suite (needs a prior production build and starts real servers) and the Docker
-  build and smoke test (no Docker daemon in the review environment).
-- Dead or redundant code: none. The exports that no other `src/` module imports
-  are consumed by the tests (`normalizeIp`, `parseTrust`, `loadConfig`,
-  `PROXY_VERSION`, `getHageziUpstreams`, the in-flight constants,
-  `RateLimiter#size`) and the `timeoutMs` option of `proxyRequest()` is set
-  only by tests; all are deliberate seams. Defensive branches that cannot run
-  in production and are kept on purpose: the `404` in `handleDoH()` (the router
-  answers first) and the oversized-input allocation in `compressionTargets()`
-  (responses are capped at 65535 bytes before validation).
-- Conflicts: none between `README.md`, `package.json`, `Dockerfile`, the
-  workflows, `next.config.ts` and the code. The stale `SERVICES.md` row was the
-  only README/reference mismatch found. The test-count claims (106 unit), the
-  Keep-Alive schedule, the published image tags, the 4097-byte body cap in
-  `next.config.ts` and the preload, and the `maxDuration` versus
-  `DEFAULT_TIMEOUT_MS` relation were re-checked.
-- Optimization: nothing worth changing. The hot path already avoids
-  per-request URL parsing, rotation-list allocation and per-message scratch
-  allocation. Building the fixed `Accept`/`User-Agent` `Headers` once instead
-  of per attempt would save about 1 microsecond per upstream call (measured in
-  an earlier review), which is negligible next to the network round trip.
-- Left alone, by design and already documented in the README: a single shared
-  limiter bucket when no client address exists (`TRUST_PROXY_HEADERS=0` on a
-  platform without the preload); eviction of the oldest bucket once 10,000 keys
-  are tracked; relaying an upstream `400`/`413`/`414`/`415` without failover;
-  and `200` bodies that fail validation not counting toward the circuit
-  breaker, since a crafted query can provoke them.
-
-## 2.10.0
-
-Two runtime bugs fixed in `src/`, one unreferenced code path removed, tests and
-documentation updated. Found in a third full read of the repository (every
-source, test, workflow, configuration and documentation file, except that
-`package-lock.json` was checked structurally and against `package.json` rather
-than line by line and `LICENSE`, the standard AGPL-3.0 text, was only skimmed).
-Dead-code, conflict and optimization checks are listed under "Review notes".
-
-### Fixed
-- **The rate limiter could stall for as long as a clock step lasted.**
-  `src/proxy.ts` fed `Date.now()` to the limiter, whose clamp only handles a
-  clock that moves *backwards*. After a forward step (an NTP correction, a VM
-  resume) followed by the clock being corrected back, the effective clock stayed
-  at the stepped value, so no window rolled over and every client was stuck at
-  its current budget until real time caught up. Reproduced with the unmodified
-  limiter: after a +1 h step and correction, a client with a limit of 5/min got
-  4 requests in the next 30 real minutes instead of about 150. `proxy.ts` now
-  passes `Math.floor(performance.now())`, a monotonic clock, so wall-clock steps
-  in either direction have no effect. Windows are aligned to process start
-  instead of the epoch; nothing depended on epoch alignment, and `Retry-After`
-  is unaffected. The doc comment of `RateLimiter` now says that callers must
-  pass a monotonic clock and why the clamp alone is not enough.
-- **`NEXT_PUBLIC_SITE_URL` with an upper- or mixed-case scheme produced a wrong
-  origin.** `toOrigin()` in `src/lib/site.ts` only recognized a lower-case
-  `http://` / `https://` prefix, so `HTTPS://dns.example.com` was treated as a
-  bare host and became `https://https` in the homepage endpoint, the canonical
-  URL and the Open Graph URL. For the same reason `ftp://dns.example.com` became
-  `https://ftp` instead of being rejected. Any explicit `scheme://` is now
-  parsed as written (and non-http(s) schemes are ignored, as the code already
-  intended); only a value without a scheme gets `https://`. `host:port` is still
-  treated as a bare host.
-
-### Removed
-- The CLI entry point of `scripts/lib/mock-upstream.mjs` (`node
-  scripts/lib/mock-upstream.mjs <port>`) and its `pathToFileURL` import. Nothing
-  referenced it any more: the Docker smoke test and the integration suite import
-  `startMockUpstream()` directly. The function is unchanged.
-
-### Changed
-- Tests: 104 -> 106 unit tests. `test-proxy.mjs` gains a regression test that
-  steps the wall clock two hours forward and back while the limiter is
-  exhausted (the verdict must not change) and then advances the monotonic clock
-  (the budget must return). `test-config.mjs` gains a test for
-  `NEXT_PUBLIC_SITE_URL` parsing (mixed-case scheme, bare host, `host:port`,
-  `ftp://`, blank, path and query dropped). Both fail against the previous
-  source and pass now.
-- README: the limiter's clock source, the accepted forms of
-  `NEXT_PUBLIC_SITE_URL`, the two new checklist lines and the updated test
-  descriptions.
-
-### Review notes
-- Run in this review: the 106 unit tests (all pass), an unused-symbol check
-  (`tsc --noUnusedLocals --noUnusedParameters`) over `src/lib` and, with
-  `checkJs`, over `scripts/` and `server/` (nothing unused), and a
-  reproduction of both bugs before the fix. Not run, because the review
-  environment had neither network access nor the project's dependencies:
-  `npm run lint`, `npm run typecheck`, `npm run build`, the integration suite
-  and the Docker build and smoke test. Run those before releasing; the two
-  `src/` edits are small and use only `performance.now()` and a regular
-  expression.
-- Dead or redundant code: only the mock-upstream CLI above. The remaining
-  exports that no other `src/` module imports are consumed by the tests
-  (`normalizeIp`, `parseTrust`, `loadConfig`, `PROXY_VERSION`,
-  `getHageziUpstreams`, the in-flight constants, `RateLimiter#size`) and the
-  `timeoutMs` option of `proxyRequest()` is set only by tests; all are
-  deliberate seams. Defensive branches that cannot run in production and are
-  kept on purpose: the `404` in `handleDoH()` (the router answers first) and the
-  oversized-input allocation in `compressionTargets()` (responses are capped at
-  65535 bytes before validation).
-- Conflicts: none between `README.md`, `package.json`, `Dockerfile`, the
-  workflows, `next.config.ts` and the code. Checked in particular the default
-  values and clamps of every environment variable, the Keep-Alive schedule, the
-  published image tags, the 4097-byte body cap in `next.config.ts` and the
-  preload, the `maxDuration` versus `DEFAULT_TIMEOUT_MS` relation, and the
-  test counts quoted in the earlier entry (104 unit, 16 integration).
-- Optimization: nothing worth changing. The hot path already avoids per-request
-  URL parsing, rotation-list allocation and per-message scratch allocation.
-  Building the fixed `Accept`/`User-Agent` `Headers` once instead of per
-  attempt would save about 1 microsecond per upstream call (measured), which is
-  negligible next to the network round trip; not done.
-- Left alone, by design and already documented in the README: a single shared
-  limiter bucket when no client address exists (`TRUST_PROXY_HEADERS=0` on a
-  platform without the preload); eviction of the oldest bucket once 10,000 keys
-  are tracked, which a client rotating /64 prefixes can use to push out others;
-  relaying an upstream `400`/`413`/`414`/`415` without failover, which lets one
-  misconfigured upstream fail requests for everyone; and `200` bodies that fail
-  validation not counting toward the circuit breaker, since a crafted query can
-  provoke them. One behavior was undocumented and is now described in the
-  README without changing it: an IPv4-mapped IPv6 CIDR in `TRUSTED_PROXIES`
-  with a prefix above 32 (for example `::ffff:10.0.0.0/104`) is silently
-  ignored, because the address collapses to IPv4 and the prefix no longer fits
-  (verified; a mapped single address such as `::ffff:10.1.2.3` does work).
-  Write the range as `10.0.0.0/8`.
+The project version remains `2.10.0`; no version bump or lockfile change was
+made.
