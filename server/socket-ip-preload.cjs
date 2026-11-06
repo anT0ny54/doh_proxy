@@ -86,18 +86,20 @@ if (globalThis[FLAG] !== true) {
       // Keep a second-argument listener intact for createServer(undefined, fn).
       options = {};
     }
+    // An own property whose value is undefined would override the defaults during
+    // the spread, so undefined selects the default explicitly. Every other value,
+    // null included, is passed to Node unchanged and validated by Node as it would
+    // be without the preload.
+    const orDefault = (value, fallback) => (value === undefined ? fallback : value);
     const merged = {
       ...options,
-      // An own property whose value is undefined still overrides the defaults
-      // during a spread. Normalize the three managed timeout options so explicit
-      // undefined behaves exactly like an absent option (null remains an invalid
-      // caller-supplied value and is intentionally passed through).
-      requestTimeout: options.requestTimeout ?? REQUEST_TIMEOUT_MS,
-      headersTimeout: options.headersTimeout ?? HEADERS_TIMEOUT_MS,
-      connectionsCheckingInterval: options.connectionsCheckingInterval ?? CONNECTIONS_CHECKING_INTERVAL_MS,
+      requestTimeout: orDefault(options.requestTimeout, REQUEST_TIMEOUT_MS),
+      headersTimeout: orDefault(options.headersTimeout, HEADERS_TIMEOUT_MS),
+      connectionsCheckingInterval: orDefault(options.connectionsCheckingInterval, CONNECTIONS_CHECKING_INTERVAL_MS),
     };
-    // Node requires headersTimeout <= requestTimeout (0 disables the latter).
-    if (merged.requestTimeout > 0) {
+    // Node requires headersTimeout <= requestTimeout (0 disables the latter). Only
+    // numbers are clamped, so a non-number is left for Node to reject.
+    if (typeof merged.requestTimeout === "number" && merged.requestTimeout > 0 && typeof merged.headersTimeout === "number") {
       merged.headersTimeout = Math.min(merged.headersTimeout, merged.requestTimeout);
     }
     return createServer.call(this, merged, listener);
