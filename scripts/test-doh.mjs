@@ -29,6 +29,21 @@ function getLikeRequest(method, url = "https://proxy.test/api/doh/dns-query") {
   return { method, url, headers: new Headers(), body: null };
 }
 
+/**
+ * Runs `body` with performance.now() replaced by a clock the body advances
+ * through `clock.now`, restoring the real clock afterwards.
+ */
+async function withManualClock(body) {
+  const original = performance.now;
+  const clock = { now: original.call(performance) };
+  performance.now = () => clock.now;
+  try {
+    await body(clock);
+  } finally {
+    performance.now = original;
+  }
+}
+
 const originalFetch = globalThis.fetch;
 
 try {
@@ -677,23 +692,17 @@ try {
       timeoutMs: 1_000,
       failover: true,
     };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200); // opens A
       assert.equal(hits.a, 3);
       await doh.proxyRequest(getRequest(), options); // still open: A skipped
       assert.equal(hits.a, 3);
-      now += 31_000; // cooldown elapsed -> half-open probe
+      clock.now += 31_000; // cooldown elapsed -> half-open probe
       await doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 4, "half-open state must probe A once");
       await doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 4, "one failed probe must re-open the breaker immediately");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("Circuit-breaker cooldown uses monotonic time, not wall-clock jumps", async () => {
@@ -895,25 +904,19 @@ try {
       return dnsAnswer();
     };
     const options = { upstreams: [{ endpoint: "https://probe-once.test/dns-query" }, { endpoint: "https://probe-other.test/dns-query" }], timeoutMs: 500, failover: true };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options);
-      now += 31_000;
+      clock.now += 31_000;
       healthy = true;
       hits = 0;
-      // Both upstreams tripped above, so both are half-open now.
+      // Both upstreams tripped above, so both are half-open clock.now.
       const inflight = [doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options)];
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.equal(hits, 2, "exactly one probe per half-open upstream; the third request does not pile on");
       release();
       const statuses = (await Promise.all(inflight)).map((response) => response.status);
       assert.deepEqual(statuses, [200, 200, 502]);
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("One client IP cannot hold more than its share of in-flight slots", async () => {
@@ -953,27 +956,21 @@ try {
     const b = { endpoint: "https://probe-leak-b.test/dns-query" };
     const aFirst = { upstreams: [a, b], timeoutMs: 1_000, failover: true };
     const bFirst = { upstreams: [b, a], timeoutMs: 1_000, failover: true };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200); // opens A
       assert.equal(hits.a, 3);
 
       aHealthy = true;
-      now += 31_000; // cooldown elapsed: A is half-open
+      clock.now += 31_000; // cooldown elapsed: A is half-open
       assert.equal((await doh.proxyRequest(getRequest(), bFirst)).status, 200); // B answers first; A is not contacted
       assert.equal(hits.a, 3);
 
-      now += 1_000; // well inside the 5 s probe TTL
+      clock.now += 1_000; // well inside the 5 s probe TTL
       assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200);
       assert.equal(hits.a, 4, "an unused probe must not lock out a recovered upstream");
       assert.equal((await doh.proxyRequest(getRequest(), aFirst)).status, 200);
       assert.equal(hits.a, 5, "a successful probe closes the breaker");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("A non-retryable answer to a half-open probe releases the probe slot", async () => {
@@ -992,24 +989,18 @@ try {
       timeoutMs: 1_000,
       failover: true,
     };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       for (let i = 0; i < 3; i += 1) assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200); // opens A
       assert.equal(hits.a, 3);
 
       aStatus = 403; // non-retryable: neither a failure nor a success
-      now += 31_000; // cooldown elapsed: A is half-open
+      clock.now += 31_000; // cooldown elapsed: A is half-open
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 4, "the half-open probe reaches A");
-      now += 1_000; // well inside the 5 s probe TTL
+      clock.now += 1_000; // well inside the 5 s probe TTL
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 5, "an inconclusive probe must not block A for the whole probe TTL");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("GET keeps an existing query string on the upstream endpoint", async () => {
@@ -1100,13 +1091,9 @@ try {
       timeoutMs: 2_000,
       failover: true,
     };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       for (let i = 0; i < 3; i += 1) await doh.proxyRequest(getRequest(), options);
-      now += 31_000;
+      clock.now += 31_000;
       aMode = "hang";
       const first = doh.proxyRequest(getRequest(), options); // claims A's probe
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1118,9 +1105,7 @@ try {
       assert.equal((await first).status, 200);
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 5, "the owner released its probe after the inconclusive answer");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("A late non-probe failure cannot clear another request's half-open probe", async () => {
@@ -1151,11 +1136,7 @@ try {
       timeoutMs: 2_000,
       failover: true,
     };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       const stale = doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 1, "the older request has started and is still pending");
 
@@ -1164,7 +1145,7 @@ try {
       }
       assert.equal(hits.a, 4, "three concurrent failures trip A while the older request is pending");
 
-      now += 31_000;
+      clock.now += 31_000;
       aMode = "probe-hang";
       const probe = doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 5, "a new request owns A's half-open probe");
@@ -1184,9 +1165,7 @@ try {
       assert.equal((await probe).status, 200);
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 5, "the failed probe re-opens the breaker without a duplicate request");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("A late non-probe success cannot close another request's half-open breaker", async () => {
@@ -1217,11 +1196,7 @@ try {
       timeoutMs: 2_000,
       failover: true,
     };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       const stale = doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 1, "the older request has started and is still pending");
 
@@ -1230,7 +1205,7 @@ try {
       }
       assert.equal(hits.a, 4, "three concurrent failures trip A while the older request is pending");
 
-      now += 31_000;
+      clock.now += 31_000;
       aMode = "probe-hang";
       const probe = doh.proxyRequest(getRequest(), options);
       assert.equal(hits.a, 5, "a new request owns A's half-open probe");
@@ -1250,9 +1225,7 @@ try {
       assert.equal((await probe).status, 200);
       assert.equal((await doh.proxyRequest(getRequest(), options)).status, 200);
       assert.equal(hits.a, 5, "the failed probe re-opens the breaker without a duplicate request");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("Isolated failures further apart than the failure window do not open the breaker", async () => {
@@ -1269,19 +1242,13 @@ try {
       timeoutMs: 1_000,
       failover: true,
     };
-    const originalPerformanceNow = performance.now;
-    const realNow = originalPerformanceNow.bind(performance);
-    let now = realNow();
-    performance.now = () => now;
-    try {
+    await withManualClock(async (clock) => {
       for (let i = 0; i < 5; i += 1) {
         await doh.proxyRequest(getRequest(), options);
-        now += 31_000;
+        clock.now += 31_000;
       }
       assert.equal(hits, 5, "spread-out failures never trip the breaker");
-    } finally {
-      performance.now = originalPerformanceNow;
-    }
+    });
   });
 
   await test("With every breaker open, each upstream is probed by at most one request at a time", async () => {
@@ -1342,6 +1309,66 @@ try {
     assert.equal((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), "private, max-age=20");
     globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=60", age: "90" });
     assert.match((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), /no-store/);
+  });
+
+  await test("A malformed upstream Age makes the answer uncacheable instead of relaying its full max-age", async () => {
+    const options = { upstreams: [{ endpoint: "https://age-bad.test/dns-query" }], timeoutMs: 500, failover: false };
+    for (const age of ["1e9", "-1", "12 34", "", "0x10"]) {
+      globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=120", age });
+      const response = await doh.proxyRequest(getRequest(), options);
+      assert.equal(response.headers.get("cache-control"), "no-store, max-age=0", `Age ${JSON.stringify(age)}`);
+    }
+    // An absent Age still relays the full (capped) max-age.
+    globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=120" });
+    assert.equal((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), "private, max-age=120");
+  });
+
+  await test("Relayed max-age treats valid Age values longer than nine digits as expired", async () => {
+    const options = { upstreams: [{ endpoint: "https://age.test/dns-query" }], timeoutMs: 500, failover: false };
+    globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=120", age: "1000000000" });
+    assert.equal(
+      (await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"),
+      "no-store, max-age=0",
+      "a large but valid Age value must not be mistaken for zero",
+    );
+    globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=120", age: "9".repeat(100) });
+    assert.equal(
+      (await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"),
+      "no-store, max-age=0",
+      "Age values beyond Number's finite range also expire the cache",
+    );
+  });
+
+  await test("Relayed max-age accepts large decimal values without precision loss", async () => {
+    const options = { upstreams: [{ endpoint: "https://age-large.test/dns-query" }], timeoutMs: 500, failover: false };
+
+    globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=1000000000" });
+    assert.equal(
+      (await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"),
+      "private, max-age=300",
+      "a valid max-age above nine digits is capped, not discarded",
+    );
+
+    globalThis.fetch = async () => dnsAnswer(validResponse(), {
+      "cache-control": "max-age=9007199254740993",
+      age: "9007199254740992",
+    });
+    assert.equal(
+      (await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"),
+      "private, max-age=1",
+      "large max-age and Age values retain their exact one-second difference",
+    );
+
+    const hugeMaxAge = "9".repeat(100);
+    globalThis.fetch = async () => dnsAnswer(validResponse(), {
+      "cache-control": `max-age=${hugeMaxAge}`,
+      age: `${"9".repeat(99)}8`,
+    });
+    assert.equal(
+      (await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"),
+      "private, max-age=1",
+      "arbitrarily large decimal values retain their exact difference",
+    );
   });
 
   await test("GET upstream URLs drop a fragment and append dns= correctly", async () => {

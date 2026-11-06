@@ -53,6 +53,19 @@ test("platform defaults pick the header the platform edge sets itself", () => {
   );
 });
 
+test("CLIENT_IP_HEADERS drops invalid names, de-duplicates entries, and falls back when none are valid", () => {
+  assert.deepEqual(
+    config.loadConfig({ CLIENT_IP_HEADERS: " CF-Connecting-IP, x-real-ip, cf-connecting-ip, bad header, x-forwarded-for\tbad" }).clientIpHeaders,
+    ["cf-connecting-ip", "x-real-ip"],
+    "header names are normalized, valid tokens only, and retain first-seen order",
+  );
+  assert.deepEqual(
+    config.loadConfig({ DOH_BUILD_PLATFORM: "vercel", CLIENT_IP_HEADERS: "bad header, invalid:name" }).clientIpHeaders,
+    ["x-real-ip", "x-forwarded-for"],
+    "an override with no valid field names uses the safe platform default",
+  );
+});
+
 test("loadConfig platform detection uses only the supplied environment", () => {
   const previous = process.env.DOH_BUILD_PLATFORM;
   try {
@@ -164,6 +177,22 @@ test("TRUSTED_PROXIES: forwarding headers from a peer outside the list are ignor
   }
 });
 
+test("TRUSTED_PROXIES: Object.prototype names are unknown entries, not named ranges", () => {
+  globalThis.__dohSocketIpPreload = true;
+  try {
+    const get = (trustedProxies) =>
+      clientIp.getClientIp(new Headers({ "x-forwarded-for": "6.6.6.6", "x-doh-socket-ip": "127.0.0.1" }), {
+        ...DEFAULT_IDENTITY,
+        trustedProxies,
+      });
+    // Before the fix these threw "named is not iterable" on every request.
+    assert.equal(get(["constructor", "__proto__", "toString", "hasOwnProperty"]), "127.0.0.1", "ignored, not trusted");
+    assert.equal(get(["constructor", "loopback"]), "6.6.6.6", "real named ranges still work next to unknown names");
+  } finally {
+    delete globalThis.__dohSocketIpPreload;
+  }
+});
+
 test("normalizeIp validates address decorations, collapses IPv4-mapped IPv6 and keys IPv6 by /64", () => {
   const cases = new Map([
     ["1.2.3.4", "1.2.3.4"],
@@ -217,6 +246,17 @@ test("NEXT_PUBLIC_SITE_URL: scheme is case-insensitive, a bare host gets https, 
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];
     }
+  }
+});
+
+test("HAGEZI_UPSTREAM_ENDPOINTS: a bare trailing '?' does not double the GET separator", async () => {
+  process.env.HAGEZI_UPSTREAM_ENDPOINTS = "https://bare-query.test/dns-query?";
+  try {
+    const [upstream] = (await importDoh({ fresh: true })).getHageziUpstreams();
+    assert.equal(upstream.href, "https://bare-query.test/dns-query", "POST target has no dangling '?'");
+    assert.equal(upstream.getPrefix, "https://bare-query.test/dns-query?", "GET adds exactly one separator");
+  } finally {
+    delete process.env.HAGEZI_UPSTREAM_ENDPOINTS;
   }
 });
 
@@ -327,10 +367,17 @@ test("the preload preserves createServer overloads and event signatures while ti
       { requestTimeout: undefined, headersTimeout: undefined, connectionsCheckingInterval: undefined },
       () => {},
     );
+    let nullRejected = null;
+    try {
+      http.createServer({ requestTimeout: null }, () => {});
+    } catch (error) {
+      nullRejected = error.code;
+    }
     const report = {
       a: [a.requestTimeout, a.headersTimeout],
       b: [b.requestTimeout, b.headersTimeout],
       c: [c.requestTimeout, c.headersTimeout, c.connectionsCheckingInterval],
+      nullRejected,
       preload: globalThis.__dohSocketIpPreload,
       listeningArgs: null,
       closeArgs: null,
@@ -360,9 +407,10 @@ test("the preload preserves createServer overloads and event signatures while ti
     a: [10_000, 5_000],
     b: [1234, 1234],
     c: [10_000, 5_000, 1_000],
+    nullRejected: "ERR_INVALID_ARG_TYPE",
     preload: true,
     listeningArgs: 0,
     closeArgs: 0,
     body: "ok",
-  }, "timeouts are clamped while native listener overloads and event argument lists stay intact");
+  }, "timeouts are clamped, null is rejected by Node, and listener overloads and event argument lists stay intact");
 });

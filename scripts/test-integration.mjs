@@ -75,7 +75,9 @@ async function startApp(env) {
 }
 
 async function stopApp(app) {
-  if (!app) return;
+  // An exit that already happened never emits again, so waiting for it would
+  // only burn the full timeout.
+  if (!app || app.child.exitCode !== null || app.child.signalCode !== null) return;
   app.child.kill("SIGTERM");
   const exited = await Promise.race([
     new Promise((resolve) => app.child.once("exit", () => resolve(true))),
@@ -103,7 +105,7 @@ before(async () => {
   const upstream = { HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${mock.address().port}/dns-query` };
   // Upstream that refuses connections, to exercise the failure path.
   const deadPort = await freePort();
-  [app, failingApp, trustedApp, untrustedApp, noProxyApp] = await Promise.all([
+  const starts = await Promise.allSettled([
     startApp(upstream),
     startApp({ HAGEZI_UPSTREAM_ENDPOINTS: `http://127.0.0.1:${deadPort}/dns-query` }),
     startApp({ ...upstream, TRUST_PROXY_HEADERS: "1", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
@@ -112,6 +114,13 @@ before(async () => {
     // exposed instance (the test client connects from loopback).
     startApp({ ...upstream, TRUSTED_PROXIES: "none", RATE_LIMIT_PER_MINUTE: String(LIMIT) }),
   ]);
+  const failure = starts.find((result) => result.status === "rejected");
+  if (failure) {
+    // Stop the servers that did start; otherwise they outlive the failed run.
+    await Promise.all(starts.filter((result) => result.status === "fulfilled").map((result) => stopApp(result.value)));
+    throw failure.reason;
+  }
+  [app, failingApp, trustedApp, untrustedApp, noProxyApp] = starts.map((result) => result.value);
 });
 
 after(async () => {

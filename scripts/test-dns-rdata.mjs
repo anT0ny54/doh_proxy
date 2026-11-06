@@ -2,8 +2,8 @@
  * Regression tests for RR-type-aware RDATA validation (src/lib/dns.ts).
  * Compression pointers may target only bytes validated as genuine domain
  * names; opaque RDATA (A/AAAA/TXT/...) contributes no targets, and
- * name-bearing RDATA (NS/CNAME/PTR/DNAME/MX/SOA/SRV/SVCB/HTTPS) must be
- * structurally exact.
+ * name-bearing RDATA (including uncompressed DNAME/KX/SVCB/HTTPS targets)
+ * must be structurally exact.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -221,15 +221,16 @@ test("pointer into the DNS header is rejected", () => {
   assert.equal(valid(response), false);
 });
 
-test("RFC 3597 name-bearing types (MINFO, RP, AFSDB, RT, PX, KX, NAPTR) become compression targets", () => {
+test("legacy name-bearing types (MINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR) become compression targets", () => {
   const owner = encodeName("example.com");
   const cases = [
     [14, [encodeName("rmail.example.com"), encodeName("email.example.com")], 0], // MINFO
     [17, [encodeName("admin.example.com"), encodeName("txt.example.com")], 0], // RP
     [18, [u16(1), encodeName("afs.example.com")], 2], // AFSDB
     [21, [u16(1), encodeName("rt.example.com")], 2], // RT
+    [24, [Buffer.alloc(18), encodeName("sig.example.com"), Buffer.from([0xaa])], 18], // SIG
     [26, [u16(1), encodeName("map822.example.com"), encodeName("mapx400.example.com")], 2], // PX
-    [36, [u16(1), encodeName("kx.example.com")], 2], // KX
+    [30, [encodeName("next.example.com"), Buffer.from([0x00, 0x40])], 0], // NXT
     [35, [u16(100), u16(10), characterString("u"), characterString("E2U+sip"), characterString(""), encodeName("sip.example.com")], 4 + 2 + 8 + 1], // NAPTR
   ];
   for (const [type, parts, nameOffsetInRdata] of cases) {
@@ -237,6 +238,29 @@ test("RFC 3597 name-bearing types (MINFO, RP, AFSDB, RT, PX, KX, NAPTR) become c
     const nameOffset = answerStart(QUERY) + owner.length + 10 + nameOffsetInRdata;
     const a = resourceRecord(Buffer.from([0xc0, nameOffset]), 1, Buffer.from([1, 2, 3, 4]));
     assert.equal(valid(buildResponse(QUERY, [rr, a])), true, `type ${type}: pointer into its RDATA name`);
+  }
+});
+
+
+test("DNAME and KX RDATA names must be uncompressed", () => {
+  const uncompressedCases = [
+    [39, encodeName("target.example.net")], // DNAME target
+    [36, Buffer.concat([u16(10), encodeName("kx.example.net")])], // KX exchanger
+  ];
+  for (const [type, rdata] of uncompressedCases) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", type, rdata)])), true,
+      `type ${type} with an uncompressed RDATA name`);
+  }
+
+  const compressedCases = [
+    [39, PTR_QUESTION], // DNAME target is a bare pointer
+    [36, Buffer.concat([u16(10), PTR_QUESTION])], // KX exchanger is a bare pointer
+    [39, Buffer.from([3, 99, 100, 110, 0xc0, 0x0c])], // DNAME target has a pointer suffix
+    [36, Buffer.concat([u16(10), Buffer.from([3, 99, 100, 110, 0xc0, 0x0c])])], // KX exchanger has a pointer suffix
+  ];
+  for (const [type, rdata] of compressedCases) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", type, rdata)])), false,
+      `type ${type} with a compressed RDATA name`);
   }
 });
 
