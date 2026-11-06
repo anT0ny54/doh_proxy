@@ -13,7 +13,7 @@ FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
-COPY next.config.ts tsconfig.json postcss.config.mjs ./
+COPY next.config.ts tsconfig.json ./
 # The homepage is statically generated and NEXT_PUBLIC_* values are inlined at
 # build time, so the public origin must be supplied as a build argument:
 #   docker build --build-arg NEXT_PUBLIC_SITE_URL=https://dns.example.com .

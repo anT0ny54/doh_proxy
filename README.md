@@ -1,6 +1,6 @@
 # FreeDNS DoH Proxy
 
-A lightweight DNS-over-HTTPS (DoH) proxy built with the Node.js runtime, using the Next.js 16, React 19, Tailwind CSS 4, and TypeScript 6 dependency lines declared in `package.json` (Node.js 22 or newer). The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
+A lightweight DNS-over-HTTPS (DoH) proxy built with the Node.js runtime, using the Next.js 16, React 19, and TypeScript 6 dependency lines declared in `package.json`, with dependency-free CSS for the homepage (Node.js 22 or newer). The service is designed around a small, fixed upstream set, bounded request/response handling, sequential failover with per-upstream circuit breakers, and process-local overload protection.
 
 ## What this project provides
 
@@ -35,7 +35,7 @@ src/app/api/doh/dns-query/         Primary HaGeZi endpoint (GET/POST/HEAD/OPTION
 src/app/api/doh/[provider]/        Fixed provider endpoints (GET/POST/HEAD/OPTIONS)
 src/app/page.tsx                   Static homepage listing the endpoints
 src/app/layout.tsx                 Root layout, metadata and viewport
-src/app/globals.css, icon.svg      Tailwind entry stylesheet and favicon
+src/app/globals.css, icon.svg      Dependency-free stylesheet and favicon
 src/components/CopyButton.tsx      Client component: copy-to-clipboard button (with fallback)
 src/lib/doh.ts                     Request handling, failover, circuit breaker, in-flight limits
 src/lib/dns.ts                     DNS wire-format validation and query/response matching
@@ -75,8 +75,7 @@ next.config.ts                     Security headers, standalone output outside V
                                    optimizer disabled
 netlify.toml                       Pins Node.js 22 for Netlify builds
 package.json, package-lock.json    Dependencies, scripts, `engines` (Node.js >=22)
-tsconfig.json, eslint.config.mjs,  TypeScript, ESLint and Tailwind/PostCSS configuration
-postcss.config.mjs
+tsconfig.json, eslint.config.mjs  TypeScript and ESLint configuration
 LICENSE                            GNU AGPL-3.0
 CHANGELOG.md                       Release history
 ```
