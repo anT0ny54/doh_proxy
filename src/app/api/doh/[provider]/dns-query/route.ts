@@ -1,4 +1,4 @@
-import { NextRequest } from "next/server";
+import type { NextRequest } from "next/server";
 import { handleDoH } from "@/lib/doh";
 import { DOH_PROVIDERS } from "@/lib/providers";
 
