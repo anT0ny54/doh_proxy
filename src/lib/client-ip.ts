@@ -4,11 +4,13 @@ import { CONFIG, SOCKET_IP_HEADER, SOCKET_IP_PRELOAD_FLAG, type ClientIpConfig }
 const MAX_HEADER_ENTRY_LENGTH = 128;
 
 /** A validated address: IPv4-mapped IPv6 is already collapsed to IPv4. */
-interface CanonicalIp {
-  readonly address: string;
-  readonly family: 4 | 6;
-  /** Eight 16-bit groups, IPv6 only. */
-  readonly groups?: readonly number[];
+type CanonicalIp =
+  | { readonly family: 4; readonly address: string }
+  /** `groups` holds the eight 16-bit groups of the address. */
+  | { readonly family: 6; readonly address: string; readonly groups: readonly number[] };
+
+function familyName(ip: CanonicalIp): "ipv4" | "ipv6" {
+  return ip.family === 4 ? "ipv4" : "ipv6";
 }
 
 /** Expands an IPv6 literal that `isIP()` has already validated into eight groups. */
@@ -79,7 +81,7 @@ function canonicalIp(raw: string): CanonicalIp | undefined {
 
 /** Rate-limit key for a canonical address: IPv4 as is, IPv6 by its /64. */
 function keyOf(ip: CanonicalIp): string {
-  if (ip.family === 4 || !ip.groups) return ip.address;
+  if (ip.family === 4) return ip.address;
   return `${ip.groups.slice(0, 4).map((group) => group.toString(16)).join(":")}::/64`;
 }
 
@@ -97,22 +99,33 @@ export function normalizeIp(raw: string): string | undefined {
 
 type Subnet = readonly [address: string, prefix: number, family: "ipv4" | "ipv6"];
 
-const NAMED_RANGES: Readonly<Record<string, readonly Subnet[]>> = {
-  loopback: [
-    ["127.0.0.0", 8, "ipv4"],
-    ["::1", 128, "ipv6"],
+// A Map, not an object literal: an entry such as "constructor" or "__proto__"
+// must not resolve to an Object.prototype property.
+const NAMED_RANGES = new Map<string, readonly Subnet[]>([
+  [
+    "loopback",
+    [
+      ["127.0.0.0", 8, "ipv4"],
+      ["::1", 128, "ipv6"],
+    ],
   ],
-  private: [
-    ["10.0.0.0", 8, "ipv4"],
-    ["172.16.0.0", 12, "ipv4"],
-    ["192.168.0.0", 16, "ipv4"],
-    ["fc00::", 7, "ipv6"],
+  [
+    "private",
+    [
+      ["10.0.0.0", 8, "ipv4"],
+      ["172.16.0.0", 12, "ipv4"],
+      ["192.168.0.0", 16, "ipv4"],
+      ["fc00::", 7, "ipv6"],
+    ],
   ],
-  linklocal: [
-    ["169.254.0.0", 16, "ipv4"],
-    ["fe80::", 10, "ipv6"],
+  [
+    "linklocal",
+    [
+      ["169.254.0.0", 16, "ipv4"],
+      ["fe80::", 10, "ipv6"],
+    ],
   ],
-};
+]);
 
 /** Compiled TRUSTED_PROXIES: `true` = any peer, otherwise a BlockList. */
 type TrustedProxyMatcher = true | BlockList;
@@ -123,7 +136,7 @@ function compileTrustedProxies(entries: readonly string[]): TrustedProxyMatcher 
   for (const entry of entries) {
     if (entry === "*") return true;
     if (entry === "none") continue;
-    const named = NAMED_RANGES[entry];
+    const named = NAMED_RANGES.get(entry);
     if (named) {
       for (const [address, prefix, family] of named) list.addSubnet(address, prefix, family);
       continue;
@@ -140,7 +153,7 @@ function compileTrustedProxies(entries: readonly string[]): TrustedProxyMatcher 
     if (prefixText !== undefined && !/^\d+$/.test(prefixText)) continue;
     const prefix = prefixText === undefined ? max : Number(prefixText);
     if (!Number.isInteger(prefix) || prefix < 0 || prefix > max) continue;
-    list.addSubnet(ip.address, prefix, ip.family === 4 ? "ipv4" : "ipv6");
+    list.addSubnet(ip.address, prefix, familyName(ip));
   }
   return list;
 }
@@ -154,7 +167,7 @@ function isTrustedProxy(peer: CanonicalIp, config: ClientIpConfig): boolean {
     matcher = compileTrustedProxies(config.trustedProxies);
     matchers.set(config, matcher);
   }
-  return matcher === true || matcher.check(peer.address, peer.family === 4 ? "ipv4" : "ipv6");
+  return matcher === true || matcher.check(peer.address, familyName(peer));
 }
 
 /**

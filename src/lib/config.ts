@@ -95,6 +95,12 @@ function parseList(value: string | undefined): string[] {
   return (value ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
 }
 
+/** Valid RFC 9110 field names; malformed entries are dropped and duplicates removed. */
+function parseHeaderNames(value: string | undefined): string[] {
+  const token = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/i;
+  return [...new Set(parseList(value).map((name) => name.toLowerCase()).filter((name) => token.test(name)))];
+}
+
 /** Valid http(s) entries of HAGEZI_UPSTREAM_ENDPOINTS; malformed ones are dropped. */
 function parseUpstreamEndpoints(value: string | undefined): string[] {
   return parseList(value).filter((endpoint) => {
@@ -126,7 +132,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ProxyConfig {
   // substitution for the normal loadConfig() call that initializes CONFIG.
   const buildPlatform = env === process.env ? process.env.DOH_BUILD_PLATFORM : undefined;
   const platform = detectPlatform(env, buildPlatform);
-  const headers = parseList(env.CLIENT_IP_HEADERS).map((name) => name.toLowerCase());
+  const headers = parseHeaderNames(env.CLIENT_IP_HEADERS);
   return Object.freeze({
     platform,
     trustProxyHeaders: parseTrust(env.TRUST_PROXY_HEADERS),

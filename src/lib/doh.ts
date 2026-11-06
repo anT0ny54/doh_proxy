@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { CLIENT_KEY_HEADER, CONFIG } from "@/lib/config";
-import { corsHeaders } from "@/lib/cors";
+import { noStoreCorsHeaders } from "@/lib/cors";
 import {
   DNS_MESSAGE,
   isValidDnsResponse,
@@ -50,7 +50,7 @@ export const MAX_IN_FLIGHT_PER_IP = 8;
 const BUSY_RETRY_AFTER_SECONDS = 1;
 // Upstream Cache-Control max-age is relayed for GET (capped) so clients can
 // cache answers; the proxy itself keeps no DNS cache.
-const MAX_RELAYED_MAX_AGE_SECONDS = 300;
+const MAX_RELAYED_MAX_AGE_SECONDS = 300n;
 
 // Circuit breaker configuration (failover endpoint only). State is per
 // runtime instance (best effort), which is enough to avoid hammering an
@@ -223,7 +223,10 @@ function recordSuccess(endpoint: string, probeToken = 0): void {
 function normalize(endpoint: string): NormalizedDoHUpstream {
   const url = new URL(endpoint);
   url.hash = "";
-  return { endpoint, href: url.href, getPrefix: `${url.href}${url.search ? "&" : "?"}` };
+  // An empty query ("https://host/dns-query?") leaves a dangling "?" in href.
+  // Strip it so the GET prefix is "https://host/dns-query?" and not "...??".
+  const href = url.search === "" ? url.href.replace(/\?$/, "") : url.href;
+  return { endpoint, href, getPrefix: `${href}${url.search ? "&" : "?"}` };
 }
 
 // Every endpoint is parsed once. The fixed and operator-set upstreams are
@@ -231,7 +234,13 @@ function normalize(endpoint: string): NormalizedDoHUpstream {
 // endpoints injected by unit tests are added later.
 const NORMALIZED_BY_ENDPOINT = new Map<string, NormalizedDoHUpstream>();
 
+function isNormalized(upstream: UpstreamInput): upstream is NormalizedDoHUpstream {
+  return "getPrefix" in upstream;
+}
+
 function normalizeUpstream(upstream: UpstreamInput): NormalizedDoHUpstream {
+  // Rotated and provider entries are already normalized; per request they pass through.
+  if (isNormalized(upstream)) return upstream;
   let normalized = NORMALIZED_BY_ENDPOINT.get(upstream.endpoint);
   if (normalized === undefined) {
     normalized = normalize(upstream.endpoint);
@@ -296,14 +305,8 @@ export function getHageziUpstreams(clientKey: string | null = null): readonly No
   return ROTATED_HAGEZI_UPSTREAMS[slot];
 }
 
-function baseHeaders(): Headers {
-  const headers = corsHeaders();
-  headers.set("Cache-Control", "no-store, max-age=0");
-  return headers;
-}
-
 function textResponse(message: string, status: number): NextResponse {
-  const headers = baseHeaders();
+  const headers = noStoreCorsHeaders();
   headers.set("Content-Type", "text/plain; charset=utf-8");
   return new NextResponse(message, { status, headers });
 }
@@ -415,6 +418,11 @@ function validateGet(url: QueryUrl): { readonly dnsParam: string; readonly query
   return { dnsParam: decoded.unpadded, query: decoded.query };
 }
 
+/** Lower-cased media type of a Content-Type value, without parameters. */
+function mediaType(value: string | null): string | undefined {
+  return value?.split(";", 1)[0].trim().toLowerCase();
+}
+
 /** Parse the HTTP Content-Length grammar (decimal digits only). */
 function parseContentLength(value: string): number | undefined {
   const digits = value.trim();
@@ -439,7 +447,7 @@ function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array 
 }
 
 async function readPostBody(request: NextRequest, deadline: number): Promise<ValidatedQuery | NextResponse> {
-  const contentType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  const contentType = mediaType(request.headers.get("content-type"));
   if (contentType !== DNS_MESSAGE) return textResponse("Unsupported Content-Type", 415);
 
   const contentLength = request.headers.get("content-length");
@@ -621,10 +629,21 @@ function fetchUpstream(
  */
 function relayedMaxAge(cacheControl: string | null, age: string | null): number {
   if (!cacheControl || /(?:^|[\s,])(?:no-store|no-cache)(?:$|[\s,=])/i.test(cacheControl)) return 0;
-  const match = /(?:^|[\s,])max-age=(\d{1,9})(?:$|[\s,])/i.exec(cacheControl);
+  const match = /(?:^|[\s,])max-age=(\d+)(?:$|[\s,])/i.exec(cacheControl);
   if (!match) return 0;
-  const spent = age !== null && /^\d{1,9}$/.test(age.trim()) ? Number(age.trim()) : 0;
-  return Math.min(Math.max(Number(match[1]) - spent, 0), MAX_RELAYED_MAX_AGE_SECONDS);
+  // Both directives use decimal delta-seconds with no digit-count limit.
+  // BigInt preserves the exact difference even when both values exceed
+  // Number.MAX_SAFE_INTEGER; only the small, capped result becomes a Number.
+  // A present but malformed Age ("1e9", "-1", "12 34") is untrustworthy, so the
+  // answer is not cached at all rather than relayed with its full max-age.
+  const maxAge = BigInt(match[1]);
+  const maxAgeLimit = MAX_RELAYED_MAX_AGE_SECONDS;
+  if (age === null) return Number(maxAge > maxAgeLimit ? maxAgeLimit : maxAge);
+  const ageValue = age.trim();
+  if (!/^\d+$/.test(ageValue)) return 0;
+  const remaining = maxAge - BigInt(ageValue);
+  if (remaining <= 0n) return 0;
+  return Number(remaining > maxAgeLimit ? maxAgeLimit : remaining);
 }
 
 export async function proxyRequest(request: NextRequest, options: DoHOptions): Promise<NextResponse> {
@@ -632,7 +651,7 @@ export async function proxyRequest(request: NextRequest, options: DoHOptions): P
   // never get here: the routes export only GET/POST/HEAD/OPTIONS, and the
   // Next.js router answers 405 for anything else.
   if (request.method === "OPTIONS" || request.method === "HEAD") {
-    return new NextResponse(null, { status: 204, headers: baseHeaders() });
+    return new NextResponse(null, { status: 204, headers: noStoreCorsHeaders() });
   }
 
   // Set (or removed) by src/proxy.ts on every request, so it is trustworthy.
@@ -749,7 +768,7 @@ async function proxyRequestInternal(
       // A 200 that is not a DNS message (captive portal, CDN error page,
       // misrouted node) does not depend on the client's query, so it counts
       // as an availability failure.
-      const contentType = result.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+      const contentType = mediaType(result.headers.get("content-type"));
       if (contentType !== DNS_MESSAGE) {
         cancelResponseBody(result);
         if (failover) recordFailure(upstream.endpoint, probe);
@@ -767,7 +786,7 @@ async function proxyRequestInternal(
 
       if (failover) recordSuccess(upstream.endpoint, probe);
 
-      const headers = baseHeaders();
+      const headers = noStoreCorsHeaders();
       headers.set("Content-Type", DNS_MESSAGE);
       // Next.js streams ArrayBuffer bodies with chunked encoding unless the
       // length is declared; DoH clients and caches expect Content-Length.

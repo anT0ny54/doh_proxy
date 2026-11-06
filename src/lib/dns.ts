@@ -17,20 +17,23 @@ const CHARACTER_STRING = -3; // length-prefixed <character-string>
 
 interface RdataLayout {
   readonly fields: readonly number[];
-  /** True when opaque data may follow the last field (SVCB/HTTPS SvcParams). */
+  /** True when opaque data may follow the last field (SIG/NXT payloads or SVCB/HTTPS SvcParams). */
   readonly opaqueTail?: boolean;
 }
 
 const SINGLE_NAME: RdataLayout = { fields: [NAME] };
+const SINGLE_NAME_UNCOMPRESSED: RdataLayout = { fields: [NAME_UNCOMPRESSED] };
 const TWO_NAMES: RdataLayout = { fields: [NAME, NAME] };
 const PREFERENCE_NAME: RdataLayout = { fields: [2, NAME] };
+const PREFERENCE_NAME_UNCOMPRESSED: RdataLayout = { fields: [2, NAME_UNCOMPRESSED] };
 // RFC 9460, section 2.2: "Compression pointers MUST NOT be used in the target name".
 const SVCB_LAYOUT: RdataLayout = { fields: [2, NAME_UNCOMPRESSED], opaqueTail: true };
 
 /**
  * Compression is accepted for the RFC 1035 types and for the types that
- * RFC 3597, section 4 says receivers SHOULD decompress (RP, AFSDB, RT, PX,
- * SRV, NAPTR). Types not listed carry no domain names: their RDATA is opaque.
+ * RFC 3597, section 4 says receivers SHOULD decompress (RP, AFSDB, RT, SIG,
+ * PX, NXT, NAPTR, SRV). Types not listed carry no domain names: their RDATA
+ * is opaque.
  */
 const RDATA_LAYOUTS: ReadonlyMap<number, RdataLayout> = new Map([
   [2, SINGLE_NAME], // NS
@@ -47,11 +50,13 @@ const RDATA_LAYOUTS: ReadonlyMap<number, RdataLayout> = new Map([
   [17, TWO_NAMES], // RP
   [18, PREFERENCE_NAME], // AFSDB
   [21, PREFERENCE_NAME], // RT
+  [24, { fields: [18, NAME], opaqueTail: true }], // SIG: fixed fields, signer name, signature
   [26, { fields: [2, NAME, NAME] }], // PX
+  [30, { fields: [NAME], opaqueTail: true }], // NXT: next domain name, type bitmap
   [33, { fields: [6, NAME] }], // SRV: priority, weight, port, target
   [35, { fields: [4, CHARACTER_STRING, CHARACTER_STRING, CHARACTER_STRING, NAME] }], // NAPTR
-  [36, PREFERENCE_NAME], // KX
-  [39, SINGLE_NAME], // DNAME
+  [36, PREFERENCE_NAME_UNCOMPRESSED], // KX (RFC 2230: RDATA MUST NOT be compressed)
+  [39, SINGLE_NAME_UNCOMPRESSED], // DNAME (RFC 6672: target MUST be uncompressed)
   [64, SVCB_LAYOUT], // SVCB
   [65, SVCB_LAYOUT], // HTTPS
 ]);

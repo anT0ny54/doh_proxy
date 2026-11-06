@@ -14,3 +14,13 @@ const CORS_ENTRIES: readonly (readonly [string, string])[] = Object.freeze([
 export function corsHeaders(): Headers {
   return new Headers(CORS_ENTRIES as [string, string][]);
 }
+
+/**
+ * CORS headers plus `Cache-Control: no-store, max-age=0`: the policy of every
+ * DoH answer, errors included, and of the 429 returned by `src/proxy.ts`.
+ */
+export function noStoreCorsHeaders(): Headers {
+  const headers = corsHeaders();
+  headers.set("Cache-Control", "no-store, max-age=0");
+  return headers;
+}
