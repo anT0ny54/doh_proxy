@@ -29,7 +29,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getClientIp } from "@/lib/client-ip";
 import { CLIENT_KEY_HEADER, CONFIG } from "@/lib/config";
-import { corsHeaders } from "@/lib/cors";
+import { noStoreCorsHeaders } from "@/lib/cors";
 import { RateLimiter } from "@/lib/rate-limit";
 
 const limiter = new RateLimiter(CONFIG.rateLimitPerMinute);
@@ -39,8 +39,7 @@ const limiter = new RateLimiter(CONFIG.rateLimitPerMinute);
 const UNKNOWN_CLIENT_KEY = "unknown-client";
 
 function tooManyRequests(retryAfterSeconds: number): NextResponse {
-  const headers = corsHeaders();
-  headers.set("Cache-Control", "no-store");
+  const headers = noStoreCorsHeaders();
   headers.set("Content-Type", "text/plain; charset=utf-8");
   headers.set("Retry-After", String(retryAfterSeconds));
   return new NextResponse("Too Many Requests", { status: 429, headers });
