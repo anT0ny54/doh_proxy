@@ -2,7 +2,7 @@ name: Docker Build and Publish
 
 on:
   workflow_dispatch:
-  # Version tags (v2.10.0) publish semver-tagged images and move `latest`;
+  # Version tags (v2.11.0) publish semver-tagged images and move `latest`;
   # the semver tag rules below only produce tags on these refs.
   push:
     tags: ["v*"]
