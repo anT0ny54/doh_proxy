@@ -2,8 +2,8 @@ name: Docker Build and Publish
 
 on:
   workflow_dispatch:
-  # Version tags (v2.11.0) publish semver-tagged images and move `latest`;
-  # the semver tag rules below only produce tags on these refs.
+  # Only a pushed version tag publishes semver-tagged images and moves `latest`.
+  # Manual dispatches remain branch/SHA-only, even when run against a tag ref.
   push:
     tags: ["v*"]
 
@@ -83,13 +83,14 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           # `latest` is owned by releases: with the default flavor
-          # `latest=auto`, a `v*` tag push moves `latest` through the semver
-          # rules. A manual run publishes only the branch name and the commit
-          # SHA, so it can no longer overwrite `latest` with an untagged commit.
+          # `latest=auto` is driven by the semver rules, which are enabled only
+          # for an actual tag push. `workflow_dispatch` can target a tag ref,
+          # so checking the event as well as the ref prevents a manual run from
+          # publishing release tags or moving `latest`.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+            type=semver,pattern={{major}},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
             type=ref,event=branch
             type=sha,format=short
           labels: |

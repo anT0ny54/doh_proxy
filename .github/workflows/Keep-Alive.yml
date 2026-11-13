@@ -14,6 +14,8 @@ permissions:
 
 jobs:
   keep-alive:
+    # Manual runs write commits, so do not target immutable Git tags.
+    if: github.event_name != 'workflow_dispatch' || github.ref_type == 'branch'
     name: Create keep-alive commit
     runs-on: ubuntu-latest
     timeout-minutes: 5

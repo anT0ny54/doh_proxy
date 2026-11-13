@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   generate-lockfile:
+    # Manual runs write commits, so do not target immutable Git tags.
+    if: github.event_name != 'workflow_dispatch' || github.ref_type == 'branch'
     name: Regenerate, verify and commit package-lock.json
     runs-on: ubuntu-latest
     timeout-minutes: 20
