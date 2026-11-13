@@ -9,7 +9,7 @@ export const MAX_DNS_MESSAGE_SIZE = 4_096;
  */
 export const MAX_DNS_RESPONSE_SIZE = 65_535;
 
-// RDATA layouts of the record types that embed domain names. A positive number
+// RDATA layouts for record types with known structured fields. A positive number
 // is a fixed-size field (bytes); the negative markers are variable fields.
 const NAME = -1; // domain name, compression allowed
 const NAME_UNCOMPRESSED = -2; // domain name, compression forbidden
@@ -17,7 +17,7 @@ const CHARACTER_STRING = -3; // length-prefixed <character-string>
 
 interface RdataLayout {
   readonly fields: readonly number[];
-  /** True when opaque data may follow the last field (SIG/NXT payloads or SVCB/HTTPS SvcParams). */
+  /** True when signature bytes may follow the final name (SIG/RRSIG). */
   readonly opaqueTail?: boolean;
 }
 
@@ -26,14 +26,15 @@ const SINGLE_NAME_UNCOMPRESSED: RdataLayout = { fields: [NAME_UNCOMPRESSED] };
 const TWO_NAMES: RdataLayout = { fields: [NAME, NAME] };
 const PREFERENCE_NAME: RdataLayout = { fields: [2, NAME] };
 const PREFERENCE_NAME_UNCOMPRESSED: RdataLayout = { fields: [2, NAME_UNCOMPRESSED] };
-// RFC 9460, section 2.2: "Compression pointers MUST NOT be used in the target name".
-const SVCB_LAYOUT: RdataLayout = { fields: [2, NAME_UNCOMPRESSED], opaqueTail: true };
+const TALINK_LAYOUT: RdataLayout = { fields: [NAME_UNCOMPRESSED, NAME_UNCOMPRESSED] };
+// RFC 4034: RRSIG has an 18-byte fixed prefix and an uncompressed Signer's Name.
+const RRSIG_LAYOUT: RdataLayout = { fields: [18, NAME_UNCOMPRESSED], opaqueTail: true };
 
 /**
- * Compression is accepted for the RFC 1035 types and for the types that
+ * Compression is accepted for the RFC 1035 types and for legacy types that
  * RFC 3597, section 4 says receivers SHOULD decompress (RP, AFSDB, RT, SIG,
- * PX, NXT, NAPTR, SRV). Types not listed carry no domain names: their RDATA
- * is opaque.
+ * PX, NXT, NAPTR, SRV). Some records have conditional layouts and are handled
+ * separately below. Unknown RDATA remains opaque by design.
  */
 const RDATA_LAYOUTS: ReadonlyMap<number, RdataLayout> = new Map([
   [2, SINGLE_NAME], // NS
@@ -46,19 +47,23 @@ const RDATA_LAYOUTS: ReadonlyMap<number, RdataLayout> = new Map([
   [9, SINGLE_NAME], // MR
   [12, SINGLE_NAME], // PTR
   [14, TWO_NAMES], // MINFO
+  [23, { fields: [CHARACTER_STRING] }], // NSAP-PTR: historical RDATA is one character-string (RFC 1348)
   [15, PREFERENCE_NAME], // MX
   [17, TWO_NAMES], // RP
   [18, PREFERENCE_NAME], // AFSDB
   [21, PREFERENCE_NAME], // RT
   [24, { fields: [18, NAME], opaqueTail: true }], // SIG: fixed fields, signer name, signature
   [26, { fields: [2, NAME, NAME] }], // PX
-  [30, { fields: [NAME], opaqueTail: true }], // NXT: next domain name, type bitmap
   [33, { fields: [6, NAME] }], // SRV: priority, weight, port, target
   [35, { fields: [4, CHARACTER_STRING, CHARACTER_STRING, CHARACTER_STRING, NAME] }], // NAPTR
   [36, PREFERENCE_NAME_UNCOMPRESSED], // KX (RFC 2230: RDATA MUST NOT be compressed)
   [39, SINGLE_NAME_UNCOMPRESSED], // DNAME (RFC 6672: target MUST be uncompressed)
-  [64, SVCB_LAYOUT], // SVCB
-  [65, SVCB_LAYOUT], // HTTPS
+  [46, RRSIG_LAYOUT], // RRSIG (RFC 4034: Signer's Name MUST be uncompressed)
+  [58, TALINK_LAYOUT], // TALINK: both linked names are uncompressed
+  [64, { fields: [2, NAME_UNCOMPRESSED] }], // SVCB; SvcParams parsed separately
+  [65, { fields: [2, NAME_UNCOMPRESSED] }], // HTTPS; SvcParams parsed separately
+  [66, { fields: [5, NAME_UNCOMPRESSED] }], // DSYNC (RFC 9859)
+  [107, PREFERENCE_NAME_UNCOMPRESSED], // LP
 ]);
 
 interface DnsCounts {
@@ -87,76 +92,78 @@ function readCounts(message: Uint8Array): DnsCounts | null {
  * Advances over a DNS name. Compression pointers may reference only earlier
  * bytes in the same DNS message, matching DNS backward-pointer semantics.
  *
- * `targets` is a per-message bitmap of offsets that this structural parser
- * permits as compression targets. Only bytes validated as part of a domain
- * name (question section, RR owner names, and RR-type-decoded RDATA names)
- * are marked; opaque RDATA contributes no targets, so a pointer cannot
- * reference arbitrary header/ttl/RDATA bytes that merely look name-like.
+ * `suffixLengths` stores expanded lengths only for suffixes of fully
+ * uncompressed names. A non-zero entry therefore marks a safe literal-label
+ * compression target and supplies its expanded wire length. Names containing
+ * a pointer are deliberately not added as targets: this rejects nested
+ * compression pointers (RFC 9267 section 2) without following pointer chains.
  */
+const MAX_NAME_LABELS = 127;
+const NAME_LABEL_OFFSETS = new Uint16Array(MAX_NAME_LABELS);
+const NAME_LABEL_LENGTHS = new Uint8Array(MAX_NAME_LABELS);
+
 function skipName(
   message: Uint8Array,
   start: number,
   allowCompression: boolean,
-  targets: Uint8Array,
+  suffixLengths: Uint8Array,
 ): number | null {
   let offset = start;
-  let nextOffset = start;
-  let jumped = false;
-  let jumps = 0;
-  let expandedNameLength = 0;
+  let labelCount = 0;
+  let suffixLength = 0;
+  let nextOffset = 0;
+  let uncompressed = false;
 
-  targets[start] = 1;
-
-  // Work is bounded without a separate step counter: an expanded name is capped
-  // at 255 bytes (at most ~127 labels) and pointer jumps are capped at 16.
   while (offset < message.byteLength) {
     const lengthOffset = offset;
     const length = message[offset];
 
     if (length === 0) {
-      expandedNameLength += 1;
-      if (expandedNameLength > 255) return null;
-      targets[offset] = 1;
-      return jumped ? nextOffset : offset + 1;
+      suffixLength = 1; // The root label occupies one wire octet.
+      suffixLengths[lengthOffset] = suffixLength;
+      nextOffset = offset + 1;
+      uncompressed = true;
+      break;
     }
 
     if ((length & 0xc0) === 0xc0) {
       if (!allowCompression || offset + 1 >= message.byteLength) return null;
 
       const pointer = ((length & 0x3f) << 8) | message[offset + 1];
-      // A pointer must target an earlier byte that has already been parsed as
-      // part of a DNS domain name. This prevents pointers into unrelated
-      // header/type/class/RDATA bytes that merely happen to look name-like.
-      // `pointer < offset < byteLength`, so no separate upper-bound check is needed.
-      if (
-        pointer < 12 ||
-        pointer >= offset ||
-        targets[pointer] === 0 ||
-        ++jumps > 16
-      ) {
-        return null;
-      }
-      // The pointer's first byte is itself the start of a valid encoded
-      // suffix, so a later name may legally point here as well.
-      targets[lengthOffset] = 1;
-      if (!jumped) {
-        nextOffset = offset + 2;
-        jumped = true;
-      }
-      offset = pointer;
-      continue;
+      // Targets must be earlier literal-label offsets in a previously
+      // validated, fully uncompressed suffix. This prevents cycles, pointers
+      // into arbitrary fields and nested pointer chains.
+      if (pointer < 12 || pointer >= offset || suffixLengths[pointer] === 0) return null;
+
+      suffixLength = suffixLengths[pointer];
+      nextOffset = offset + 2;
+      break;
     }
 
     // Not a pointer and not 0b00 (0x40/0x80 are reserved label types). After
     // this check `length` is at most 63.
     if ((length & 0xc0) !== 0 || offset + 1 + length > message.byteLength) return null;
-    targets[lengthOffset] = 1;
-    expandedNameLength += 1 + length;
-    if (expandedNameLength > 255) return null;
+    if (labelCount === MAX_NAME_LABELS) return null;
+
+    NAME_LABEL_OFFSETS[labelCount] = lengthOffset;
+    NAME_LABEL_LENGTHS[labelCount] = length + 1; // Label length octet + contents.
+    labelCount += 1;
     offset += 1 + length;
   }
 
-  return null;
+  if (nextOffset === 0) return null; // No root label or compression pointer.
+
+  // Work backward from the root or cached literal suffix. The longest legal
+  // encoded name is 255 octets, so at most 127 non-empty labels can be present.
+  // Only root-terminated names may become targets; a name ending in a pointer
+  // is valid here but is not safe as a target for another compression pointer.
+  for (let i = labelCount - 1; i >= 0; i -= 1) {
+    suffixLength += NAME_LABEL_LENGTHS[i];
+    if (suffixLength > 255) return null;
+    if (uncompressed) suffixLengths[NAME_LABEL_OFFSETS[i]] = suffixLength;
+  }
+
+  return nextOffset;
 }
 
 interface QuestionRange {
@@ -166,24 +173,335 @@ interface QuestionRange {
   readonly present: boolean;
 }
 
+function validateNsecBitmap(message: Uint8Array, start: number, end: number): boolean {
+  let offset = start;
+  let previousWindow = -1;
+
+  // RFC 4034 section 4.1.2 defines one or more ordered window blocks.
+  while (offset < end) {
+    if (offset + 2 > end) return false;
+    const window = message[offset];
+    const length = message[offset + 1];
+    offset += 2;
+
+    if (window <= previousWindow || length === 0 || length > 32 || offset + length > end) return false;
+    // Trailing zero octets are forbidden; the last byte must carry a bit.
+    if (message[offset + length - 1] === 0) return false;
+    offset += length;
+    previousWindow = window;
+  }
+
+  return offset === end && previousWindow >= 0;
+}
+
+function validateNxtBitmap(message: Uint8Array, start: number, end: number): boolean {
+  // Legacy RFC 2535 NXT uses a flat bitmap. Its own type bit (30) must be set,
+  // type zero must be clear, the bitmap is at least four octets, and trailing
+  // zero octets are not permitted.
+  const length = end - start;
+  return length >= 4 && length <= 16 &&
+    (message[start] & 0x80) === 0 &&
+    (message[start + 3] & 0x02) !== 0 &&
+    message[end - 1] !== 0;
+}
+
+type TlvValueValidator = (
+  message: Uint8Array,
+  key: number,
+  valueStart: number,
+  valueEnd: number,
+  suffixLengths: Uint8Array,
+) => boolean;
+
+function validateOrderedTlvList(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+  validateValue: TlvValueValidator,
+): boolean {
+  let offset = start;
+  let previousKey = -1;
+  let mandatoryKeys: number[] | null = null;
+  let nextMandatoryKey = 0;
+
+  while (offset < end) {
+    if (offset + 4 > end) return false;
+    const key = readUint16(message, offset);
+    const length = readUint16(message, offset + 2);
+    offset += 4;
+    const valueEnd = offset + length;
+    if (key <= previousKey || valueEnd > end ||
+        !validateValue(message, key, offset, valueEnd, suffixLengths)) return false;
+
+    if (key === 0) {
+      // The mandatory key is a non-empty, strictly increasing uint16 list.
+      // It cannot include itself, and every listed key must occur in this RR.
+      if (length < 2 || length % 2 !== 0) return false;
+      mandatoryKeys = [];
+      let previousMandatoryKey = 0;
+      for (let valueOffset = offset; valueOffset < valueEnd; valueOffset += 2) {
+        const mandatoryKey = readUint16(message, valueOffset);
+        if (mandatoryKey === 0 || mandatoryKey <= previousMandatoryKey) return false;
+        mandatoryKeys.push(mandatoryKey);
+        previousMandatoryKey = mandatoryKey;
+      }
+    } else if (mandatoryKeys !== null && nextMandatoryKey < mandatoryKeys.length) {
+      const requiredKey = mandatoryKeys[nextMandatoryKey];
+      if (requiredKey < key) return false;
+      if (requiredKey === key) nextMandatoryKey += 1;
+    }
+
+    offset = valueEnd;
+    previousKey = key;
+  }
+
+  return offset === end && (mandatoryKeys === null || nextMandatoryKey === mandatoryKeys.length);
+}
+
+function acceptOpaqueTlvValue(
+  _message: Uint8Array,
+  _key: number,
+  _valueStart: number,
+  _valueEnd: number,
+  _suffixLengths: Uint8Array,
+): boolean {
+  return true;
+}
+
+function validateSvcParams(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  // RFC 9460 section 2.2: keys are strictly increasing and values are bounded.
+  // Individual SvcParam value semantics are key-specific and intentionally
+  // remain the responsibility of an SVCB-aware client.
+  return validateOrderedTlvList(message, start, end, suffixLengths, acceptOpaqueTlvValue);
+}
+
+function validateDelegInfoValue(
+  message: Uint8Array,
+  key: number,
+  valueStart: number,
+  valueEnd: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  const length = valueEnd - valueStart;
+
+  if (key === 1) return length > 0 && length % 4 === 0; // server-ipv4
+  if (key === 2) return length > 0 && length % 16 === 0; // server-ipv6
+
+  if (key === 3 || key === 4) {
+    // server-name and include-delegparam are concatenated, uncompressed names.
+    if (length === 0) return false;
+    let offset = valueStart;
+    while (offset < valueEnd) {
+      const next = skipName(message, offset, false, suffixLengths);
+      if (next === null || next > valueEnd) return false;
+      offset = next;
+    }
+    return offset === valueEnd;
+  }
+
+  // Future DelegInfoKeys are opaque until their value formats are registered.
+  return true;
+}
+
+function validateDelegInfos(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  // DELEG/DELEGPARAM reuse ordered key/length/value framing. Keys 3 and 4
+  // contain uncompressed names; every non-empty list must also select exactly
+  // one server-information set (IPv4, IPv6, both, server-name, or include).
+  let hasIpv4 = false;
+  let hasIpv6 = false;
+  let hasServerName = false;
+  let hasIncludeDelegparam = false;
+  const valid = validateOrderedTlvList(
+    message,
+    start,
+    end,
+    suffixLengths,
+    (data, key, valueStart, valueEnd, suffixes) => {
+      if (key === 1) hasIpv4 = true;
+      else if (key === 2) hasIpv6 = true;
+      else if (key === 3) hasServerName = true;
+      else if (key === 4) hasIncludeDelegparam = true;
+      return validateDelegInfoValue(data, key, valueStart, valueEnd, suffixes);
+    },
+  );
+  if (!valid || start === end) return valid;
+
+  const hasAddressInfo = hasIpv4 || hasIpv6;
+  const hasNameInfo = hasServerName || hasIncludeDelegparam;
+  if (hasAddressInfo) return !hasNameInfo;
+  return hasServerName !== hasIncludeDelegparam;
+}
+
+function validateA6Rdata(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  if (start >= end) return false;
+  const prefixLength = message[start];
+  if (prefixLength > 128) return false;
+
+  const suffixBytes = Math.ceil((128 - prefixLength) / 8);
+  const nameStart = start + 1 + suffixBytes;
+  if (nameStart > end) return false;
+  if (prefixLength === 0) return nameStart === end;
+
+  const nameEnd = skipName(message, nameStart, false, suffixLengths);
+  return nameEnd === end;
+}
+
+function validateIpsecKeyRdata(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  if (start + 3 > end) return false;
+  const gatewayType = message[start + 1];
+  let offset = start + 3;
+
+  if (gatewayType === 1) offset += 4;
+  else if (gatewayType === 2) offset += 16;
+  else if (gatewayType === 3) {
+    const nameEnd = skipName(message, offset, false, suffixLengths);
+    if (nameEnd === null || nameEnd > end) return false;
+    offset = nameEnd;
+  } else if (gatewayType !== 0) {
+    return false;
+  }
+
+  // The remaining public-key bytes are algorithm-specific opaque data.
+  return offset <= end;
+}
+
+function validateHipRdata(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  if (start + 4 > end) return false;
+  const hitLength = message[start];
+  const publicKeyLength = readUint16(message, start + 2);
+  let offset = start + 4 + hitLength + publicKeyLength;
+  if (offset > end) return false;
+
+  // The RVS field is optional; when present it is a sequence of uncompressed
+  // domain names (RFC 8005 section 5.6).
+  while (offset < end) {
+    const nameEnd = skipName(message, offset, false, suffixLengths);
+    if (nameEnd === null || nameEnd > end) return false;
+    offset = nameEnd;
+  }
+  return offset === end;
+}
+
+function validateTkeyRdata(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  const algorithmEnd = skipName(message, start, false, suffixLengths);
+  if (algorithmEnd === null || algorithmEnd + 16 > end) return false;
+
+  // Inception(4), expiration(4), mode(2), error(2), key size(2).
+  let offset = algorithmEnd + 12;
+  const keyLength = readUint16(message, offset);
+  offset += 2 + keyLength;
+  if (offset + 2 > end) return false;
+  const otherLength = readUint16(message, offset);
+  offset += 2;
+  return offset + otherLength === end;
+}
+
+function validateTsigRdata(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  const algorithmEnd = skipName(message, start, false, suffixLengths);
+  if (algorithmEnd === null || algorithmEnd + 10 > end) return false;
+
+  // Time Signed(6), Fudge(2), MAC Size(2), MAC, Original ID(2),
+  // Error(2), Other Len(2), Other Data.
+  const macLength = readUint16(message, algorithmEnd + 8);
+  let offset = algorithmEnd + 10 + macLength;
+  if (offset + 6 > end) return false;
+  const otherLength = readUint16(message, offset + 4);
+  offset += 6;
+  return offset + otherLength === end;
+}
+
+function validateAmtrelayRdata(
+  message: Uint8Array,
+  start: number,
+  end: number,
+  suffixLengths: Uint8Array,
+): boolean {
+  if (start + 2 > end) return false;
+  const relayType = message[start + 1] & 0x7f;
+  const relayStart = start + 2;
+  if (relayType === 0) return relayStart === end;
+  if (relayType === 1) return relayStart + 4 === end;
+  if (relayType === 2) return relayStart + 16 === end;
+  if (relayType === 3) {
+    const nameEnd = skipName(message, relayStart, false, suffixLengths);
+    return nameEnd === end;
+  }
+  // Undefined relay types have no standardized shape; preserve their opaque
+  // payload rather than interpreting arbitrary bytes as a domain name.
+  return true;
+}
+
 /**
- * Validates the domain names embedded in RDATA for the record types listed in
- * RDATA_LAYOUTS, marking only the validated name bytes as compression targets.
- * Returns false when name-bearing RDATA is malformed; returns true for types
- * whose RDATA carries no names (their bytes stay opaque and never become
- * compression targets).
+ * Validates the domain names and selected variable-length field framing in
+ * RDATA for RR types with known wire layouts. Only suffixes of fully
+ * uncompressed names become eligible compression targets. Unknown RDATA is
+ * deliberately opaque and never contributes compression targets.
  */
 function validateRdataNames(
   message: Uint8Array,
   type: number,
   rdataStart: number,
   rdLength: number,
-  targets: Uint8Array,
+  suffixLengths: Uint8Array,
 ): boolean {
+  const end = rdataStart + rdLength;
+
+  // Records with conditional fields are clearer and safer as explicit parsers.
+  if (type === 38) return validateA6Rdata(message, rdataStart, end, suffixLengths);
+  if (type === 45) return validateIpsecKeyRdata(message, rdataStart, end, suffixLengths);
+  if (type === 54 || type === 61440) return validateDelegInfos(message, rdataStart, end, suffixLengths);
+  if (type === 55) return validateHipRdata(message, rdataStart, end, suffixLengths);
+  if (type === 249) return validateTkeyRdata(message, rdataStart, end, suffixLengths);
+  if (type === 250) return validateTsigRdata(message, rdataStart, end, suffixLengths);
+  if (type === 260) return validateAmtrelayRdata(message, rdataStart, end, suffixLengths);
+
+  if (type === 47 || type === 30) {
+    const nameEnd = skipName(message, rdataStart, type === 30, suffixLengths);
+    if (nameEnd === null || nameEnd > end) return false;
+    return type === 47
+      ? validateNsecBitmap(message, nameEnd, end)
+      : validateNxtBitmap(message, nameEnd, end);
+  }
+
   const layout = RDATA_LAYOUTS.get(type);
   if (!layout) return true;
 
-  const end = rdataStart + rdLength;
   let offset = rdataStart;
   for (const field of layout.fields) {
     if (field > 0) {
@@ -195,16 +513,19 @@ function validateRdataNames(
       if (offset > end) return false;
     } else {
       if (offset >= end) return false;
-      const next = skipName(message, offset, field === NAME, targets);
+      const next = skipName(message, offset, field === NAME, suffixLengths);
       if (next === null || next > end) return false;
       offset = next;
     }
   }
+
+  if ((type === 24 || type === 46) && offset === end) return false; // SIG/RRSIG needs signature bytes.
+  if (type === 64 || type === 65) return validateSvcParams(message, offset, end, suffixLengths);
   return layout.opaqueTail ? offset <= end : offset === end;
 }
 
-function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8Array): number | null {
-  let offset = skipName(message, start, true, targets);
+function parseResourceRecord(message: Uint8Array, start: number, suffixLengths: Uint8Array): number | null {
+  let offset = skipName(message, start, true, suffixLengths);
   if (offset === null || offset + 10 > message.byteLength) return null;
 
   const type = readUint16(message, offset);
@@ -215,22 +536,24 @@ function parseResourceRecord(message: Uint8Array, start: number, targets: Uint8A
   const end = offset + rdLength;
   if (end > message.byteLength) return null;
 
-  // Only bytes decoded as genuine domain names become compression targets;
-  // never the RDATA region as a whole.
-  if (!validateRdataNames(message, type, offset, rdLength, targets)) return null;
+  // Only suffixes of fully uncompressed decoded names become compression
+  // targets; opaque RDATA and compressed names contribute none.
+  if (!validateRdataNames(message, type, offset, rdLength, suffixLengths)) return null;
   return end;
 }
 
-// Validation is synchronous, so one scratch bitmap sized for the largest
-// accepted response is reused instead of allocating up to 64 KiB per message.
-const SCRATCH_TARGETS = new Uint8Array(MAX_DNS_RESPONSE_SIZE);
+// Validation is synchronous, so one scratch suffix-length table sized for the
+// largest accepted response is reused instead of allocating up to 64 KiB per
+// message. Each entry is zero for an invalid target or 1–255 for a validated
+// suffix's expanded wire length.
+const SCRATCH_SUFFIX_LENGTHS = new Uint8Array(MAX_DNS_RESPONSE_SIZE);
 
-/** A zeroed compression-target bitmap for a message of `length` bytes. */
-function compressionTargets(length: number): Uint8Array {
-  if (length > SCRATCH_TARGETS.byteLength) return new Uint8Array(length);
-  const targets = SCRATCH_TARGETS.subarray(0, length);
-  targets.fill(0);
-  return targets;
+/** A zeroed compression-suffix table for a message of `length` bytes. */
+function compressionSuffixLengths(length: number): Uint8Array {
+  if (length > SCRATCH_SUFFIX_LENGTHS.byteLength) return new Uint8Array(length);
+  const suffixLengths = SCRATCH_SUFFIX_LENGTHS.subarray(0, length);
+  suffixLengths.fill(0);
+  return suffixLengths;
 }
 
 function validateStructure(message: Uint8Array, expectedResponse: boolean): QuestionRange | null {
@@ -251,12 +574,12 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
   // relaying for them must not 502 across the whole failover list.
   if (expectedResponse ? counts.questions > 1 : counts.questions !== 1) return null;
 
-  const targets = compressionTargets(message.byteLength);
+  const suffixLengths = compressionSuffixLengths(message.byteLength);
   let question: QuestionRange;
   if (counts.questions === 1) {
     // Question QNAME compression stays rejected: a response question is the
     // first name in the message, so there is no earlier name to point at.
-    const questionNameEnd = skipName(message, 12, false, targets);
+    const questionNameEnd = skipName(message, 12, false, suffixLengths);
     if (questionNameEnd === null || questionNameEnd + 4 > message.byteLength) return null;
     question = { end: questionNameEnd + 4, typeOffset: questionNameEnd, present: true };
   } else {
@@ -267,7 +590,7 @@ function validateStructure(message: Uint8Array, expectedResponse: boolean): Ques
 
   const recordCount = counts.answers + counts.authorities + counts.additionals;
   for (let i = 0; i < recordCount; i += 1) {
-    const nextOffset = parseResourceRecord(message, offset, targets);
+    const nextOffset = parseResourceRecord(message, offset, suffixLengths);
     if (nextOffset === null) return null;
     offset = nextOffset;
   }

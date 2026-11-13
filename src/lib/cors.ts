@@ -11,7 +11,7 @@ const CORS_ENTRIES: readonly (readonly [string, string])[] = Object.freeze([
  * CORS headers shared by every DoH response, including the 429 returned by
  * `src/proxy.ts`, so browser-based DoH clients can read all of them.
  */
-export function corsHeaders(): Headers {
+function corsHeaders(): Headers {
   return new Headers(CORS_ENTRIES as [string, string][]);
 }
 

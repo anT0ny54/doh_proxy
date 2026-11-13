@@ -607,7 +607,7 @@ function fetchUpstream(
   upstream: NormalizedDoHUpstream,
   dnsSearch: string | undefined,
   body: ArrayBuffer | undefined,
-  deadline: AbortSignal,
+  attemptSignal: AbortSignal,
 ): Promise<Response> {
   const headers = new Headers({ Accept: DNS_MESSAGE, "User-Agent": USER_AGENT });
   if (body !== undefined) headers.set("Content-Type", DNS_MESSAGE);
@@ -616,10 +616,52 @@ function fetchUpstream(
     method: request.method,
     headers,
     body,
-    signal: request.signal ? AbortSignal.any([deadline, request.signal]) : deadline,
+    signal: request.signal ? AbortSignal.any([attemptSignal, request.signal]) : attemptSignal,
     cache: "no-store",
     redirect: "error",
   });
+}
+
+/**
+ * Finds Cache-Control directives without treating commas inside quoted
+ * extension values as separators. Returns null for malformed quoting or when
+ * no usable max-age is present. If max-age occurs more than once, RFC 9111
+ * permits using the first occurrence; no-cache/no-store always win.
+ */
+function parseCacheControlMaxAge(cacheControl: string): string | null {
+  let start = 0;
+  let quoted = false;
+  let escaped = false;
+  let maxAge: string | null = null;
+
+  for (let offset = 0; offset <= cacheControl.length; offset += 1) {
+    const character = cacheControl[offset];
+    if (offset === cacheControl.length || (character === "," && !quoted)) {
+      const directive = cacheControl.slice(start, offset).trim();
+      start = offset + 1;
+
+      if (!directive) continue;
+      const equals = directive.indexOf("=");
+      const name = (equals < 0 ? directive : directive.slice(0, equals)).trim().toLowerCase();
+      if (name === "no-store" || name === "no-cache") return null;
+      if (name === "max-age" && maxAge === null) {
+        const value = equals < 0 ? "" : directive.slice(equals + 1).trim();
+        if (!/^\d+$/.test(value)) return null;
+        maxAge = value;
+      }
+      continue;
+    }
+
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+    } else if (character === '"') {
+      quoted = true;
+    }
+  }
+
+  return quoted || escaped ? null : maxAge;
 }
 
 /**
@@ -628,15 +670,15 @@ function fetchUpstream(
  * upstream cache. 0 means "do not cache".
  */
 function relayedMaxAge(cacheControl: string | null, age: string | null): number {
-  if (!cacheControl || /(?:^|[\s,])(?:no-store|no-cache)(?:$|[\s,=])/i.test(cacheControl)) return 0;
-  const match = /(?:^|[\s,])max-age=(\d+)(?:$|[\s,])/i.exec(cacheControl);
-  if (!match) return 0;
+  if (!cacheControl) return 0;
+  const maxAgeValue = parseCacheControlMaxAge(cacheControl);
+  if (maxAgeValue === null) return 0;
   // Both directives use decimal delta-seconds with no digit-count limit.
   // BigInt preserves the exact difference even when both values exceed
   // Number.MAX_SAFE_INTEGER; only the small, capped result becomes a Number.
   // A present but malformed Age ("1e9", "-1", "12 34") is untrustworthy, so the
   // answer is not cached at all rather than relayed with its full max-age.
-  const maxAge = BigInt(match[1]);
+  const maxAge = BigInt(maxAgeValue);
   const maxAgeLimit = MAX_RELAYED_MAX_AGE_SECONDS;
   if (age === null) return Number(maxAge > maxAgeLimit ? maxAgeLimit : maxAge);
   const ageValue = age.trim();
@@ -788,9 +830,8 @@ async function proxyRequestInternal(
 
       const headers = noStoreCorsHeaders();
       headers.set("Content-Type", DNS_MESSAGE);
-      // Next.js streams ArrayBuffer bodies with chunked encoding unless the
-      // length is declared; DoH clients and caches expect Content-Length.
-      headers.set("Content-Length", String(responseBody.byteLength));
+      // No Content-Length is set: Next.js discards a Content-Length from a route
+      // handler (send-response.js) and frames the body as chunked anyway.
       if (request.method === "GET") {
         const maxAge = relayedMaxAge(result.headers.get("cache-control"), result.headers.get("age"));
         if (maxAge > 0) headers.set("Cache-Control", `private, max-age=${maxAge}`);

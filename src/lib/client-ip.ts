@@ -176,7 +176,9 @@ function isTrustedProxy(peer: CanonicalIp, config: ClientIpConfig): boolean {
  * right is the first one a client could not have written itself.
  */
 function pickForwarded(value: string, hops: number): string | undefined {
-  const entries = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  // Preserve empty fields: filtering them would shift the trusted-hop index
+  // and could select an earlier, client-supplied address from a malformed chain.
+  const entries = value.split(",").map((entry) => entry.trim());
   return entries[entries.length - hops];
 }
 
