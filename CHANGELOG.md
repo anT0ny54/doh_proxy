@@ -3,77 +3,87 @@
 ## [2.11.0] - 2026-11-06
 
 The version is unchanged. The entry below is the latest modified log for this
-release, followed by the 2.11.0 release notes.
+release (review pass, 2026-11-14; fourth merged-tree audit).
 
 ### Modified
 
 #### Fixed
-- DNS response validation: compressed names were accepted in DNAME and KX
-  RDATA even though RFC 6672 requires an uncompressed DNAME target and RFC
-  2230 prohibits compression in KX RDATA. Both record types now require
-  uncompressed names; regression tests cover bare pointers and pointer suffixes.
-- DNS response validation: added the legacy SIG signer-name and NXT
-  next-domain-name layouts. RFC 3597 also recommends decompressing these names
-  when processing existing records, so valid later pointers into them are now
-  accepted rather than rejected as references into opaque RDATA.
-- `TRUSTED_PROXIES`: an entry that names an `Object.prototype` property (for
-  example `constructor`, `toString`, `__proto__`) was resolved as a named range
-  and made every request that reached the trust check fail with a `TypeError`.
-  Named ranges are now looked up in a `Map`; such entries are ignored.
-- `HAGEZI_UPSTREAM_ENDPOINTS`: an entry ending in a bare `?` produced a GET
-  target of `...dns-query??dns=...`. The separator is now added once, and the
-  POST target no longer carries the dangling `?`.
-- `server/socket-ip-preload.cjs`: an explicit `null` timeout was silently
-  replaced by the default, contrary to the file's comment and to Node, which
-  rejects `null`. `null` now reaches Node unchanged. The headers-timeout clamp
-  applies only to numbers, so `null` cannot turn it into `0`.
-- Cache relay: a present but malformed upstream `Age` (for example `1e9`, `-1`,
-  `12 34`) was treated as zero and the full `max-age` was relayed. Such answers
-  are now not cached (`Cache-Control: no-store, max-age=0`).
-- Cache relay: valid upstream `max-age` values longer than nine digits were
-  ignored, and large `max-age`/`Age` pairs could lose precision. Decimal values
-  are now compared with exact integer arithmetic and the relayed lifetime is
-  capped at 300 seconds.
-- Circuit-breaker documentation: the README stated that late results from older
-  non-probe requests never restart a cooldown or close the breaker. The code
-  applies that protection only while a half-open probe is active. The README now
-  states the rule as implemented.
-- `scripts/test-integration.mjs`: when one of the five servers failed to start,
-  the others were left running. All started servers are stopped first. A server
-  that has already exited is no longer waited for during teardown (that wait
-  burned the full 10-second timeout).
+- Docker image SemVer tags are now enabled only for a `push` event to a tag. A manual `workflow_dispatch` run against a version-tag ref could otherwise publish release tags and move `latest`, contradicting the documented branch/SHA-only behavior. The workflow and README now agree.
+- The lockfile-updater and keep-alive workflows now skip manual runs dispatched from tag refs. Both workflows create commits and push to `GITHUB_REF_NAME`; a tag ref is not a writable branch target. Scheduled keep-alive runs and branch-based manual runs are unchanged.
+- Cache-Control freshness parsing now recognizes commas only outside quoted
+  extension values. A `max-age`-looking token inside a quoted extension could
+  previously be mistaken for a real directive and grant freshness the upstream
+  did not provide; real `no-cache`/`no-store` directives and malformed quoting
+  now fail closed. Regression tests cover both false-positive and real directives.
+- NSAP-PTR (type 23) RDATA is validated as its historical single
+  character-string, not as a domain name. The prior layout could reject valid
+  records and incorrectly treat string contents as eligible compression targets.
+- DELEG/DELEGPARAM validation now rejects non-empty DelegInfo lists without
+  exactly one allowed server-information set. Previously, incompatible sets
+  such as IPv4 plus server-name could pass; tests cover the valid address/name
+  alternatives and invalid mixtures.
+- DNS compression suffix indexing now includes the root label. A valid backward
+  pointer to the root QNAME or to the root suffix of another fully uncompressed
+  name was previously rejected; regression tests cover both forms.
+- `X-Forwarded-For` parsing now preserves empty list fields while counting
+  `TRUSTED_PROXY_HOPS`. Previously, filtering empty fields could shift the
+  selected position and use an earlier client-supplied address when a trusted
+  proxy chain was malformed. An empty or invalid selected hop now fails closed
+  to the socket-address fallback; regression coverage was added.
+- DNSSEC response validation now parses RRSIG (type 46) Signer's Name and
+  NSEC (type 47) Next Domain Name as uncompressed domain names, as required by
+  RFC 4034. They were previously treated as opaque RDATA, so truncated or
+  illegally compressed embedded names could pass structural validation, and
+  valid names could not be used as compression targets by later records.
+- DNS compression pointers now target only literal-label suffixes from earlier,
+  fully uncompressed names. Nested pointer chains are rejected instead of
+  followed, following RFC 9267 section 2; cached suffix lengths keep accepted
+  pointer resolution bounded without repeated pointer traversal.
+- Chunked framing: the DoH handler set a `Content-Length` header on successful
+  answers, but Next.js discards that header from route handlers
+  (`send-response.js`), so it never reached clients. The dead header is removed.
+  `README.md` and the integration suite previously described and asserted an
+  explicit `Content-Length` that the server never sent; they now state and test
+  the real chunked framing.
 
 #### Changed
-- All DoH answers and the rate limiter's `429` share one header policy, from
-  `noStoreCorsHeaders()` in `src/lib/cors.ts`. The `429` `Cache-Control` value is
-  now `no-store, max-age=0` (it was `no-store`); DoH answers already sent that
-  value. Both mean "do not cache".
+- `fetchUpstream` names its per-attempt abort signal `attemptSignal` (it was
+  called `deadline`, which was misleading). Behavior is unchanged.
+- `README.md` now documents the DNSSEC RDATA layouts, their compression rules,
+  the nested-pointer rejection policy, and fail-closed handling of empty
+  `X-Forwarded-For` hop fields. The unrelated Bandwidth Hero Server blurb was
+  removed from the related-projects section.
+- The second full-project audit expanded the known DNS RDATA layouts to cover
+  the historical NSAP-PTR character-string layout, A6, IPSECKEY, HIP, TALINK,
+  LP, TKEY, TSIG, AMTRELAY, DSYNC, and the currently assigned DELEGPARAM/DELEG
+  types. DNSSEC bitmap and ordered
+  parameter framing checks were expanded at the same time. SVCB/HTTPS and
+  DELEG/DELEGPARAM mandatory-key lists are now checked for ordering, valid
+  contents, and the presence of every referenced key; invalid empty mandatory
+  parameters previously used by SVCB regression fixtures were corrected.
 
 #### Removed (no behavior change)
-- Duplicated header construction in `src/proxy.ts` and `src/lib/doh.ts`.
-- Duplicated `Content-Type` media-type parsing in `src/lib/doh.ts` (now `mediaType()`).
-- Duplicated IPv4/IPv6 family mapping and an unreachable branch in
-  `src/lib/client-ip.ts` (`CanonicalIp` is now a discriminated union).
-- Eight copies of the same fake-monotonic-clock setup in `scripts/test-doh.mjs`
-  (now one `withManualClock()` helper).
-- A value-level `import` of the `NextRequest` type in the provider route.
+- The unused `corsHeaders` export in `src/lib/cors.ts`; it is only used inside
+  that module.
+- The obsolete NXT entry in the generic RDATA layout table (NXT now has a
+  dedicated bitmap validator), and redundant SVCB/HTTPS opaque-tail flags
+  (their SvcParam lists are parsed explicitly).
+- A garbled comment in `scripts/test-doh.mjs` (the half-open breaker test).
 
-#### Optimized
-- Upstreams that are already normalized (HaGeZi rotation and provider routes)
-  pass through without a per-request lookup.
-- The Docker image build skips the audit and funding lookups of `npm ci`.
-
-#### Tests
-- Regression tests added: named-range lookup with prototype names; bare trailing
-  `?` on an override endpoint; malformed upstream `Age`; `null` preload timeout
-  rejected by Node; large `max-age` values and exact `max-age`/`Age` differences;
-  compressed DNAME/KX RDATA rejection and legacy SIG/NXT compression targets.
-- `npm test`: 127 of 127 pass on Node.js 22.16.0. The test helper used the
-  available global TypeScript 5.8.3 because the repository's dependency install
-  did not complete in this environment.
-- Strict type check of `src/lib` passes with unused-locals and unused-parameters
-  enabled (checked with a `next/server` type shim).
-- Not run in this environment: a complete `npm ci` (it timed out with package
-  directories left incomplete), ESLint, the application type check, `next build`,
-  the integration suite (`npm run test:integration`) and the Docker smoke test.
-
+#### Verified
+- `npm test`: 144 of 144 pass on Node.js 22.16.0. The regression suite covers
+  root-label compression targets, NSAP-PTR character-string framing, valid and
+  invalid DELEG server-information sets, empty X-Forwarded-For hop fields, and
+  the additional RR-layout, bitmap, and ordered-parameter cases, plus quoted
+  Cache-Control extension handling. The test helper used the available
+  TypeScript 5.8.3 transpiler through a temporary
+  workspace symlink; the project manifest and lockfile remain pinned to
+  TypeScript 6.0.3. A standalone strict TypeScript compile of `src/lib/dns.ts`
+  also passed.
+- The workspace has no installed Next.js, React or Node.js type dependencies.
+  A full `tsc --noEmit` therefore cannot resolve those packages, and lint,
+  production build and integration tests could not be rerun in this pass. The
+  previous full-environment verification recorded for this release passed
+  lint, typecheck and build, with 16 of 16 integration tests passing on Node.js
+  22.23.4. The earlier `npm ci --ignore-scripts` attempt did not finish within
+  its 120-second network window.

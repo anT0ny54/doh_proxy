@@ -134,7 +134,7 @@ The proxy implements the RFC 8484 DoH request format:
 - An unknown provider id on `/api/doh/<provider>/dns-query` returns `404` from the router (`generateStaticParams()` + `dynamicParams = false`).
 - The rate limiter in `src/proxy.ts` runs before routing. Every request under `/api/doh/` except `HEAD` and `OPTIONS` counts against the client's budget, including unsupported methods and unknown provider ids, and once the budget is spent those get `429` instead of `405` or `404`.
 - Responses from the DoH handler carry permissive CORS headers (`Access-Control-Allow-Origin: *`, methods `GET, POST, HEAD, OPTIONS`, headers `Accept, Content-Type, Cache-Control`, exposed header `Retry-After`, preflight cache `Access-Control-Max-Age: 86400`). The `429` returned by the rate limiter carries the same CORS headers and `Cache-Control` value (both from `src/lib/cors.ts`, so every DoH answer and the 429 share one policy) plus `Retry-After`.
-- Successful answers carry an explicit `Content-Length` (Next.js would otherwise use chunked encoding).
+- Successful answers use chunked transfer encoding and carry no `Content-Length`. Next.js discards the `Content-Length` a route handler sets (`next/dist/server/send-response.js`), so the handler does not set one, and `scripts/test-integration.mjs` asserts its absence.
 - Upstream requests are sent with `User-Agent: FreeDNS-DoH/<version>` (`PROXY_VERSION`), `Accept: application/dns-message`, `cache: no-store` and `redirect: error`.
 
 Status codes returned by the proxy itself (error bodies are `text/plain`; a successful answer is `application/dns-message`; `204` has no body):
@@ -176,7 +176,11 @@ Request handling is bounded:
 - Failover stops (no further attempt is made) once less than 100 ms of the request deadline remains, so a slow client cannot make healthy upstreams look unhealthy.
 - **Circuit breaker (primary endpoint only):** an upstream that accumulates 3 failures (timeout, network error, retryable status: 408, 425, 429, 500, 502, 503 or 504, or a `200` that is not `application/dns-message`, such as a captive portal or CDN error page), each within 30 seconds of the previous one and without an intervening success, is skipped for 30 seconds, after which one half-open probe is allowed. Isolated failures further apart than 30 seconds do not accumulate. The probe slot is reserved only when an attempt on that upstream actually starts, so a recovered upstream is not locked out when an earlier upstream answers first. Each probe carries an ownership token, so only the attempt that claimed it can release it (a request that skipped the upstream cannot clear another request's probe). While a half-open probe is active, a late failure or success from an older non-probe request cannot clear that probe, close the breaker, or restart its cooldown; only the probe's own result decides whether the breaker closes or re-opens. Outside a probe, a late success is evidence that the upstream answers and closes the breaker, and a late failure counts toward the threshold like any other failure. Every attempt reports back within the request deadline; a 5 second probe TTL exists only as a safety net. Cooldown, failure-window and probe-TTL accounting use monotonic `performance.now()` time, so wall-clock corrections cannot prematurely expire a cooldown or active probe lease. If every upstream is open, the set is still probed, but each upstream by at most one request at a time; concurrent requests that find every probe slot taken get `502` at once instead of piling onto dead upstreams. Non-retryable upstream statuses and invalid DNS bodies (which a crafted query can provoke) do not increment the breaker, and when they answer a half-open probe they release the slot immediately. Provider routes have a single upstream and keep no breaker state. State is per process.
 
-DNS validation checks message size, header flags/opcode, exactly one Question in queries (responses may carry one Question or, rarely, none; see above), section boundaries, name encoding, backward compression pointers, and the complete message structure. Compression pointers may only target bytes validated as part of a domain name: the Question, record owner names and the names inside the RDATA of NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR, MINFO, MX, RP, AFSDB, RT, SIG, PX, NXT, SRV, NAPTR, KX, DNAME and SVCB/HTTPS (a table-driven layout in `dns.ts`). The RFC 3597 types RP/AFSDB/RT/SIG/PX/NXT/SRV/NAPTR are included because receivers should decompress them; DNAME targets, KX exchangers and SVCB/HTTPS targets must be uncompressed, per RFC 6672, RFC 2230 and RFC 9460. RDATA of every other type is opaque, so a pointer into it is rejected. Upstream responses must be `200 application/dns-message`, structurally valid, and match the original query transaction ID and, when present, the Question section before they are relayed.
+DNS validation checks message size, header flags/opcode, exactly one Question in queries (responses may carry one Question or, rarely, none; see above), section boundaries, DNS name encoding, and the framing of known RDATA layouts. It does not attempt full RR-specific semantic validation: unknown RDATA and key-specific values whose format is not needed to locate names remain opaque.
+
+Compression pointers are backward-only and may target only literal-label suffixes recorded from previously validated, fully uncompressed names, including the root label itself. The Question, record owner names, and supported legacy name-bearing RDATA (NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR, MINFO, MX, RP, AFSDB, RT, SIG, PX, NXT, SRV and NAPTR) can contribute targets. Compressed forms are tolerated for the legacy formats where historical receivers need to decompress them; newer name-bearing formats are checked as uncompressed, including KX, DNAME, A6 prefix names, IPSECKEY gateway names, HIP RVS names, TALINK, LP, TKEY and TSIG algorithm names, AMTRELAY relay names, DSYNC targets, RRSIG Signer's Names, NSEC Next Domain Names, and SVCB/HTTPS TargetNames. The deprecated NSAP-PTR (type 23) instead uses its historical single character-string RDATA; its contents are not domain names and never become compression targets. DELEGPARAM (type 54) and DELEG (type 61440) DelegInfo keys `server-name` and `include-delegparam` are parsed as concatenated uncompressed names. Unknown DelegInfo values remain opaque.
+
+The validator also checks NSEC window-block and legacy NXT bitmap framing, strictly increasing SVCB/HTTPS SvcParam key ordering and bounds, and DELEG/DELEGPARAM DelegInfo ordering and bounds (including the known IPv4/IPv6 lengths and mandatory-key lists). A mandatory-key list must be non-empty, strictly increasing, exclude key 0, and reference keys present in the same record. A non-empty DelegInfo list must contain exactly one supported server-information set: IPv4, IPv6, both address families, server-name, or include-delegparam. It does not validate every SvcParam's key-specific value format. Nested compression-pointer chains are rejected rather than followed; only suffixes from fully uncompressed names can become later pointer targets. This is a deliberately strict parser policy aligned with the security guidance in RFC 9267 section 2, while retaining a bounded lookup for accepted pointers. RDATA not covered by a known layout is opaque and never contributes compression targets. Upstream responses must be `200 application/dns-message`, pass these structural checks, and match the original query transaction ID and, when present, the Question section before they are relayed.
 
 ## Primary upstreams
 
@@ -215,7 +219,7 @@ The trusted header defaults to the one the platform edge sets itself, so a clien
 | Netlify | `x-nf-client-connection-ip` |
 | Self-hosted (Docker, `npm start`) | `x-forwarded-for` |
 
-For `X-Forwarded-For`, the entry `TRUSTED_PROXY_HOPS` from the right is used (default `1`: the entry appended by the nearest proxy). With two trusted proxies in a chain (for example a CDN in front of nginx), set `TRUSTED_PROXY_HOPS=2`. If that entry is missing or not an IP, the request falls back to the socket address; it never falls back to a client-written entry. A Cloudflare-fronted deployment can set `CLIENT_IP_HEADERS=cf-connecting-ip` instead.
+For `X-Forwarded-For`, the entry `TRUSTED_PROXY_HOPS` from the right is used (default `1`: the entry appended by the nearest proxy). With two trusted proxies in a chain (for example a CDN in front of nginx), set `TRUSTED_PROXY_HOPS=2`. Empty fields are kept in their original positions; if the selected entry is missing or not an IP, the request falls back to the socket address rather than shifting to an earlier, client-supplied entry. A Cloudflare-fronted deployment can set `CLIENT_IP_HEADERS=cf-connecting-ip` instead.
 
 #### Trusted proxies
 
@@ -262,7 +266,7 @@ All runtime variables above are parsed once at startup by `src/lib/config.ts`; r
 - The image optimizer is disabled (`images: { unoptimized: true }`); the app never uses `next/image`, so the optimizer endpoint and its `sharp` code path are not reachable.
 - Request and response sizes are explicitly bounded to keep memory use predictable.
 - Response validation rejects malformed or mismatched DNS answers before relay.
-- GET DoH responses relay a usable upstream `Cache-Control: max-age=N`, minus the upstream `Age`, as `private, max-age=N`, capped at 300 seconds. Decimal `max-age` and `Age` values are compared without floating-point precision loss, including values longer than nine digits. A present but malformed `Age` (anything other than decimal digits) is not cached at all. POST and error responses use `Cache-Control: no-store, max-age=0`. The proxy does not implement an application DNS cache.
+- GET DoH responses relay a usable upstream `Cache-Control: max-age=N`, minus the upstream `Age`, as `private, max-age=N`, capped at 300 seconds. Cache-Control is parsed as comma-separated directives without treating commas inside quoted extension values as separators; only actual `max-age`, `no-cache` and `no-store` directives affect freshness. Malformed quoting, a malformed `Age` (anything other than decimal digits), or an actual `no-cache`/`no-store` directive makes the answer uncacheable. Decimal `max-age` and `Age` values are compared without floating-point precision loss, including values longer than nine digits. POST and error responses use `Cache-Control: no-store, max-age=0`. The proxy does not implement an application DNS cache.
 - The strict document CSP is applied only to the homepage. Every route (API included) gets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, a restrictive `Permissions-Policy` and `Cross-Origin-Resource-Policy: cross-origin`; the `X-Powered-By` header is disabled. A CSP has no effect on `application/dns-message` bodies.
 - A public DoH service can still consume significant bandwidth under abuse, so platform or gateway traffic controls remain important.
 
@@ -301,7 +305,7 @@ The Docker image (`node:22-alpine`, non-root `node` user, `NODE_OPTIONS=--max-ol
 node --require ./socket-ip-preload.cjs server.js
 ```
 
-The `Docker Build and Publish` workflow runs on demand and on `v*` tags. It runs lint, type check and unit tests first, then builds the image locally and runs the same DoH smoke test as CI (`scripts/docker-smoke-test.mjs`) before pushing. A `v*` tag publishes the semver tags (`2.11.0`, `2.11`, `2`) and moves `latest`. A manual run publishes only the branch name and the short commit SHA, so it never overwrites `latest`. The workflow passes the repository variable `NEXT_PUBLIC_SITE_URL` as the build argument and falls back to `http://localhost:8367` when it is unset. All actions in every workflow are pinned to commit SHAs.
+The `Docker Build and Publish` workflow runs on demand and on `v*` tags. It runs lint, type check and unit tests first, then builds the image locally and runs the same DoH smoke test as CI (`scripts/docker-smoke-test.mjs`) before pushing. Only a `push` event for a `v*` tag publishes semver tags (`2.11.0`, `2.11`, `2`) and moves `latest`. A manual run publishes the branch name (when dispatched from a branch) and the short commit SHA; even when manually dispatched against a version-tag ref, it cannot publish semver tags or move `latest`. The workflow passes the repository variable `NEXT_PUBLIC_SITE_URL` as the build argument and falls back to `http://localhost:8367` when it is unset. All actions in every workflow are pinned to commit SHAs.
 
 `next.config.ts` uses standalone output unless the `VERCEL` or `NETLIFY` environment variable is set, so managed Vercel/Netlify builds use their native Next.js output handling. `NEXT_PUBLIC_SITE_URL` is inlined at build time, so it must be passed as a build argument.
 
@@ -330,7 +334,7 @@ npm run test:integration   # after npm run build
 
 `npm test` runs eight node:test suites (with `--expose-gc`, for the deadline regression test): mock-server harness error handling (`scripts/test-harness.mjs`: an occupied port rejects promptly), DNS parser/response-validation (`scripts/test-dns.mjs`), RR-type-aware RDATA validation (`scripts/test-dns-rdata.mjs`), DoH runtime behavior (`scripts/test-doh.mjs`: failover, timeouts, circuit breakers including probe ownership, the failure window and single probes when every breaker is open, request-rejection relay, GET/POST validation, redirect and content-type handling, response-size caps, cache-control and exact large-decimal `max-age`/`Age` handling, version and route-deadline checks), in-flight capacity (`scripts/test-capacity.mjs`), the proxy in both trust modes, including HEAD/OPTIONS exemption, forged headers from a public peer and immunity to wall-clock steps (`scripts/test-proxy.mjs`), the sliding-window limiter (`scripts/test-rate-limit.mjs`) and configuration and client identity (`scripts/test-config.mjs`: every environment variable, platform defaults, header/hop selection, `TRUSTED_PROXIES` matching, socket fallback, IP normalization, all three rotation modes, upstream overrides, `NEXT_PUBLIC_SITE_URL` parsing, the body cap and the preload timeouts). The suites transpile the real `src/` TypeScript on the fly through `scripts/lib/transpile-source.mjs`, which resolves `@/lib/*` imports, supplies the `next/server` stub, sets `DOH_PROXY_VERSION` from `package.json`, and can load fresh module instances after changing `process.env` (configuration is read once per instance). They share the builders in `scripts/lib/dns-fixtures.mjs` and do not require a Next.js build. `typescript` (a dev dependency) must be installed for this helper to work.
 
-`npm run test:integration` (`scripts/test-integration.mjs`) is separate: it needs `npm run build` first, starts the production server with `next start` and the socket-IP preload (like `npm start`) against the local mock upstream in `scripts/lib/mock-upstream.mjs` (via `HAGEZI_UPSTREAM_ENDPOINTS`), and checks GET/POST, content types, `Content-Length`, body-size caps (including a chunked body over the 4097-byte buffer that starts with a valid query), a slow upload, the 10 second transport timeout (`408`), upstream failure, router 404s for unknown providers, HEAD not being rate limited, and the per-client rate limit in both trust modes (including forged headers with `TRUST_PROXY_HEADERS=0`, with `TRUSTED_PROXIES=none`, and from a second source address) over real HTTP. The timeout case makes the suite take about 10 seconds longer.
+`npm run test:integration` (`scripts/test-integration.mjs`) is separate: it needs `npm run build` first, starts the production server with `next start` and the socket-IP preload (like `npm start`) against the local mock upstream in `scripts/lib/mock-upstream.mjs` (via `HAGEZI_UPSTREAM_ENDPOINTS`), and checks GET/POST, content types, body-size caps (including a chunked body over the 4097-byte buffer that starts with a valid query), a slow upload, the 10 second transport timeout (`408`), upstream failure, router 404s for unknown providers, HEAD not being rate limited, and the per-client rate limit in both trust modes (including forged headers with `TRUST_PROXY_HEADERS=0`, with `TRUSTED_PROXIES=none`, and from a second source address) over real HTTP. The timeout case makes the suite take about 10 seconds longer.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: lint, type check, `npm test`, build, the integration suite, a Docker image build with a smoke test that sends a real DoH query to the container, and a separate lockfile-only `npm audit` job (production dependencies gate the build; the full audit is advisory). The smoke test is `node scripts/docker-smoke-test.mjs <image>`; it can also be run locally, but it needs `docker run --network host` (Linux) and free ports 18053 and 18367, it removes a stale container of the same name (`doh-proxy`) from an interrupted run before starting, and it always removes its container and mock upstream afterwards. The manual `Update package-lock.json` workflow regenerates the lockfile from scratch, checks the `@next/swc-*` platform binaries are present, and runs lint, type check, tests and build before committing. Pushes made with `GITHUB_TOKEN` do not trigger other workflows, so run CI on that commit manually.
 
@@ -342,12 +346,12 @@ The repository includes automated checks for:
 
 ```text
 ✓ DNS query/response structure and message-type validation
-✓ Compression-pointer direction and target validation
+✓ Compression-pointer direction/target validation; nested pointer chains rejected
 ✓ DNS name expansion length bounds
 ✓ Response transaction-ID and Question matching, including case-insensitivity
 ✓ parseQuery input immutability for Node Buffer views (0x20 preservation)
 ✓ Queries up to 4 KiB and responses up to 65535 bytes
-✓ RR-type-aware RDATA validation (legacy SIG/NXT compression targets; uncompressed DNAME, KX and SVCB/HTTPS targets)
+✓ RR-type-aware RDATA validation (legacy SIG/NXT compression targets; uncompressed DNAME, KX, RRSIG, NSEC and SVCB/HTTPS names)
 ✓ DoH GET/POST validation, correct optional base64url padding and rejection of malformed padding before upstream fetch
 ✓ Upstream redirect blocking, content-type validation and response validation
 ✓ Upstream response size cap (declared and streamed) with continued failover
@@ -361,6 +365,7 @@ The repository includes automated checks for:
 ✓ Breaker failure window (isolated failures do not trip it) and no breaker state on provider routes
 ✓ Upstream deadline still fires after garbage collection
 ✓ GET max-age relay (minus Age) and POST no-store behavior
+✓ Cache-Control parsing ignores directive-looking text inside quoted extension values; actual no-cache/no-store and malformed quoting fail closed
 ✓ A malformed upstream Age (for example `1e9` or `-1`) makes the answer uncacheable instead of relaying its full max-age
 ✓ Global/per-client in-flight ceilings
 ✓ 100 requests/minute per client with TRUST_PROXY_HEADERS=1 and =0 (unit and real HTTP)
@@ -378,7 +383,7 @@ The repository includes automated checks for:
 ✓ Sliding-window limiter: no boundary burst, expiry, capacity eviction and clock rollback handling
 ✓ Limiter clock is monotonic: wall-clock steps (forward or back) neither reset nor freeze budgets
 ✓ NEXT_PUBLIC_SITE_URL: mixed-case scheme, bare host, host:port and non-http schemes
-✓ Unknown provider ids answered 404 by the router; Content-Length on answers
+✓ Unknown provider ids answered 404 by the router; answers are chunked with no Content-Length
 ✓ Docker image answers a real DoH query through the standalone server and socket-IP preload (CI and publish workflow)
 ✓ PROXY_VERSION taken from package.json and route deadline checks
 ```
@@ -421,14 +426,6 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
 | Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
 | Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
-
-### ⚡ Bandwidth Hero Server
-
-A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
-
-Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
-
-🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
 
 ## Supporting the Project
 
