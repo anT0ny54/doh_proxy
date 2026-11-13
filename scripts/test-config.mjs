@@ -117,7 +117,6 @@ test("the socket-IP preload uses the header and flag names config.ts expects", a
 test("getClientIp: trusted header first, the X-Forwarded-For entry TRUSTED_PROXY_HOPS from the right", () => {
   const get = (headers, identity = DEFAULT_IDENTITY) => clientIp.getClientIp(new Headers(headers), identity);
   assert.equal(get({ "x-forwarded-for": "6.6.6.6, 2.2.2.2" }), "2.2.2.2");
-  assert.equal(get({ "x-forwarded-for": "2.2.2.2, " }), "2.2.2.2", "trailing empty entries are skipped");
   assert.equal(get({ "x-forwarded-for": "9.9.9.9, 2.2.2.2, 10.0.0.5" }, { ...DEFAULT_IDENTITY, trustedProxyHops: 2 }), "2.2.2.2");
   assert.equal(get({ "x-forwarded-for": "2.2.2.2" }, { ...DEFAULT_IDENTITY, trustedProxyHops: 2 }), undefined, "too few hops: no identity");
   assert.equal(get({ "x-forwarded-for": "2.2.2.2, junk" }), undefined, "an unusable entry never falls back to a client-written one");
@@ -125,6 +124,27 @@ test("getClientIp: trusted header first, the X-Forwarded-For entry TRUSTED_PROXY
   const realIpFirst = { ...DEFAULT_IDENTITY, clientIpHeaders: ["x-real-ip", "x-forwarded-for"] };
   assert.equal(get({ "x-real-ip": "7.7.7.7", "x-forwarded-for": "2.2.2.2" }, realIpFirst), "7.7.7.7");
   assert.equal(get({ "x-real-ip": "bogus", "x-forwarded-for": "2.2.2.2" }, realIpFirst), "2.2.2.2", "a bad trusted header falls back to the next one");
+});
+
+test("getClientIp: empty X-Forwarded-For entries preserve trusted-hop positions and fail closed", () => {
+  const get = (headers, identity = DEFAULT_IDENTITY) => clientIp.getClientIp(new Headers(headers), identity);
+  assert.equal(get({ "x-forwarded-for": "2.2.2.2, " }), undefined, "a missing nearest-proxy entry is not skipped");
+  assert.equal(
+    get(
+      { "x-forwarded-for": "9.9.9.9, , 10.0.0.5" },
+      { ...DEFAULT_IDENTITY, trustedProxyHops: 2 },
+    ),
+    undefined,
+    "an empty intermediate hop cannot shift selection to an earlier client-supplied entry",
+  );
+  assert.equal(
+    get(
+      { "x-forwarded-for": "9.9.9.9, 2.2.2.2, 10.0.0.5" },
+      { ...DEFAULT_IDENTITY, trustedProxyHops: 2 },
+    ),
+    "2.2.2.2",
+    "a well-formed chain still selects the configured hop",
+  );
 });
 
 test("getClientIp: the socket address is used when trust is off, and as the trusted-mode fallback, only with the preload", () => {

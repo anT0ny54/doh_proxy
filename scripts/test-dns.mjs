@@ -36,6 +36,43 @@ test("accepts backward compression in a resource-record owner name", () => {
   assert.equal(matches(validResponse(), validQuery), true);
 });
 
+test("accepts backward compression pointers to previously validated root suffixes", () => {
+  const rootQuery = queryWithName([]);
+  assert.equal(matches(validResponse(rootQuery), rootQuery), true, "root QNAME is a valid compression target");
+
+  const namedQuery = validQuery;
+  const response = validResponse(namedQuery);
+  const rootLabelOffset = namedQuery.length - 5; // QTYPE + QCLASS follow the root label.
+  const answerOwnerOffset = namedQuery.length;
+  response[answerOwnerOffset] = 0xc0 | (rootLabelOffset >> 8);
+  response[answerOwnerOffset + 1] = rootLabelOffset & 0xff;
+  assert.equal(matches(response, namedQuery), true, "a non-root QNAME's terminal root suffix is also a valid target");
+});
+
+test("rejects a pointer to a previously compressed owner name", () => {
+  const depth = 2;
+  const response = Buffer.alloc(validQuery.length + depth * 16);
+  response.set(validQuery);
+  response.writeUInt16BE(0x8180, 2); // QR + RD + RA
+  response.writeUInt16BE(depth, 6);
+
+  let previousNameOffset = 12; // The first pointer targets the uncompressed question QNAME.
+  let offset = validQuery.length;
+  for (let i = 0; i < depth; i += 1) {
+    response[offset] = 0xc0 | (previousNameOffset >> 8);
+    response[offset + 1] = previousNameOffset & 0xff;
+    response.writeUInt16BE(1, offset + 2); // A
+    response.writeUInt16BE(1, offset + 4); // IN
+    response.writeUInt32BE(60, offset + 6);
+    response.writeUInt16BE(4, offset + 10);
+    response.set([192, 0, 2, i], offset + 12);
+    previousNameOffset = offset;
+    offset += 16;
+  }
+
+  assert.equal(matches(response, validQuery), false);
+});
+
 test("rejects forward compression pointers", () => {
   const response = validResponse();
   const answerNameOffset = validQuery.length;
@@ -62,15 +99,13 @@ test("rejects compression pointers that point before the DNS message", () => {
   assert.equal(dns.isValidDnsResponse(response), false);
 });
 
-test("rejects names longer than 255 octets", () => {
-  const labels = [];
-  let remaining = 256;
-  while (remaining > 0) {
-    const length = Math.min(63, remaining - 1);
-    labels.push(length, ...new Array(length).fill(97));
-    remaining -= length + 1;
-  }
-  assert.equal(isValidDnsQuery(queryWithName(labels)), false);
+test("accepts the maximum 255-octet name and rejects a longer name", () => {
+  // 127 one-character labels occupy 254 octets plus the root label.
+  const maximum = Array.from({ length: 127 }, () => [1, 97]).flat();
+  assert.equal(isValidDnsQuery(queryWithName(maximum)), true);
+
+  const tooLong = [...maximum, 1, 97];
+  assert.equal(isValidDnsQuery(queryWithName(tooLong)), false);
 });
 
 test("accepts a structurally valid DNS response", () => {

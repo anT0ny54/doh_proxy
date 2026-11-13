@@ -909,7 +909,7 @@ try {
       clock.now += 31_000;
       healthy = true;
       hits = 0;
-      // Both upstreams tripped above, so both are half-open clock.now.
+      // Both upstreams tripped above, so both are half-open now.
       const inflight = [doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options), doh.proxyRequest(getRequest(), options)];
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.equal(hits, 2, "exactly one probe per half-open upstream; the third request does not pile on");
@@ -1309,6 +1309,40 @@ try {
     assert.equal((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), "private, max-age=20");
     globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": "max-age=60", age: "90" });
     assert.match((await doh.proxyRequest(getRequest(), options)).headers.get("cache-control"), /no-store/);
+  });
+
+  await test("Cache-Control directives inside quoted extension values are not interpreted", async () => {
+    const options = { upstreams: [{ endpoint: "https://cache-control-quoted.test/dns-query" }], timeoutMs: 500, failover: false };
+    const responseFor = async (cacheControl) => {
+      globalThis.fetch = async () => dnsAnswer(validResponse(), { "cache-control": cacheControl });
+      return doh.proxyRequest(getRequest(), options);
+    };
+
+    assert.equal(
+      (await responseFor('extension="note, max-age=86400, other"')).headers.get("cache-control"),
+      "no-store, max-age=0",
+      "a max-age-looking token inside a quoted extension value is not a freshness directive",
+    );
+    assert.equal(
+      (await responseFor('extension="note, no-store, other", max-age=120')).headers.get("cache-control"),
+      "private, max-age=120",
+      "a no-store-looking token inside a quoted extension value is not a directive",
+    );
+    assert.equal(
+      (await responseFor('max-age=60, extension="note, max-age=86400, other"')).headers.get("cache-control"),
+      "private, max-age=60",
+      "a real max-age directive is parsed outside quoted values",
+    );
+    assert.equal(
+      (await responseFor('max-age=120, no-cache, extension="quoted, value"')).headers.get("cache-control"),
+      "no-store, max-age=0",
+      "an actual no-cache directive always disables relaying freshness",
+    );
+    assert.equal(
+      (await responseFor('max-age=120, extension="unterminated')).headers.get("cache-control"),
+      "no-store, max-age=0",
+      "malformed quoted directives fail closed",
+    );
   });
 
   await test("A malformed upstream Age makes the answer uncacheable instead of relaying its full max-age", async () => {

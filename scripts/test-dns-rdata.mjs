@@ -2,8 +2,8 @@
  * Regression tests for RR-type-aware RDATA validation (src/lib/dns.ts).
  * Compression pointers may target only bytes validated as genuine domain
  * names; opaque RDATA (A/AAAA/TXT/...) contributes no targets, and
- * name-bearing RDATA (including uncompressed DNAME/KX/SVCB/HTTPS targets)
- * must be structurally exact.
+ * name-bearing RDATA (including DNSSEC, SVCB/HTTPS, DSYNC and DELEG names)
+ * must follow the RR-specific compression and framing rules.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -83,16 +83,16 @@ test("CNAME RDATA as a bare compression pointer still validates", () => {
   assert.equal(valid(response), true);
 });
 
-test("later compression pointers may target an earlier pointer suffix", () => {
-  // edge.example.com is encoded as a literal `edge` label and then a pointer
-  // to example.com. That pointer byte is itself a valid name-suffix target.
+test("nested compression pointers are rejected as targets", () => {
+  // The CNAME name starts with a literal label but ends in a pointer. A later
+  // RR must not target that first label because its suffix still contains a pointer.
   const cnameRdata = Buffer.from([4, ...Buffer.from("edge"), 0xc0, 0x0c]);
   const cname = resourceRecord(PTR_QUESTION, 5, cnameRdata);
-  const suffixPointerOffset = answerStart(QUERY) + PTR_QUESTION.length + 10 + 5;
-  const ownerPointer = Buffer.from([0xc0 | (suffixPointerOffset >> 8), suffixPointerOffset & 0xff]);
+  const compressedNameOffset = answerStart(QUERY) + PTR_QUESTION.length + 10;
+  const ownerPointer = Buffer.from([0xc0 | (compressedNameOffset >> 8), compressedNameOffset & 0xff]);
   const a = resourceRecord(ownerPointer, 1, Buffer.from([1, 2, 3, 4]));
   const response = buildResponse(QUERY, [cname, a]);
-  assert.equal(valid(response), true);
+  assert.equal(valid(response), false);
 });
 
 test("MX exchange name bytes become valid compression targets", () => {
@@ -170,7 +170,7 @@ test("HTTPS/SVCB target name must end inside the RDATA", () => {
   const good = resourceRecord(
     "example.com",
     65,
-    Buffer.concat([u16(1), encodeName("cdn.example.com"), u16(0), u16(0)]),
+    Buffer.concat([u16(1), encodeName("cdn.example.com")]),
   );
   assert.equal(valid(buildResponse(QUERY, [good])), true);
 
@@ -199,7 +199,7 @@ test("compressed SVCB/HTTPS target name is rejected (RFC 9460 section 2.2)", () 
     const rr = resourceRecord(
       "example.com",
       type,
-      Buffer.concat([u16(1), encodeName("cdn.example.com"), u16(0), u16(0)]),
+      Buffer.concat([u16(1), encodeName("cdn.example.com")]),
     );
     const response = buildResponse(QUERY, [rr]);
     assert.equal(valid(response), true, `type ${type} with uncompressed target`);
@@ -230,7 +230,7 @@ test("legacy name-bearing types (MINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR) beco
     [21, [u16(1), encodeName("rt.example.com")], 2], // RT
     [24, [Buffer.alloc(18), encodeName("sig.example.com"), Buffer.from([0xaa])], 18], // SIG
     [26, [u16(1), encodeName("map822.example.com"), encodeName("mapx400.example.com")], 2], // PX
-    [30, [encodeName("next.example.com"), Buffer.from([0x00, 0x40])], 0], // NXT
+    [30, [encodeName("next.example.com"), Buffer.from([0x00, 0x00, 0x00, 0x02])], 0], // NXT
     [35, [u16(100), u16(10), characterString("u"), characterString("E2U+sip"), characterString(""), encodeName("sip.example.com")], 4 + 2 + 8 + 1], // NAPTR
   ];
   for (const [type, parts, nameOffsetInRdata] of cases) {
@@ -264,8 +264,296 @@ test("DNAME and KX RDATA names must be uncompressed", () => {
   }
 });
 
+
+test("RRSIG signer names and NSEC next-domain names become compression targets", () => {
+  const owner = encodeName("example.com");
+  const cases = [
+    [46, Buffer.concat([Buffer.alloc(18), encodeName("signer.example.net"), Buffer.from([0xaa])]), 18],
+    [47, Buffer.concat([encodeName("next.example.net"), Buffer.from([0x00, 0x01, 0x40])]), 0],
+  ];
+
+  for (const [type, rdata, nameOffsetInRdata] of cases) {
+    const rr = resourceRecord(owner, type, rdata);
+    const nameOffset = answerStart(QUERY) + owner.length + 10 + nameOffsetInRdata;
+    const ownerPointer = Buffer.from([0xc0 | (nameOffset >> 8), nameOffset & 0xff]);
+    const a = resourceRecord(ownerPointer, 1, Buffer.from([1, 2, 3, 4]));
+    assert.equal(valid(buildResponse(QUERY, [rr, a])), true, `type ${type}: pointer into its RDATA name`);
+  }
+});
+
+test("RRSIG and NSEC embedded names reject compression and truncation", () => {
+  const cases = [
+    [46, Buffer.alloc(18), Buffer.from([0xaa])], // RRSIG: fixed prefix, name, signature
+    [47, Buffer.alloc(0), Buffer.from([0x00, 0x01, 0x40])], // NSEC: name, type bitmap
+  ];
+
+  for (const [type, prefix, suffix] of cases) {
+    // A bare pointer and a literal label followed by a pointer are both illegal.
+    for (const name of [PTR_QUESTION, Buffer.from([3, 99, 100, 110, 0xc0, 0x0c])]) {
+      const rr = resourceRecord("example.com", type, Buffer.concat([prefix, name, suffix]));
+      assert.equal(valid(buildResponse(QUERY, [rr])), false, `type ${type}: compressed embedded name`);
+    }
+
+    const truncated = resourceRecord(
+      "example.com",
+      type,
+      Buffer.concat([prefix, Buffer.from([3, 97])]),
+    );
+    assert.equal(valid(buildResponse(QUERY, [truncated])), false, `type ${type}: truncated embedded name`);
+  }
+});
+
 test("NAPTR with a character-string running past RDLENGTH is rejected", () => {
   const rdata = Buffer.concat([u16(100), u16(10), Buffer.from([40, 1, 2])]);
   const rr = resourceRecord("example.com", 35, rdata);
   assert.equal(valid(buildResponse(QUERY, [rr])), false);
+});
+
+
+test("A6 records parse their conditional uncompressed prefix name", () => {
+  const noPrefix = Buffer.concat([Buffer.from([0]), Buffer.alloc(16, 0x11)]);
+  const withPrefix = Buffer.concat([Buffer.from([64]), Buffer.alloc(8, 0x22), encodeName("prefix.example.net")]);
+  const fullPrefix = Buffer.concat([Buffer.from([128]), encodeName("prefix.example.net")]);
+  for (const rdata of [noPrefix, withPrefix, fullPrefix]) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 38, rdata)])), true);
+  }
+
+  const compressed = Buffer.concat([Buffer.from([64]), Buffer.alloc(8), PTR_QUESTION]);
+  const tooShort = Buffer.concat([Buffer.from([64]), Buffer.alloc(7), encodeName("prefix.example.net")]);
+  for (const rdata of [Buffer.from([129]), compressed, tooShort]) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 38, rdata)])), false);
+  }
+});
+
+test("IPSECKEY validates gateway-type-specific lengths and uncompressed gateway names", () => {
+  const cases = [
+    Buffer.from([10, 0, 2, 1, 2, 3]), // no gateway, opaque public key
+    Buffer.from([10, 1, 2, 192, 0, 2, 1, 0xaa]), // IPv4 gateway
+    Buffer.concat([Buffer.from([10, 2, 2]), Buffer.alloc(16, 0x20), Buffer.from([0xaa])]), // IPv6 gateway
+    Buffer.concat([Buffer.from([10, 3, 2]), encodeName("gw.example.net"), Buffer.from([0xaa])]), // DNS gateway
+  ];
+  for (const rdata of cases) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 45, rdata)])), true);
+  }
+
+  const compressedName = Buffer.concat([Buffer.from([10, 3, 2]), PTR_QUESTION]);
+  const shortIpv4 = Buffer.from([10, 1, 2, 192, 0, 2]);
+  const unknownGateway = Buffer.from([10, 4, 2]);
+  for (const rdata of [compressedName, shortIpv4, unknownGateway, Buffer.from([10, 3])]) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 45, rdata)])), false);
+  }
+});
+
+test("HIP validates its fixed lengths and optional uncompressed RVS names", () => {
+  const header = Buffer.from([16, 2, 0, 2]); // HIT length, algorithm, public-key length
+  const fixed = Buffer.concat([header, Buffer.alloc(16, 0x44), Buffer.from([0xaa, 0xbb])]);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 55, fixed)])), true);
+
+  const withRvs = Buffer.concat([fixed, encodeName("rvs.example.net"), encodeName("backup.example.net")]);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 55, withRvs)])), true);
+
+  const compressedRvs = Buffer.concat([fixed, PTR_QUESTION]);
+  const truncatedHit = Buffer.concat([Buffer.from([16, 2, 0, 2]), Buffer.alloc(15), Buffer.from([1, 2])]);
+  const truncatedKey = Buffer.concat([Buffer.from([16, 2, 0, 4]), Buffer.alloc(16), Buffer.from([1, 2])]);
+  for (const rdata of [compressedRvs, truncatedHit, truncatedKey]) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 55, rdata)])), false);
+  }
+});
+
+test("LP and TALINK names are uncompressed", () => {
+  const lp = resourceRecord("example.com", 107, Buffer.concat([u16(10), encodeName("locator.example.net")]));
+  const talink = resourceRecord("example.com", 58, Buffer.concat([
+    encodeName("previous.example.net"),
+    encodeName("next.example.net"),
+  ]));
+  assert.equal(valid(buildResponse(QUERY, [lp, talink])), true);
+
+  const compressedLp = resourceRecord("example.com", 107, Buffer.concat([u16(10), PTR_QUESTION]));
+  const compressedTalink = resourceRecord("example.com", 58, Buffer.concat([
+    encodeName("previous.example.net"), PTR_QUESTION,
+  ]));
+  assert.equal(valid(buildResponse(QUERY, [compressedLp])), false);
+  assert.equal(valid(buildResponse(QUERY, [compressedTalink])), false);
+});
+
+test("TKEY and TSIG algorithm names are uncompressed and variable fields are bounded", () => {
+  const tkey = Buffer.concat([
+    encodeName("gss-tsig"),
+    u32(1), u32(2), u16(3), u16(0),
+    u16(2), Buffer.from([0xaa, 0xbb]),
+    u16(1), Buffer.from([0xcc]),
+  ]);
+  const tsig = Buffer.concat([
+    encodeName("hmac-sha256"),
+    Buffer.alloc(6), u16(300),
+    u16(3), Buffer.from([0xaa, 0xbb, 0xcc]),
+    u16(0x1234), u16(0), u16(2), Buffer.from([0xdd, 0xee]),
+  ]);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 249, tkey)])), true);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 250, tsig)])), true);
+
+  const compressedTkey = Buffer.concat([PTR_QUESTION, tkey.subarray(encodeName("gss-tsig").length)]);
+  const compressedTsig = Buffer.concat([PTR_QUESTION, tsig.subarray(encodeName("hmac-sha256").length)]);
+  const truncatedTkey = tkey.subarray(0, tkey.length - 1);
+  const truncatedTsig = tsig.subarray(0, tsig.length - 1);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 249, compressedTkey)])), false);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 250, compressedTsig)])), false);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 249, truncatedTkey)])), false);
+  assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 250, truncatedTsig)])), false);
+});
+
+test("AMTRELAY validates relay type and uncompressed DNS relay names", () => {
+  const cases = [
+    Buffer.from([10, 0]), // no relay
+    Buffer.from([10, 1, 192, 0, 2, 1]), // IPv4 relay
+    Buffer.concat([Buffer.from([10, 2]), Buffer.alloc(16, 0x20)]), // IPv6 relay
+    Buffer.concat([Buffer.from([10, 3]), encodeName("relay.example.net")]), // DNS relay
+  ];
+  for (const rdata of cases) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 260, rdata)])), true);
+  }
+
+  const compressed = Buffer.from([10, 3, ...PTR_QUESTION]);
+  const badIpv4 = Buffer.from([10, 1, 192, 0, 2]);
+  const badIpv6 = Buffer.concat([Buffer.from([10, 2]), Buffer.alloc(15)]);
+  for (const rdata of [compressed, badIpv4, badIpv6, Buffer.from([10])]) {
+    assert.equal(valid(buildResponse(QUERY, [resourceRecord("example.com", 260, rdata)])), false);
+  }
+});
+
+test("NSEC bitmap window framing and ordering are validated", () => {
+  const makeNsec = (bitmap) => resourceRecord("example.com", 47,
+    Buffer.concat([encodeName("next.example.net"), bitmap]));
+  const validBitmap = Buffer.from([0, 1, 0x40, 2, 1, 0x80]);
+  assert.equal(valid(buildResponse(QUERY, [makeNsec(validBitmap)])), true);
+
+  const invalidBitmaps = [
+    Buffer.alloc(0), // at least one window is required
+    Buffer.from([0]), // truncated window header
+    Buffer.from([0, 0]), // zero length
+    Buffer.from([0, 33, ...Buffer.alloc(33, 1)]), // length > 32
+    Buffer.from([0, 2, 0x40]), // truncated bitmap
+    Buffer.from([1, 1, 0x40, 0, 1, 0x40]), // decreasing windows
+    Buffer.from([0, 1, 0]), // trailing zero octet
+  ];
+  for (const bitmap of invalidBitmaps) {
+    assert.equal(valid(buildResponse(QUERY, [makeNsec(bitmap)])), false);
+  }
+});
+
+test("SVCB and HTTPS parameter TLVs are bounded and strictly ordered", () => {
+  const makeSvcb = (type, params) => resourceRecord("example.com", type,
+    Buffer.concat([u16(1), encodeName("cdn.example.net"), params]));
+  const validParams = Buffer.concat([u16(1), u16(3), Buffer.from([1, 2, 3]), u16(3), u16(2), u16(443)]);
+  const mandatoryParams = Buffer.concat([
+    u16(0), u16(4), u16(1), u16(3), validParams,
+  ]);
+  for (const type of [64, 65]) {
+    assert.equal(valid(buildResponse(QUERY, [makeSvcb(type, validParams)])), true);
+    assert.equal(valid(buildResponse(QUERY, [makeSvcb(type, mandatoryParams)])), true);
+    assert.equal(valid(buildResponse(QUERY, [makeSvcb(type, Buffer.alloc(0))])), true);
+    for (const bad of [
+      Buffer.from([0]), // truncated parameter header
+      Buffer.concat([u16(1), u16(3), Buffer.from([1, 2])]), // truncated value
+      Buffer.concat([u16(3), u16(0), u16(1), u16(0)]), // decreasing keys
+      Buffer.concat([u16(1), u16(0), u16(1), u16(0)]), // duplicate keys
+      Buffer.concat([u16(0), u16(2), u16(9), validParams]), // mandatory key is absent
+      Buffer.concat([u16(0), u16(4), u16(3), u16(1), validParams]), // unsorted mandatory list
+    ]) {
+      assert.equal(valid(buildResponse(QUERY, [makeSvcb(type, bad)])), false,
+        `type ${type}: malformed SvcParams`);
+    }
+  }
+});
+
+test("legacy NXT bitmap framing rejects truncated and noncanonical bitmaps", () => {
+  const makeNxt = (bitmap) => resourceRecord("example.com", 30,
+    Buffer.concat([encodeName("next.example.net"), bitmap]));
+  assert.equal(valid(buildResponse(QUERY, [makeNxt(Buffer.from([0, 0, 0, 2]))])), true);
+  for (const bitmap of [
+    Buffer.from([0, 0, 2]), // shorter than four bytes
+    Buffer.from([0, 0, 0, 0]), // NXT bit missing and trailing zero
+    Buffer.from([0x80, 0, 0, 2]), // reserved type-zero bit set
+    Buffer.from([0, 0, 0, 2, 0]), // trailing zero octet
+    Buffer.alloc(17, 0xff), // exceeds the legacy flat bitmap
+  ]) {
+    assert.equal(valid(buildResponse(QUERY, [makeNxt(bitmap)])), false);
+  }
+});
+
+
+test("NSAP-PTR uses its historical character-string RDATA, while DSYNC names stay uncompressed", () => {
+  const nsapPtr = resourceRecord("example.com", 23, characterString("4444333322221111"));
+  const nsapStringOffset = answerStart(QUERY) + encodeName("example.com").length + 10 + 1;
+  const nsapStringPointer = Buffer.from([0xc0 | (nsapStringOffset >> 8), nsapStringOffset & 0xff]);
+  const pointerIntoString = resourceRecord(nsapStringPointer, 1, Buffer.from([192, 0, 2, 53]));
+  assert.equal(valid(buildResponse(QUERY, [nsapPtr])), true);
+  assert.equal(valid(buildResponse(QUERY, [nsapPtr, pointerIntoString])), false,
+    "character-string contents must not become DNS compression targets");
+
+  const dsync = resourceRecord("example.com", 66,
+    Buffer.concat([u16(59), Buffer.from([1]), u16(5359), encodeName("notify.example.net")]));
+  const dsyncTargetOffset = answerStart(QUERY) + encodeName("example.com").length + 10 + 5;
+  const dsyncTargetPointer = Buffer.from([0xc0 | (dsyncTargetOffset >> 8), dsyncTargetOffset & 0xff]);
+  const followup = resourceRecord(dsyncTargetPointer, 1, Buffer.from([192, 0, 2, 53]));
+  assert.equal(valid(buildResponse(QUERY, [dsync, followup])), true);
+
+  const truncatedNsapPtr = resourceRecord("example.com", 23, Buffer.from([5, 0x31, 0x32]));
+  const compressedDsync = resourceRecord("example.com", 66,
+    Buffer.concat([u16(59), Buffer.from([1]), u16(5359), PTR_QUESTION]));
+  const shortDsync = resourceRecord("example.com", 66,
+    Buffer.concat([u16(59), Buffer.from([1]), u16(5359), Buffer.from([3, 97])]));
+  assert.equal(valid(buildResponse(QUERY, [truncatedNsapPtr])), false);
+  assert.equal(valid(buildResponse(QUERY, [compressedDsync])), false);
+  assert.equal(valid(buildResponse(QUERY, [shortDsync])), false);
+});
+
+test("DELEGPARAM and DELEG enforce ordered fields, uncompressed names, and server-info sets", () => {
+  const tlv = (key, value) => Buffer.concat([u16(key), u16(value.length), value]);
+  const addressInfo = tlv(1, Buffer.from([192, 0, 2, 1]));
+  const ipv6Info = tlv(2, Buffer.alloc(16, 0x20));
+  const nameInfo = tlv(3, Buffer.concat([encodeName("ns1.example.net"), encodeName("ns2.example.net")]));
+  const includeInfo = tlv(4, encodeName("shared.example.net"));
+  const mandatoryIpv4 = tlv(0, u16(1));
+  const mandatoryName = tlv(0, u16(3));
+
+  for (const type of [54, 61440]) {
+    const makeRecord = (value) => resourceRecord("example.com", type, value);
+    assert.equal(valid(buildResponse(QUERY, [makeRecord(Buffer.alloc(0))])), true);
+    for (const validInfo of [
+      Buffer.concat([mandatoryIpv4, addressInfo]),
+      ipv6Info,
+      Buffer.concat([addressInfo, ipv6Info]),
+      Buffer.concat([mandatoryName, nameInfo]),
+      includeInfo,
+    ]) {
+      assert.equal(valid(buildResponse(QUERY, [makeRecord(validInfo)])), true,
+        `type ${type}: valid server-information set`);
+    }
+
+    const nameTargetOffset = answerStart(QUERY) + encodeName("example.com").length + 10 + 4;
+    const nameTargetPointer = Buffer.from([0xc0 | (nameTargetOffset >> 8), nameTargetOffset & 0xff]);
+    const followup = resourceRecord(nameTargetPointer, 1, Buffer.from([192, 0, 2, 54]));
+    assert.equal(valid(buildResponse(QUERY, [makeRecord(nameInfo), followup])), true,
+      `type ${type}: uncompressed embedded names are valid compression targets`);
+
+    const badOrder = Buffer.concat([nameInfo, addressInfo]);
+    const duplicate = Buffer.concat([addressInfo, addressInfo]);
+    const truncated = Buffer.concat([u16(3), u16(10), encodeName("ns.example.net")]);
+    const compressedName = tlv(3, PTR_QUESTION);
+    const badMandatory = tlv(0, u16(0));
+    const unsortedMandatory = tlv(0, Buffer.concat([u16(3), u16(1)]));
+    const missingMandatoryTarget = Buffer.concat([mandatoryIpv4, ipv6Info]);
+    const badIpv4Length = tlv(1, Buffer.from([192, 0, 2]));
+    const mixedAddressAndName = Buffer.concat([addressInfo, nameInfo]);
+    const mixedNameAndInclude = Buffer.concat([nameInfo, includeInfo]);
+    const mixedAddressAndInclude = Buffer.concat([addressInfo, includeInfo]);
+    const unknownOnly = tlv(100, Buffer.alloc(0));
+    for (const bad of [badOrder, duplicate, truncated, compressedName, badMandatory,
+      unsortedMandatory, missingMandatoryTarget, badIpv4Length, mixedAddressAndName,
+      mixedNameAndInclude, mixedAddressAndInclude, unknownOnly]) {
+      assert.equal(valid(buildResponse(QUERY, [makeRecord(bad)])), false,
+        `type ${type}: malformed or incompatible DelegInfos`);
+    }
+  }
 });

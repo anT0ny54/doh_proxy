@@ -136,7 +136,8 @@ test("GET with a valid dns parameter proxies a matching response", async () => {
   assert.equal(res.headers.get("content-type"), DNS_MESSAGE);
   assert.match(res.headers.get("cache-control") ?? "", /max-age=120/); // upstream max-age relayed for GET
   const body = new Uint8Array(await res.arrayBuffer());
-  assert.equal(Number(res.headers.get("content-length")), body.length, "Content-Length is set by the server");
+  // No Content-Length: Next.js drops the one a route sets, so the answer is chunked.
+  assert.equal(res.headers.get("content-length"), null);
   assert.equal(body.length > 12, true);
   assert.equal((body[0] << 8) | body[1], 0x1234); // transaction ID preserved
   assert.equal(body[2] & 0x80, 0x80); // QR bit set
