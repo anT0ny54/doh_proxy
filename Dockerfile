@@ -21,7 +21,10 @@ COPY next.config.ts tsconfig.json ./
 # for a local `docker run -p 8367:8367`.
 ARG NEXT_PUBLIC_SITE_URL="http://localhost:8367"
 ENV NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL
-RUN npm run build
+# Next.js keeps .next/cache across builds, so a BuildKit cache mount lets
+# repeated image builds reuse its compile cache. The cache is not copied into
+# the runner stage.
+RUN --mount=type=cache,target=/app/.next/cache npm run build
 
 FROM base AS runner
 ENV NODE_ENV=production
