@@ -117,3 +117,20 @@ test("the limiter runs on a monotonic clock: a wall-clock step neither resets no
     performance.now = monotonicNow;
   }
 });
+
+// What the route would receive: with no request-header override, Next.js
+// forwards the original headers unchanged.
+const seenByRoute = (response, original) => (response.requestHeaders ?? original.headers).get(KEY_HEADER);
+
+test("an injected client key is removed on every method, including OPTIONS and HEAD", async () => {
+  const proxy = await loadProxy("1");
+  for (const method of ["OPTIONS", "HEAD"]) {
+    const req = request({ [KEY_HEADER]: "forged", "x-forwarded-for": "203.0.113.60" }, method);
+    const response = proxy(req);
+    assert.equal(response.status, 200, method);
+    assert.equal(seenByRoute(response, req), null, `${method}: the forged key must not reach the route`);
+  }
+  // Nothing to strip: the request passes through untouched.
+  const clean = request({ "x-forwarded-for": "203.0.113.60" }, "OPTIONS");
+  assert.equal(proxy(clean).requestHeaders, undefined);
+});

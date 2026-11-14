@@ -23,7 +23,8 @@ const EXPECTED = `200 ${DNS_MESSAGE}`;
 
 const image = process.argv[2];
 const timeoutSeconds = Number(process.argv[3] ?? 60);
-if (!image || !(timeoutSeconds > 0)) {
+const timeoutMs = timeoutSeconds * 1_000;
+if (!image || !Number.isFinite(timeoutMs) || timeoutMs < 1) {
   console.error("usage: node scripts/docker-smoke-test.mjs <image> [timeoutSeconds=60]");
   process.exit(2);
 }
@@ -47,16 +48,28 @@ try {
       image,
     ).status === 0;
 
-  const deadline = Date.now() + timeoutSeconds * 1_000;
-  while (started && result !== EXPECTED && Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (started && result !== EXPECTED) {
+    const remainingMs = deadline - performance.now();
+    if (remainingMs < 1) break;
+
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(3_000) });
+      // A single stalled fetch must not outlive the user-supplied readiness
+      // deadline; cap it at 3 s or the remaining whole-millisecond budget.
+      const signal = AbortSignal.timeout(Math.min(3_000, Math.floor(remainingMs)));
+      const response = await fetch(url, { signal });
       await response.arrayBuffer();
+      if (performance.now() >= deadline) {
+        result = "readiness deadline exceeded";
+        break;
+      }
       result = `${response.status} ${response.headers.get("content-type")}`;
     } catch (error) {
       result = String(error?.cause?.code ?? error?.message ?? error);
     }
-    if (result !== EXPECTED) await delay(1_000);
+
+    const pauseMs = deadline - performance.now();
+    if (result !== EXPECTED && pauseMs > 0) await delay(Math.min(1_000, Math.ceil(pauseMs)));
   }
 } finally {
   if (started) docker("logs", CONTAINER);

@@ -55,21 +55,38 @@ async function startApp(env) {
     },
   );
   let logs = "";
+  let spawnError;
   child.stdout.on("data", (d) => (logs += d));
   child.stderr.on("data", (d) => (logs += d));
+  child.once("error", (error) => {
+    spawnError = error;
+  });
 
-  const deadline = Date.now() + 90_000;
+  const deadline = performance.now() + 90_000;
+  const exitDescription = () => child.signalCode ?? child.exitCode;
   let lastError;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`next start exited early (${child.exitCode})\n${logs}`);
+  while (performance.now() < deadline) {
+    if (spawnError) throw new Error(`next start could not be spawned\n${logs}`, { cause: spawnError });
+    if (exitDescription() !== null) throw new Error(`next start exited early (${exitDescription()})\n${logs}`);
+    const remainingMs = deadline - performance.now();
+    if (remainingMs < 1) break;
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/`);
+      // Bound each readiness request by the remaining whole-millisecond startup
+      // budget. Recheck the child and deadline after reading the response too.
+      const signal = AbortSignal.timeout(Math.min(1_000, Math.floor(remainingMs)));
+      const res = await fetch(`http://127.0.0.1:${port}/`, { signal });
+      await res.arrayBuffer();
+      if (spawnError) throw new Error(`next start could not be spawned\n${logs}`, { cause: spawnError });
+      if (exitDescription() !== null) throw new Error(`next start exited early (${exitDescription()})\n${logs}`);
+      if (performance.now() >= deadline) break;
       if (res.ok) return { child, base: `http://127.0.0.1:${port}` };
     } catch (error) {
       lastError = error;
     }
-    await delay(500);
+    const pauseMs = deadline - performance.now();
+    if (pauseMs > 0) await delay(Math.min(200, Math.ceil(pauseMs)));
   }
+  if (spawnError) throw new Error(`next start could not be spawned\n${logs}`, { cause: spawnError });
   child.kill("SIGKILL");
   throw new Error(`app did not become ready: ${lastError}\n${logs}`);
 }
@@ -79,10 +96,16 @@ async function stopApp(app) {
   // only burn the full timeout.
   if (!app || app.child.exitCode !== null || app.child.signalCode !== null) return;
   app.child.kill("SIGTERM");
+  let timeout;
   const exited = await Promise.race([
     new Promise((resolve) => app.child.once("exit", () => resolve(true))),
-    delay(10_000).then(() => false),
+    new Promise((resolve) => {
+      timeout = setTimeout(() => resolve(false), 10_000);
+    }),
   ]);
+  // Cancel the losing timer when the child exits, so teardown does not keep
+  // the test process alive for another 10 seconds.
+  clearTimeout(timeout);
   if (!exited) app.child.kill("SIGKILL");
 }
 
@@ -209,21 +232,49 @@ test("a slow client uploading a POST body gets a bounded terminal response", asy
   const status = await new Promise((resolve, reject) => {
     const req = http.request(
       { host: "127.0.0.1", port, path: "/api/doh/dns-query", method: "POST", headers: { "content-type": DNS_MESSAGE } },
-      (res) => resolve(res.statusCode),
     );
-    req.on("error", reject);
+    let timer;
+    let settled = false;
+    const finish = (error, statusCode) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearInterval(timer);
+      if (error) {
+        // A response-side error can happen while the client is still writing;
+        // tear down the request too, rather than leaving the socket uploading.
+        req.destroy();
+        reject(error);
+      } else {
+        resolve(statusCode);
+      }
+    };
+
+    req.on("response", (res) => {
+      const statusCode = res.statusCode;
+      res.once("end", () => {
+        finish(null, statusCode);
+        // A transport-level timeout may answer before the trickle completes.
+        // Stop uploading and release the socket once that response is drained.
+        req.destroy();
+      });
+      res.once("error", (error) => finish(error));
+      res.resume();
+    });
+    req.on("error", (error) => finish(error));
     // Trickles a VALID query for well over MAX_BODY_READ_MS (1s). With proxy.ts
     // in the pipeline Next.js buffers the request body before the route runs,
     // so the body-read deadline applies post-buffering: a streaming-enforced
     // server answers 408, a buffering one proxies the completed query (200).
     // The 408 path itself is unit-tested with synthetic slow bodies.
     let offset = 0;
-    const timer = setInterval(() => {
+    timer = setInterval(() => {
+      if (settled) return;
       const end = Math.min(offset + 4, VALID_QUERY.length);
       req.write(VALID_QUERY.subarray(offset, end));
       offset = end;
       if (offset >= VALID_QUERY.length) {
         clearInterval(timer);
+        timer = undefined;
         req.end();
       }
     }, 400);
@@ -233,7 +284,7 @@ test("a slow client uploading a POST body gets a bounded terminal response", asy
 
 test("a POST body still incomplete after the 10 s transport request timeout gets 408", { timeout: 30_000 }, async () => {
   const port = Number(new URL(app.base).port);
-  const started = Date.now();
+  const started = performance.now();
   const status = await new Promise((resolve, reject) => {
     const req = http.request(
       { host: "127.0.0.1", port, path: "/api/doh/dns-query", method: "POST", headers: { "content-type": DNS_MESSAGE, "content-length": String(VALID_QUERY.length) } },
@@ -246,7 +297,7 @@ test("a POST body still incomplete after the 10 s transport request timeout gets
     req.on("error", (error) => (error.code === "ECONNRESET" || error.code === "EPIPE" ? resolve("reset") : reject(error)));
     req.write(VALID_QUERY.subarray(0, 4)); // ...and never the rest
   });
-  const elapsed = Date.now() - started;
+  const elapsed = performance.now() - started;
   assert.ok(status === 408 || status === "reset", `expected 408, got ${status}`);
   assert.ok(elapsed >= 9_000 && elapsed < 20_000, `bounded by the preload's request timeout, took ${elapsed} ms`);
 });

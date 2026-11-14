@@ -30,8 +30,8 @@ try {
       }),
     );
 
-    const startedDeadline = Date.now() + 1_000;
-    while (calls < doh.MAX_IN_FLIGHT_REQUESTS && Date.now() < startedDeadline) {
+    const startedDeadline = performance.now() + 1_000;
+    while (calls < doh.MAX_IN_FLIGHT_REQUESTS && performance.now() < startedDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     assert.equal(calls, doh.MAX_IN_FLIGHT_REQUESTS);

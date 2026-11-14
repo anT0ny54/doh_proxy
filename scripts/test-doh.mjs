@@ -119,7 +119,7 @@ try {
       });
     };
 
-    const started = Date.now();
+    const started = performance.now();
     const response = await doh.proxyRequest(getRequest(), {
       upstreams: [{ endpoint: "https://timeout.test/dns-query" }],
       timeoutMs: 40,
@@ -128,7 +128,7 @@ try {
 
     assert.equal(response.status, 502);
     assert.equal(calls, 1);
-    assert.ok(Date.now() - started < 500, "timeout path should stay bounded");
+    assert.ok(performance.now() - started < 500, "timeout path should stay bounded");
   });
 
   await test("The upstream deadline still fires after garbage collection", async () => {
@@ -139,14 +139,14 @@ try {
         init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
         globalThis.gc?.();
       });
-    const started = Date.now();
+    const started = performance.now();
     const response = await doh.proxyRequest(getRequest(), {
       upstreams: [{ endpoint: "https://gc-timeout.test/dns-query" }],
       timeoutMs: 300,
       failover: false,
     });
     assert.equal(response.status, 502);
-    assert.ok(Date.now() - started < 1_000);
+    assert.ok(performance.now() - started < 1_000);
   });
 
   await test("POST rejects non-decimal Content-Length values before reading or forwarding the body", async () => {
@@ -186,7 +186,7 @@ try {
       throw new Error("fetch must not run after a body timeout");
     };
 
-    const started = Date.now();
+    const started = performance.now();
     const response = await doh.proxyRequest(postRequest(pendingBody), {
       upstreams: [{ endpoint: "https://never-reached.test/dns-query" }],
       timeoutMs: 40,
@@ -197,7 +197,7 @@ try {
     // The 25 ms cancel timeout plus event-loop overhead can exceed 400 ms on a
     // loaded runner; the bound that matters is that it stays far below the
     // request deadline.
-    assert.ok(Date.now() - started < 1_000, "body cancellation must not extend the deadline indefinitely");
+    assert.ok(performance.now() - started < 1_000, "body cancellation must not extend the deadline indefinitely");
   });
 
   await test("A synchronous POST-body cancellation error does not hide the 413 response", async () => {
@@ -489,10 +489,10 @@ try {
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
     controller.abort();
-    const started = Date.now();
+    const started = performance.now();
     const response = await pending;
     assert.equal(aborted, true, "the upstream fetch must be aborted by the client disconnect");
-    assert.ok(Date.now() - started < 500, "must resolve promptly instead of at the deadline");
+    assert.ok(performance.now() - started < 500, "must resolve promptly instead of at the deadline");
     assert.equal(calls, 1, "failover must not contact the next upstream for a disconnected client");
     assert.equal(response.status, 502);
 
@@ -872,10 +872,10 @@ try {
     globalThis.fetch = async (url, init) => {
       const host = new URL(String(url)).hostname;
       if (host !== "last.test") return new Response("no", { status: 403 });
-      const started = Date.now();
+      const started = performance.now();
       await new Promise((resolve, reject) => {
         init.signal.addEventListener("abort", () => {
-          lastTimeout = Date.now() - started;
+          lastTimeout = performance.now() - started;
           reject(new Error("aborted"));
         });
       });

@@ -434,3 +434,14 @@ test("the preload preserves createServer overloads and event signatures while ti
     body: "ok",
   }, "timeouts are clamped, null is rejected by Node, and listener overloads and event argument lists stay intact");
 });
+
+test("X-Forwarded-For hop selection walks from the right and keeps empty fields as positions", () => {
+  // No socket address here, so an empty or missing selected field must yield no identity.
+  const get = (xff, hops) => clientIp.getClientIp(new Headers({ "x-forwarded-for": xff }), { ...DEFAULT_IDENTITY, trustedProxyHops: hops });
+  assert.equal(get(",", 1), undefined, "a lone comma selects an empty last field");
+  assert.equal(get(",", 2), undefined, "a leading empty field is still a position");
+  assert.equal(get("1.1.1.1, , 2.2.2.2", 2), undefined, "an empty entry at the selected hop fails closed");
+  assert.equal(get("9.9.9.9,2.2.2.2", 2), "9.9.9.9", "the first hop from the right with two entries");
+  assert.equal(get("9.9.9.9,2.2.2.2", 3), undefined, "more hops than entries selects nothing");
+  assert.equal(get(" 9.9.9.9 , 2.2.2.2 ", 2), "9.9.9.9", "fields are trimmed");
+});
