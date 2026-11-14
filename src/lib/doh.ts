@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { CLIENT_KEY_HEADER, CONFIG } from "@/lib/config";
-import { noStoreCorsHeaders } from "@/lib/cors";
+import { noStoreCorsHeaders, textErrorHeaders } from "@/lib/cors";
 import {
   DNS_MESSAGE,
   isValidDnsResponse,
@@ -134,6 +134,15 @@ function hasActiveProbe(cb: CircuitBreakerState, now: number): boolean {
 }
 
 /**
+ * True when a tripped breaker's half-open probe is held by a different attempt.
+ * Such an attempt's verdict must neither clear the probe nor close the breaker:
+ * only the probe's own result decides that.
+ */
+function probeOwnedByAnother(cb: CircuitBreakerState, probeToken: number, now: number): boolean {
+  return cb.failures >= CIRCUIT_BREAKER_THRESHOLD && hasActiveProbe(cb, now) && cb.probeToken !== probeToken;
+}
+
+/**
  * True while another request holds the probe slot of a tripped breaker. Used
  * when every breaker is open: each upstream is then probed by at most one
  * request at a time instead of by every concurrent request.
@@ -183,13 +192,7 @@ function recordFailure(endpoint: string, probeToken = 0): void {
   // verdict. An older, non-probe request may finish after that probe starts;
   // it must not clear the probe token or restart the cooldown. The probe's
   // own result will either close the breaker or re-open it immediately.
-  if (
-    cb.failures >= CIRCUIT_BREAKER_THRESHOLD &&
-    hasActiveProbe(cb, now) &&
-    cb.probeToken !== probeToken
-  ) {
-    return;
-  }
+  if (probeOwnedByAnother(cb, probeToken, now)) return;
 
   // Isolated, old failures expire; a tripped breaker keeps its count so that a
   // failed half-open probe re-opens it immediately.
@@ -209,14 +212,7 @@ function recordSuccess(endpoint: string, probeToken = 0): void {
   const cb = state.circuitBreakers.get(endpoint);
   // A success from an older attempt is not the verdict for a newer active
   // half-open probe. Only that probe's owner may close a tripped breaker.
-  if (
-    cb &&
-    cb.failures >= CIRCUIT_BREAKER_THRESHOLD &&
-    hasActiveProbe(cb, performance.now()) &&
-    cb.probeToken !== probeToken
-  ) {
-    return;
-  }
+  if (cb && probeOwnedByAnother(cb, probeToken, performance.now())) return;
   state.circuitBreakers.delete(endpoint);
 }
 
@@ -306,9 +302,7 @@ export function getHageziUpstreams(clientKey: string | null = null): readonly No
 }
 
 function textResponse(message: string, status: number): NextResponse {
-  const headers = noStoreCorsHeaders();
-  headers.set("Content-Type", "text/plain; charset=utf-8");
-  return new NextResponse(message, { status, headers });
+  return new NextResponse(message, { status, headers: textErrorHeaders() });
 }
 
 function busyResponse(): NextResponse {
@@ -463,23 +457,25 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
   const chunks: Uint8Array[] = [];
   let total = 0;
 
+  // One timer for the whole body instead of one per chunk. The rejection is
+  // pre-handled: it can fire while a best-effort cancel is still awaited, after
+  // the loop has stopped racing against it, and must not become unhandled.
+  const timeoutToken = {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(timeoutToken), Math.max(0, deadline - performance.now()));
+  });
+  expired.catch(() => {});
+
   try {
     for (;;) {
-      const remaining = deadline - performance.now();
-      if (remaining <= 0) {
+      if (deadline - performance.now() <= 0) {
         await cancelBestEffort(reader);
         return textResponse("Request body timeout", 408);
       }
 
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeoutToken = {};
       try {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(timeoutToken), remaining);
-          }),
-        ]);
+        const result = await Promise.race([reader.read(), expired]);
 
         if (result.done) break;
 
@@ -497,11 +493,10 @@ async function readPostBody(request: NextRequest, deadline: number): Promise<Val
         // The client's body stream failed (e.g. the upload was aborted). Answer
         // instead of letting the error escape the handler as an unhandled 500.
         return textResponse("Request body error", 400);
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
       }
     }
   } finally {
+    clearTimeout(timer);
     try {
       reader.releaseLock();
     } catch {

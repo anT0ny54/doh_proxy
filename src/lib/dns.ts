@@ -259,28 +259,6 @@ function validateOrderedTlvList(
   return offset === end && (mandatoryKeys === null || nextMandatoryKey === mandatoryKeys.length);
 }
 
-function acceptOpaqueTlvValue(
-  _message: Uint8Array,
-  _key: number,
-  _valueStart: number,
-  _valueEnd: number,
-  _suffixLengths: Uint8Array,
-): boolean {
-  return true;
-}
-
-function validateSvcParams(
-  message: Uint8Array,
-  start: number,
-  end: number,
-  suffixLengths: Uint8Array,
-): boolean {
-  // RFC 9460 section 2.2: keys are strictly increasing and values are bounded.
-  // Individual SvcParam value semantics are key-specific and intentionally
-  // remain the responsibility of an SVCB-aware client.
-  return validateOrderedTlvList(message, start, end, suffixLengths, acceptOpaqueTlvValue);
-}
-
 function validateDelegInfoValue(
   message: Uint8Array,
   key: number,
@@ -520,7 +498,10 @@ function validateRdataNames(
   }
 
   if ((type === 24 || type === 46) && offset === end) return false; // SIG/RRSIG needs signature bytes.
-  if (type === 64 || type === 65) return validateSvcParams(message, offset, end, suffixLengths);
+  // RFC 9460 section 2.2: SvcParam keys are strictly increasing and values are
+  // bounded. Individual SvcParam value semantics are key-specific and remain
+  // the responsibility of an SVCB-aware client, so values are accepted as-is.
+  if (type === 64 || type === 65) return validateOrderedTlvList(message, offset, end, suffixLengths, () => true);
   return layout.opaqueTail ? offset <= end : offset === end;
 }
 

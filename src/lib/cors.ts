@@ -24,3 +24,10 @@ export function noStoreCorsHeaders(): Headers {
   headers.set("Cache-Control", "no-store, max-age=0");
   return headers;
 }
+
+/** `noStoreCorsHeaders()` for a plain-text error body. */
+export function textErrorHeaders(): Headers {
+  const headers = noStoreCorsHeaders();
+  headers.set("Content-Type", "text/plain; charset=utf-8");
+  return headers;
+}

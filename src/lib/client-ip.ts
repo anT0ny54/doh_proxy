@@ -176,10 +176,18 @@ function isTrustedProxy(peer: CanonicalIp, config: ClientIpConfig): boolean {
  * right is the first one a client could not have written itself.
  */
 function pickForwarded(value: string, hops: number): string | undefined {
-  // Preserve empty fields: filtering them would shift the trusted-hop index
-  // and could select an earlier, client-supplied address from a malformed chain.
-  const entries = value.split(",").map((entry) => entry.trim());
-  return entries[entries.length - hops];
+  // Walk the comma-separated fields from the right, materialising only the
+  // ones needed. Empty fields still count as positions: filtering them would
+  // shift the trusted-hop index and could select an earlier, client-supplied
+  // address from a malformed chain. `end === 0` avoids a negative fromIndex,
+  // which lastIndexOf would clamp to 0 and so match a leading comma.
+  let end = value.length;
+  for (let position = 1; ; position += 1) {
+    const comma = end === 0 ? -1 : value.lastIndexOf(",", end - 1);
+    if (position === hops) return value.slice(comma + 1, end).trim();
+    if (comma === -1) return undefined;
+    end = comma;
+  }
 }
 
 /**
