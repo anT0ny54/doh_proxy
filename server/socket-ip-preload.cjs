@@ -52,8 +52,10 @@ function splitBodyAtCap(request) {
     if (received < BODY_CAP_BYTES && Buffer.isBuffer(chunk) && received + chunk.length > BODY_CAP_BYTES) {
       const head = BODY_CAP_BYTES - received;
       received += chunk.length;
-      push.call(this, chunk.subarray(0, head));
-      return push.call(this, chunk.subarray(head));
+      // Both halves are pushed; the first one's backpressure signal must not be
+      // dropped, so the result is false if either push asked the producer to wait.
+      const more = push.call(this, chunk.subarray(0, head));
+      return push.call(this, chunk.subarray(head)) && more;
     }
     if (Buffer.isBuffer(chunk)) received += chunk.length;
     return push.call(this, chunk, encoding);
